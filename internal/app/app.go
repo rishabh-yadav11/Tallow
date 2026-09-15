@@ -152,7 +152,7 @@ func (a *App) load(path string) error {
 	a.mu.Unlock()
 
 	a.setAuth(cfg.Auth.APIKeys)
-	a.authOpen = cfg.Auth.Open
+	a.setAuthOpen(cfg.Auth.Open)
 	a.adminSrv = admin.New(a, cfg.Server.AdminSocket)
 	a.proxySrv = &http.Server{Addr: cfg.Server.Listen, Handler: ph.Routes()}
 	if params.ReadTimeout > 0 {
@@ -184,6 +184,13 @@ func (a *App) setAuth(keys []string) {
 	}
 	a.authMu.Lock()
 	a.auth = m
+	a.authMu.Unlock()
+}
+
+// setAuthOpen records the safe-by-default open flag. Callers must hold authMu.
+func (a *App) setAuthOpen(open bool) {
+	a.authMu.Lock()
+	a.authOpen = open
 	a.authMu.Unlock()
 }
 
@@ -292,7 +299,7 @@ func (a *App) Reload() error {
 	a.mu.Unlock()
 
 	a.setAuth(cfg.Auth.APIKeys)
-	a.authOpen = cfg.Auth.Open
+	a.setAuthOpen(cfg.Auth.Open)
 	if a.store != nil {
 		_ = a.store.Audit("reload", "config", a.CfgPath)
 	}
