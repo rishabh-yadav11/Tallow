@@ -322,15 +322,24 @@ func (a *App) Run(ctx context.Context) error {
 
 	select {
 	case err := <-errc:
-		a.proxySrv.Shutdown(context.Background())
-		a.adminSrv.Close()
+		a.shutdown()
 		return err
 	case <-ctx.Done():
-		a.proxySrv.Shutdown(context.Background())
-		a.adminSrv.Close()
-		a.store.Close()
+		a.shutdown()
 		return nil
 	}
+}
+
+// shutdown gracefully stops the proxy and admin servers within a bounded deadline
+// so a lingering keep-alive client connection cannot block process shutdown
+// indefinitely.
+func (a *App) shutdown() {
+	const grace = 10 * time.Second
+	sctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	_ = a.proxySrv.Shutdown(sctx)
+	a.adminSrv.Close()
+	a.store.Close()
 }
 
 // watchConfig polls the config file mtime and hot-reloads on change.
