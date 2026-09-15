@@ -281,3 +281,252 @@ func TestEndToEndToolPassthrough(t *testing.T) {
 		t.Fatal("tools not forwarded to upstream")
 	}
 }
+
+// startGatewayAuth builds a gateway with an explicit auth policy. When open is
+// true the gateway accepts any token; when false (the safe default) it requires a
+// configured api key. apiKeys, if non-empty, whitelists those tokens.
+func startGatewayAuth(t *testing.T, upstreamURL string, open bool, apiKeys []string) *httptest.Server {
+	dir := t.TempDir()
+	const masterKey = "integration-master-key"
+	box, err := secret.NewBox([]byte(masterKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks, err := secret.LoadStore(filepath.Join(dir, "keys.json"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.Set("p1:k1", "sk-fake"); err != nil {
+		t.Fatal(err)
+	}
+
+	authBlock := "[auth]\nopen = " + boolStr(open) + "\n"
+	if len(apiKeys) > 0 {
+		authBlock += "api_keys = ["
+		for i, k := range apiKeys {
+			if i > 0 {
+				authBlock += ", "
+			}
+			authBlock += "\"" + k + "\""
+		}
+		authBlock += "]\n"
+	}
+
+	cfg := fmt.Sprintf(`version = 1
+%s[server]
+listen = "127.0.0.1:0"
+admin_socket = "%s"
+max_concurrent = 8
+queue_timeout = "5s"
+sticky_ttl = "5s"
+
+[secret]
+keystore = "%s"
+
+[store]
+path = "%s"
+raw_bodies = true
+
+[observability]
+enabled = true
+
+[[provider]]
+name = "p1"
+base_url = "%s"
+
+  [[provider.key]]
+  id = "k1"
+  ref = "p1:k1"
+  rpm = 100
+
+[[alias]]
+name = "flash"
+  [[alias.target]]
+  provider = "p1"
+  model = "flash-v4"
+  supports_tools = true
+`,
+		authBlock,
+		filepath.Join(dir, "admin.sock"),
+		filepath.Join(dir, "keys.json"),
+		filepath.Join(dir, "tallow.db"),
+		upstreamURL,
+	)
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv(secret.EnvMasterKey, masterKey)
+	t.Cleanup(func() { os.Unsetenv(secret.EnvMasterKey) })
+
+	a, err := app.New(cfgPath, "test")
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+	srv := httptest.NewServer(a.ProxyHandler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// TestAuthClosedRejectsRequests verifies the user-facing fix for issue #6:
+// an empty api_keys list with open=false must NOT open the gateway; requests
+// without a valid key get 401.
+func TestAuthClosedRejectsRequests(t *testing.T) {
+	upSrv, _ := setup(t)
+	gw := startGatewayAuth(t, upSrv.URL, false, nil)
+
+	resp, _ := post(t, gw.URL+"/v1/chat/completions",
+		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for closed gateway with no token, got %d", resp.StatusCode)
+	}
+}
+
+// TestAuthOpenAcceptsAnyToken verifies open=true restores the loopback-trust
+// behavior explicitly opted into (e.g. by the integration harness).
+func TestAuthOpenAcceptsAnyToken(t *testing.T) {
+	upSrv, _ := setup(t)
+	gw := startGatewayAuth(t, upSrv.URL, true, nil)
+
+	resp, _ := post(t, gw.URL+"/v1/chat/completions",
+		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 for open gateway, got %d", resp.StatusCode)
+	}
+}
+
+// TestAuthKeyAllowList verifies a configured api_keys allow-list is honored.
+func TestAuthKeyAllowList(t *testing.T) {
+	upSrv, _ := setup(t)
+	gw := startGatewayAuth(t, upSrv.URL, false, []string{"secret-key"})
+
+	// Wrong key -> 401.
+	resp, _ := postAuth(t, gw.URL+"/v1/chat/completions", "wrong",
+		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong key, got %d", resp.StatusCode)
+	}
+	// Correct key -> 200.
+	resp, body := postAuth(t, gw.URL+"/v1/chat/completions", "secret-key",
+		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 for correct key, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func postAuth(t *testing.T, url, token, body string) (*http.Response, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("postAuth: %v", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp, string(b)
+}
+
+// TestHotReloadUnderLoad exercises the issue #1 race: concurrent config hot-reload
+// (which rewrites Router.budgets / observ.enabled under lock) against live
+// requests. Under -race this fails before the fix; it must pass after.
+func TestHotReloadUnderLoad(t *testing.T) {
+	upSrv, _ := setup(t)
+	dir := t.TempDir()
+	const masterKey = "integration-master-key"
+	box, _ := secret.NewBox([]byte(masterKey))
+	ks, _ := secret.LoadStore(filepath.Join(dir, "keys.json"), box)
+	_ = ks.Set("p1:k1", "sk-fake")
+	cfgPath := filepath.Join(dir, "config.toml")
+	writeCfg := func(open bool) {
+		cfg := fmt.Sprintf(`version = 1
+[auth]
+open = %s
+
+[server]
+listen = "127.0.0.1:0"
+admin_socket = "%s"
+max_concurrent = 8
+
+[secret]
+keystore = "%s"
+
+[store]
+path = "%s"
+
+[observability]
+enabled = true
+
+[[provider]]
+name = "p1"
+base_url = "%s"
+
+  [[provider.key]]
+  id = "k1"
+  ref = "p1:k1"
+
+[[alias]]
+name = "flash"
+  [[alias.target]]
+  provider = "p1"
+  model = "flash-v4"
+`,
+			boolStr(open), filepath.Join(dir, "admin.sock"),
+			filepath.Join(dir, "keys.json"), filepath.Join(dir, "tallow.db"), upSrv.URL)
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCfg(true)
+	os.Setenv(secret.EnvMasterKey, masterKey)
+	t.Cleanup(func() { os.Unsetenv(secret.EnvMasterKey) })
+
+	a, err := app.New(cfgPath, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(a.ProxyHandler())
+	t.Cleanup(srv.Close)
+
+	const workers = 8
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					resp, _ := post(t, srv.URL+"/v1/chat/completions",
+						`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+					if resp != nil {
+						resp.Body.Close()
+					}
+				}
+			}
+		}()
+	}
+	// Hammer reloads concurrently with requests.
+	for i := 0; i < 200; i++ {
+		writeCfg(i%2 == 0)
+		if err := a.Reload(); err != nil {
+			t.Errorf("reload %d: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}

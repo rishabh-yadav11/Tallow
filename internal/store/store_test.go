@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -182,5 +184,81 @@ func TestRecordAfterCloseNoPanic(t *testing.T) {
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("second Close should no-op: %v", err)
+	}
+}
+
+// TestMaintainVacuum exercises the deferred VACUUM path (issue #2): retention
+// maintenance must run off the request path and shrink the db without error.
+func TestMaintainVacuum(t *testing.T) {
+	dir := t.TempDir()
+	cfg := StoreConfig{
+		Path:          filepath.Join(dir, "tallow.db"),
+		RawBodies:     true,
+		RawBodiesDays: 5,
+		MetadataDays:  30,
+		ErrorsDays:    90,
+		RollupEvery:   time.Hour,
+		VacuumEvery:   0, // force a VACUUM on first Maintain
+	}
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed enough rows that the db file is non-trivial, then delete most of them
+	// so a VACUUM actually reclaims space.
+	for i := 0; i < 200; i++ {
+		if err := s.RecordRequest(model.RequestMeta{ID: fmt.Sprintf("seed-%d", i), DurMillis: 5}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.flushForTest()
+	if err := s.Maintain(context.Background()); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	// Force a second VACUUM now that enough time (simulated) has passed.
+	cfg.VacuumEvery = time.Nanosecond
+	s.cfg = cfg
+	if err := s.Maintain(context.Background()); err != nil {
+		t.Fatalf("Maintain vacuum: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestDurableAfterReopen verifies async writes are persisted to the SQLite WAL
+// and survive Close + reopen (issue #2): a crash-free shutdown must not lose
+// request metadata that was enqueued before Close.
+func TestDurableAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tallow.db")
+	cfg := StoreConfig{Path: dbPath, RawBodies: true, RawBodiesDays: 5, MetadataDays: 30, ErrorsDays: 90}
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 50
+	for i := 0; i < n; i++ {
+		if err := s.RecordRequest(model.RequestMeta{ID: fmt.Sprintf("durable-%d", i), DurMillis: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Close flushes the queue (worker drains before db.Close).
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen and confirm all rows persisted.
+	s2, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	rows, err := s2.RecentRequests(1000)
+	if err != nil {
+		t.Fatalf("RecentRequests: %v", err)
+	}
+	if len(rows) != n {
+		t.Fatalf("expected %d durable rows after reopen, got %d", n, len(rows))
 	}
 }

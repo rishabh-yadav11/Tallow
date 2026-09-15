@@ -1,0 +1,10 @@
+# Build artifacts
+/tallow
+/tallowctl
+
+# Local data / secrets
+*.db
+*.db-shm
+*.db-wal
+keys.json
+.env
