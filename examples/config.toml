@@ -1,0 +1,109 @@
+# Tallow configuration (schema version 1).
+# Hand-editable TOML. See README.md for the full field reference and the
+# routing/caching/retry model.
+
+# Schema version. Must match the version Tallow understands; a mismatch is a
+# hard error so future schema changes never silently break this file.
+version = 1
+
+[server]
+# Client-facing OpenAI-compatible endpoint (bound to loopback by default).
+listen = "127.0.0.1:8080"
+# Control interface for the TUI/frontends, exposed over a local Unix socket.
+admin_socket = "~/.tallow/admin.sock"
+# Global cap on in-flight upstream requests.
+max_concurrent = 16
+# Max wait for a concurrency slot before 429 (bounded queue, not reject).
+queue_timeout = "30s"
+# Idle expiry of sticky session affinity (provider-side prompt-cache reuse).
+sticky_ttl = "15m"
+
+[auth]
+# Bearer tokens clients must present.
+api_keys = ["local-dev-key"]
+# Gate that makes the gateway accept requests with no/invalid key. Safe by
+# default: keep false so an empty api_keys list does NOT open the gateway.
+open = false
+
+[secret]
+# Master keyfile (0600) used when TALLOW_MASTER_KEY is not set. The env var wins.
+keyfile = "~/.tallow/master.key"
+# Encrypted side-storage for provider keys (managed via `tallowctl key add`).
+keystore = "~/.tallow/keys.json"
+
+[store]
+path = "~/.tallow/tallow.db"
+raw_bodies = true          # capture request/response bodies for retention.
+
+[cache]
+enabled = true
+max_entries = 1024
+ttl = "10m"                # exact-match entry lifetime.
+# max_bytes = 268435456    # optional byte cap on cached bodies (default 256 MiB).
+
+[retention]
+raw_bodies_days = 5        # ~3-7 days: age-based delete.
+metadata_days = 30         # per-request metadata: age-based delete.
+errors_days = 90           # errors: longer window, age-based delete.
+rollup_interval = "1h"     # roll-up cadence (before metadata deletion).
+vacuum_interval = "6h"     # periodic VACUUM.
+
+[compaction]
+enabled = true
+max_tool_output_chars = 8000
+
+[observability]
+enabled = true
+
+# --- Providers: any OpenAI-compatible endpoint (key + base URL). ---
+
+[[provider]]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+rpm = 120                   # optional aggregate provider-level RPM cap.
+health_check = true         # proactive minimal-chat-probe circuit breaker.
+health_interval = "60s"
+timeout = "120s"
+
+  [[provider.key]]
+  id = "account-1"
+  ref = "openrouter:account-1"   # keystore ref; secret lives in keys.json.
+  rpm = 60
+  # max_requests = 100000         # optional hard cap per window.
+  # window = "24h"
+  max_concurrent = 8
+  # cost_limit_cents = 500        # optional USD cap (500 = $5.00).
+
+[[provider]]
+name = "local-llm"
+base_url = "http://127.0.0.1:11434/v1"
+health_check = false          # local server; skip proactive probing.
+
+  [[provider.key]]
+  id = "default"
+  ref = "local-llm:default"
+
+# --- Aliases: client-facing model names -> ordered provider targets. ---
+# Order = failover order. The upstream "model" string is what that provider
+# actually receives; capabilities and pricing are declared manually.
+
+[[alias]]
+name = "deepseek-v4-flash"
+
+  [[alias.target]]
+  provider = "openrouter"
+  model = "deepseek/deepseek-v4-flash"
+  context_window = 131072
+  supports_tools = true
+  supports_stream = true
+  price_input_per_1m = 0.27      # USD per 1M input tokens.
+  price_output_per_1m = 1.10
+
+  [[alias.target]]
+  provider = "local-llm"
+  model = "deepseek-v4-flash"
+  context_window = 32768
+  supports_tools = true
+  supports_stream = true
+  price_input_per_1m = 0.0
+  price_output_per_1m = 0.0
