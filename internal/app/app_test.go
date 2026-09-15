@@ -3,9 +3,11 @@ package app_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rishabh-yadav11/tallow/internal/app"
 	"github.com/rishabh-yadav11/tallow/internal/secret"
@@ -529,4 +532,148 @@ name = "flash"
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// freePort reserves and releases a loopback TCP port, returning its number. There
+// is a small TOCTOU window before the caller binds it, which is acceptable for a
+// test; callers retry if bind fails.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("freePort listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// TestAppRunEndToEnd boots the actual gateway via App.Run (proxy ListenAndServe,
+// admin unix socket, health loop, retention loop, config watcher) against a fake
+// upstream, serves a real chat request, then cancels the context to verify
+// graceful shutdown returns nil. This exercises the run path that the in-process
+// httptest.NewServer(a.ProxyHandler()) harness never touches.
+func TestAppRunEndToEnd(t *testing.T) {
+	upSrv, up := setup(t)
+	dir := t.TempDir()
+	const masterKey = "integration-master-key"
+	box, _ := secret.NewBox([]byte(masterKey))
+	ks, _ := secret.LoadStore(filepath.Join(dir, "keys.json"), box)
+	_ = ks.Set("p1:k1", "sk-fake")
+
+	var baseURL string
+	for attempt := 0; attempt < 5; attempt++ {
+		port := freePort(t)
+		cfg := fmt.Sprintf(`version = 1
+[auth]
+open = true
+
+[server]
+listen = "127.0.0.1:%d"
+admin_socket = "%s"
+max_concurrent = 8
+queue_timeout = "5s"
+sticky_ttl = "5s"
+
+[secret]
+keystore = "%s"
+
+[store]
+path = "%s"
+raw_bodies = true
+
+[observability]
+enabled = true
+
+[[provider]]
+name = "p1"
+base_url = "%s"
+
+  [[provider.key]]
+  id = "k1"
+  ref = "p1:k1"
+  rpm = 100
+
+[[alias]]
+name = "flash"
+  [[alias.target]]
+  provider = "p1"
+  model = "flash-v4"
+  supports_tools = true
+`,
+			port, filepath.Join(dir, "admin.sock"),
+			filepath.Join(dir, "keys.json"), filepath.Join(dir, "tallow.db"), upSrv.URL)
+		cfgPath := filepath.Join(dir, "config.toml")
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		os.Setenv(secret.EnvMasterKey, masterKey)
+		t.Cleanup(func() { os.Unsetenv(secret.EnvMasterKey) })
+
+		a, err := app.New(cfgPath, "test")
+		if err != nil {
+			t.Fatalf("app.New: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		done := make(chan error, 1)
+		go func() { done <- a.Run(ctx) }()
+
+		baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+		// Poll /health until the proxy is listening.
+		ready := false
+		for i := 0; i < 100; i++ {
+			req, _ := http.NewRequest(http.MethodGet, baseURL+"/health", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == 200 {
+					ready = true
+					break
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if ready {
+			defer func() {
+				cancel()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("Run returned error on shutdown: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Error("Run did not return after context cancel (graceful shutdown hung)")
+				}
+			}()
+			break
+		}
+		// Not ready: tear down and retry on a fresh port.
+		cancel()
+		<-done
+	}
+
+	if baseURL == "" {
+		t.Fatal("gateway never became ready")
+	}
+
+	// Real chat request through the live Run() server. Use a no-keep-alive client
+	// so the connection closes promptly and graceful shutdown does not block on it.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("chat request: %v", err)
+	}
+	body := new(strings.Builder)
+	_, _ = io.Copy(body, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("chat status %d: %s", resp.StatusCode, body.String())
+	}
+	if _, ok := up.lastBody(); !ok {
+		t.Fatal("upstream did not receive the forwarded request")
+	}
 }
