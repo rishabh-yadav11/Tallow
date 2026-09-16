@@ -192,3 +192,37 @@ func TestConcurrentSelectBudgetsNoRace(t *testing.T) {
 		<-done
 	}
 }
+
+func TestSetBudgetsAppliesUpdatedLimitsWithoutReset(t *testing.T) {
+	r, now := fixture()
+	// First install a generous RPM limit.
+	r.SetBudgets(map[string]budget.KeyLimits{
+		"p1/k1": {RPM: 100},
+	}, map[string]int{})
+
+	kb := r.budgets["p1/k1"]
+	// Consume one slot; the live window must survive the reload below.
+	if ok, _ := kb.Acquire(now); !ok {
+		t.Fatal("first acquire should succeed")
+	}
+	// Hot-reload lowers the RPM to 10 (and adds p2 provider RPM cap).
+	r.SetBudgets(map[string]budget.KeyLimits{
+		"p1/k1": {RPM: 10},
+	}, map[string]int{"p1": 5})
+
+	// The existing tracker must now enforce the new (lower) limit without
+	// resetting the live counter: 9 more acquires succeed, the 10th fails.
+	for i := 0; i < 9; i++ {
+		if ok, _ := kb.Acquire(now); !ok {
+			t.Fatalf("acquire %d should succeed under new limit", i+1)
+		}
+	}
+	if ok, _ := kb.Acquire(now); ok {
+		t.Fatal("acquire beyond the updated RPM limit should fail")
+	}
+
+	// Provider budget installed on reload must be reflected.
+	if pb := r.pBudget["p1"]; pb == nil || pb.Remaining(now) != 5 {
+		t.Fatalf("provider budget not installed/updated: %+v", r.pBudget["p1"])
+	}
+}

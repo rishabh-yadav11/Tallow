@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -293,6 +294,7 @@ func (a *App) Reload() error {
 	a.cfg = cfg
 	a.params = params
 	a.reg.Swap(providers, aliases)
+	a.health.Prune(providers)
 	a.router.SetBudgets(keyLimits(providers), provRPM(providers))
 	a.observ.SetEnabled(cfg.Observability.Enabled)
 	a.Keystore = keystore
@@ -449,8 +451,13 @@ func (a *App) probe(reg *registry.Registry, client *http.Client, p model.Provide
 }
 
 func (a *App) aliasModelByProvider() map[string]string {
+	aliases := a.reg.Aliases()
+	// Iterate in a stable order so "first-seen" model per provider is
+	// deterministic (reg.aliases is a map with random iteration order), which
+	// both keeps the health probe stable and makes behavior testable.
+	sort.Slice(aliases, func(i, j int) bool { return aliases[i].Name < aliases[j].Name })
 	m := map[string]string{}
-	for _, al := range a.reg.Aliases() {
+	for _, al := range aliases {
 		for _, t := range al.Targets {
 			// Pick a model from a target whose Provider matches this key (the
 			// provider being probed), i.e. a model this provider actually

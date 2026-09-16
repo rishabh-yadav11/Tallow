@@ -127,3 +127,18 @@ func TestRefreshUpdatesBytes(t *testing.T) {
 		t.Fatal("refreshed oversized entry should be evicted under byte budget")
 	}
 }
+
+func TestRefreshKeepsEntryLive(t *testing.T) {
+	// Regression: refreshing an existing entry must reset its expiry; a set
+	// twice key used to be immediately treated as expired (dead) on Get.
+	c := New(10, time.Minute, 0)
+	c.Set(Entry{Key: "a", Body: []byte("v1")})
+	c.Set(Entry{Key: "a", Body: []byte("v2")})
+	e, ok := c.Get("a")
+	if !ok {
+		t.Fatal("refreshed entry should still be retrievable")
+	}
+	if string(e.Body) != "v2" {
+		t.Fatalf("expected refreshed body v2, got %q", e.Body)
+	}
+}

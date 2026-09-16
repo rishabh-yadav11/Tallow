@@ -109,6 +109,18 @@ func NewKeyBudget(l KeyLimits) *KeyBudget {
 	}
 }
 
+// SetLimits applies updated limits without resetting live counters (used by
+// config hot-reload so existing windows and in-flight/cost state survive).
+func (b *KeyBudget) SetLimits(l KeyLimits) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rpm.Limit = l.RPM
+	b.req.Limit = l.MaxRequests
+	b.req.Window = l.Window
+	b.maxInflight = l.MaxConcurrent
+	b.costLimit = l.CostLimitCents
+}
+
 // Acquire reserves a request slot. Returns failure with a reason when any hard
 // limit is exhausted. All limits are peeked (non-consumingly) before any is
 // consumed, so a request blocked by one limit never burns a slot on another.
@@ -191,6 +203,13 @@ type ProviderBudget struct {
 // NewProviderBudget builds a provider-level RPM limiter.
 func NewProviderBudget(rpm int) *ProviderBudget {
 	return &ProviderBudget{rpm: FixedWindow{Limit: rpm, Window: time.Minute}}
+}
+
+// SetRPM updates the provider-level RPM cap without resetting the live window.
+func (p *ProviderBudget) SetRPM(rpm int) {
+	p.rpm.mu.Lock()
+	p.rpm.Limit = rpm
+	p.rpm.mu.Unlock()
 }
 
 // Allow consumes a provider-level RPM slot.

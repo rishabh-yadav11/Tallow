@@ -53,8 +53,15 @@ func Apply(messages []any, cfg Config) {
 
 func truncate(s string, max int) string {
 	orig := len(s)
-	head := s[:max]
-	return fmt.Sprintf("%s%s", head, fmt.Sprintf(truncationMarker, orig, max))
+	// Reserve room for the marker so the final length respects the max bound.
+	kept := max - len(fmt.Sprintf(truncationMarker, orig, max))
+	if kept < 0 {
+		kept = 0
+	}
+	if kept > orig {
+		kept = orig
+	}
+	return s[:kept] + fmt.Sprintf(truncationMarker, orig, kept)
 }
 
 // EstimateSize returns a rough byte estimate of tool-output content, useful

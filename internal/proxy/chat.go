@@ -58,14 +58,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Status:    "ok",
 	}
 
-	// Exact-match cache: non-streaming only (see README for the tradeoff).
+	// Exact-match cache: non-streaming only (see README for the tradeoff). The
+	// cache key is qualified by the alias's resolved upstream model. The fast
+	// path is only taken when the alias maps to a single model, so a cached
+	// response is never served across distinct models behind the same alias.
+	canonicalize := h.deps.CacheEnabled && h.deps.Cache != nil && !stream
 	cacheKey := ""
-	if h.deps.CacheEnabled && h.deps.Cache != nil && !stream {
+	if canonicalize {
 		if canon, err := cache.Normalize(req); err == nil {
-			cacheKey = cache.Key(canon)
-			if e, ok := h.deps.Cache.Get(cacheKey); ok {
-				h.serveCached(w, e, &meta, started)
-				return
+			if m, ok := h.singleModel(alias); ok {
+				cacheKey = m + "/" + cache.Key(canon)
+				if e, ok := h.deps.Cache.Get(cacheKey); ok {
+					h.serveCached(w, e, &meta, started)
+					return
+				}
 			}
 		}
 	}
@@ -184,6 +190,24 @@ func (h *Handler) maxAttempts(alias string) int {
 		}
 	}
 	return 2
+}
+
+// singleModel returns the upstream model an alias resolves to, or ("", false)
+// when the alias can route to multiple distinct models. The exact-match cache
+// is only served/populated for single-model aliases so a cached response is
+// never served across distinct models behind the same alias.
+func (h *Handler) singleModel(alias string) (string, bool) {
+	a, ok := h.deps.Registry.Alias(alias)
+	if !ok || len(a.Targets) == 0 {
+		return "", false
+	}
+	m := a.Targets[0].Model
+	for _, t := range a.Targets[1:] {
+		if t.Model != m {
+			return "", false
+		}
+	}
+	return m, true
 }
 
 // serveCached emits a cached non-streaming response.
