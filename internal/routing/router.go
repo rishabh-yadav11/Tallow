@@ -45,13 +45,17 @@ func NewRouter(reg *registry.Registry, h *health.Registry, stickyTTL time.Durati
 	}
 }
 
-// SetBudgets (re)installs budget trackers. Existing trackers are preserved by
-// key so hot-reload does not reset live windows.
+// SetBudgets (re)installs budget trackers. Existing trackers are updated with
+// the new limits in place (live windows and in-flight/cost state are preserved
+// so hot-reload does not reset counters), and trackers for removed entities are
+// dropped.
 func (r *Router) SetBudgets(keys map[string]budget.KeyLimits, providers map[string]int) {
 	r.bmu.Lock()
 	defer r.bmu.Unlock()
 	for id, l := range keys {
-		if _, ok := r.budgets[id]; !ok {
+		if kb, ok := r.budgets[id]; ok {
+			kb.SetLimits(l)
+		} else {
 			r.budgets[id] = budget.NewKeyBudget(l)
 		}
 	}
@@ -62,8 +66,16 @@ func (r *Router) SetBudgets(keys map[string]budget.KeyLimits, providers map[stri
 		}
 	}
 	for id, rpm := range providers {
-		if _, ok := r.pBudget[id]; !ok {
+		if pb, ok := r.pBudget[id]; ok {
+			pb.SetRPM(rpm)
+		} else {
 			r.pBudget[id] = budget.NewProviderBudget(rpm)
+		}
+	}
+	// Drop provider budgets no longer present.
+	for id := range r.pBudget {
+		if _, ok := providers[id]; !ok {
+			delete(r.pBudget, id)
 		}
 	}
 }
@@ -143,9 +155,11 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 						return sel, nil
 					}
 					// Provider/key removed from registry on hot-reload: the pin
-					// is stale. Forget it and route normally.
+					// is stale. Forget it, return the reserved slot, and route
+					// normally (mirrors the non-sticky removed path below).
 					reasons = append(reasons, "sticky:"+p+"/"+k+":removed")
 					r.sticky.Forget(sessionKey)
+					sel.kb.Release(0)
 				}
 			}
 			reasons = append(reasons, "sticky:"+p+"/"+k+":stale")
@@ -211,16 +225,26 @@ func finalReason(trail []string, final string) string {
 	return strings.Join(trail, "; ") + " -> " + final
 }
 
-// acquire reserves a specific provider/key (used by sticky path).
+// acquire reserves a specific provider/key (used by sticky path). It enforces
+// both the key budget and the provider-level RPM cap, mirroring the non-sticky
+// acquireKey path so a pinned session cannot exceed the aggregate provider cap.
 func (r *Router) acquire(provider, key, model string, target model.Target, now time.Time) (*Selection, error) {
 	id := provider + "/" + key
 	r.bmu.RLock()
 	kb := r.budgets[id]
+	pb := r.pBudget[provider]
 	r.bmu.RUnlock()
 	if kb != nil {
 		if ok, _ := kb.Acquire(now); !ok {
 			return nil, fmt.Errorf("budget exhausted")
 		}
+	}
+	if pb != nil && !pb.Allow(now) {
+		// Provider RPM exhausted; do not burn the key's reserved slot.
+		if kb != nil {
+			kb.Release(0)
+		}
+		return nil, fmt.Errorf("provider rpm exhausted")
 	}
 	sel := &Selection{Provider: provider, Key: key, Model: model, Target: target, kb: kb}
 	fillDest(r.reg, sel)

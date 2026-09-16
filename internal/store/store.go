@@ -320,7 +320,9 @@ func (s *Store) RunRetention(ctx context.Context) error {
 			return ctx.Err()
 		case <-t.C:
 			if err := s.Maintain(ctx); err != nil {
-				return err
+				// A transient maintenance error must not permanently kill future
+				// rollup/delete/vacuum runs; log and continue.
+				fmt.Fprintf(os.Stderr, "tallow: retention maintenance failed: %v\n", err)
 			}
 		}
 	}
@@ -393,8 +395,17 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 		}
 	}
 
+	// Perform the rollup INSERTs and the watermark advance in one transaction so
+	// a crash between them cannot re-merge the same range (double counting) on
+	// the next run.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	for bk, a := range agg {
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO rollups (bucket, bucket_start, provider, key, requests, errors, prompt_tokens, completion_tokens, cost_cents)
 			 VALUES (?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(bucket, bucket_start, provider, key) DO UPDATE SET
@@ -409,13 +420,13 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 	}
 
 	if maxTS > wm {
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO meta (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
 			watermarkKey, fmt.Sprintf("%d", maxTS)); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) deleteAgedLocked(now time.Time) error {

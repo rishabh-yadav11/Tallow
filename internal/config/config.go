@@ -70,7 +70,7 @@ type CacheCfg struct {
 	Enabled    *bool  `toml:"enabled"`
 	MaxEntries int    `toml:"max_entries"`
 	TTL        string `toml:"ttl"`       // exact-match entry lifetime (duration).
-	MaxBytes   int64  `toml:"max_bytes"` // upper bound on cached bytes (<=0 unbounded).
+	MaxBytes   int64  `toml:"max_bytes"` // byte cap on cached bodies; 0/negative = default 256 MiB.
 }
 
 type Retention struct {

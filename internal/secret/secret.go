@@ -179,7 +179,26 @@ func (s *Store) saveLocked() error {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	fh, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	// fsync before rename so a crash between write and rename cannot lose the
+	// last key add/rm. Clean up the temp file on any failure.
+	cleanup := func() {
+		fh.Close()
+		os.Remove(tmp)
+	}
+	if _, err := fh.Write(b); err != nil {
+		cleanup()
+		return err
+	}
+	if err := fh.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := fh.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, s.path)

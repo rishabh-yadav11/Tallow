@@ -3,6 +3,8 @@ package health
 import (
 	"sync"
 	"time"
+
+	"github.com/rishabh-yadav11/tallow/internal/model"
 )
 
 // Registry owns circuit breakers keyed by provider and by provider/key. It is
@@ -38,4 +40,29 @@ func (r *Registry) get(id string, m *map[string]*Breaker) *Breaker {
 	b := NewBreaker(3, 30*time.Second)
 	(*m)[id] = b
 	return b
+}
+
+// Prune drops breakers for providers/keys no longer present, so hot-reload
+// cannot leak breakers or leave stale open/half-open state behind.
+func (r *Registry) Prune(providers []model.Provider) {
+	keepP := map[string]bool{}
+	keepK := map[string]bool{}
+	for _, p := range providers {
+		keepP["p:"+p.Name] = true
+		for _, k := range p.Keys {
+			keepK[p.Name+"/"+k.ID] = true
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id := range r.provs {
+		if !keepP[id] {
+			delete(r.provs, id)
+		}
+	}
+	for id := range r.keys {
+		if !keepK[id] {
+			delete(r.keys, id)
+		}
+	}
 }

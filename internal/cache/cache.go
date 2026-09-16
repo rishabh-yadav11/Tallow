@@ -139,6 +139,8 @@ func (c *Cache) Set(e Entry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sweepExpiredLocked()
+	e.CreatedAt = time.Now()
+	e.expires = e.CreatedAt.Add(c.ttl)
 	if el, ok := c.entries[e.Key]; ok {
 		old := el.Value.(*item).e
 		c.bytes += entrySize(e) - entrySize(old)
@@ -147,8 +149,6 @@ func (c *Cache) Set(e Entry) {
 		c.evictBytesOverLocked()
 		return
 	}
-	e.CreatedAt = time.Now()
-	e.expires = e.CreatedAt.Add(c.ttl)
 	el := c.order.PushFront(&item{key: e.Key, e: e})
 	c.entries[e.Key] = el
 	c.bytes += entrySize(e)
