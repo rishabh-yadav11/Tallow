@@ -2,9 +2,17 @@
 /tallow
 /tallowctl
 
+# Local config copied from examples/ (may reference real providers)
+/config.toml
+
+# Runtime data directory and sockets
+tallow-data/
+*.sock
+
 # Local data / secrets
 *.db
 *.db-shm
 *.db-wal
 keys.json
+keys.json.tmp
 .env

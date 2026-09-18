@@ -262,3 +262,93 @@ func TestDurableAfterReopen(t *testing.T) {
 		t.Fatalf("expected %d durable rows after reopen, got %d", n, len(rows))
 	}
 }
+
+// TestRetentionZeroKeepsForever verifies that a retention window of 0 is
+// interpreted as "keep forever": Maintain must not delete any rows (a natural
+// but wrong reading of 0 as "delete everything" previously wiped all data).
+func TestRetentionZeroKeepsForever(t *testing.T) {
+	dir := t.TempDir()
+	cfg := StoreConfig{Path: filepath.Join(dir, "tallow.db"), RawBodies: true, RawBodiesDays: 0, MetadataDays: 0, ErrorsDays: 0}
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Old rows that retention would definitely delete if 0 were "keep nothing".
+	old := time.Now().AddDate(0, -6, 0)
+	if err := s.RecordRequest(model.RequestMeta{ID: "old-req", StartedAt: old}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordRaw("old-raw", old, []byte(`{}`), []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordError("err-1", "p", "k", "m", "old-req", "boom"); err != nil {
+		t.Fatal(err)
+	}
+	s.flushForTest()
+
+	if err := s.Maintain(context.Background()); err != nil {
+		t.Fatalf("Maintain with zero retention: %v", err)
+	}
+
+	rows, err := s.RecentRequests(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("retention 0 must keep rows forever: got %d rows, want 1", len(rows))
+	}
+}
+
+// TestRetentionPositiveDeletesAgedRows verifies positive windows still delete
+// old rows, so the zero-keep-forever change did not break real retention.
+func TestRetentionPositiveDeletesAgedRows(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tallow.db")
+	cfg := StoreConfig{Path: dbPath, RawBodies: true, RawBodiesDays: 1, MetadataDays: 1, ErrorsDays: 1}
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	old := time.Now().AddDate(0, 0, -30)
+	recent := time.Now().Add(-time.Minute)
+	for _, tc := range []struct {
+		id string
+		ts time.Time
+	}{{"aged-1", old}, {"fresh-1", recent}} {
+		if err := s.RecordRequest(model.RequestMeta{ID: tc.id, StartedAt: tc.ts}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.flushForTest()
+
+	if err := s.Maintain(context.Background()); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	rows, err := s.RecentRequests(100)
+	if err != nil {
+		t.Fatalf("RecentRequests: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != "fresh-1" {
+		t.Fatalf("positive retention must delete aged rows only; got %d rows: %+v", len(rows), rows)
+	}
+}
+
+// TestWriteStatsCountsDrops verifies the drop counter records ops lost to a
+// closed store, making silent telemetry loss observable (audit H1).
+func TestWriteStatsCountsDrops(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := s.RecordRequest(model.RequestMeta{ID: "after-close"}); err == nil {
+		t.Fatal("expected errStoreClosed from RecordRequest after Close")
+	}
+	fails, drops := s.WriteStats()
+	if fails != 0 || drops != 1 {
+		t.Fatalf("WriteStats after closed-store write: failures=%d drops=%d, want 0/1", fails, drops)
+	}
+}

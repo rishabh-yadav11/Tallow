@@ -7,9 +7,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rishabh-yadav11/tallow/internal/model"
@@ -26,6 +28,19 @@ type Store struct {
 	enqMu  sync.Mutex   // guards closed + channel send against Close.
 	closed bool
 	wg     sync.WaitGroup // tracks the background writer goroutine.
+
+	// writeFailures counts DB writes that failed inside the worker; writeDrops
+	// counts ops dropped because the queue was full or the store was closed.
+	// Both are best-effort observability for silent telemetry loss.
+	writeFailures atomic.Uint64
+	writeDrops    atomic.Uint64
+}
+
+// WriteFailures returns the number of deferred writes that failed at the
+// database layer, and the number of ops dropped because the queue was full or
+// the store was closed. Useful for diagnosing silent telemetry loss.
+func (s *Store) WriteStats() (failures, drops uint64) {
+	return s.writeFailures.Load(), s.writeDrops.Load()
 }
 
 // writeOp is one deferred database write produced by the request path. The
@@ -199,27 +214,30 @@ func (s *Store) worker() {
 	defer s.wg.Done()
 	for op := range s.queue {
 		s.mu.Lock()
+		var err error
 		switch op.kind {
 		case opRequest:
-			_, err := s.db.Exec(
+			_, err = s.db.Exec(
 				`INSERT INTO requests (id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, status, route_reason, prompt_tokens, completion_tokens, cost_cents, err)
 				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				op.req.ID, op.req.StartedAt.UnixMilli(), op.req.DurMillis, op.req.Provider, op.req.Key, op.req.Model, op.req.UpstreamModel,
 				b2i(op.req.Stream), b2i(op.req.Cached), op.req.Status, op.req.RouteReason, op.req.PromptTokens, op.req.CompletionTokens, op.req.CostCents, op.req.Err,
 			)
-			_ = err
 		case opRaw:
-			_, err := s.db.Exec(`INSERT INTO raw_bodies (id, started_at, req_body, resp_body) VALUES (?,?,?,?)`,
+			_, err = s.db.Exec(`INSERT INTO raw_bodies (id, started_at, req_body, resp_body) VALUES (?,?,?,?)`,
 				op.id, op.ts.UnixMilli(), string(op.reqBody), string(op.respBody))
-			_ = err
 		case opError:
-			_, err := s.db.Exec(`INSERT INTO errors (id, started_at, provider, key, model, message, request_id) VALUES (?,?,?,?,?,?,?)`,
+			_, err = s.db.Exec(`INSERT INTO errors (id, started_at, provider, key, model, message, request_id) VALUES (?,?,?,?,?,?,?)`,
 				op.id, time.Now().UnixMilli(), op.provider, op.key, op.model, op.message, op.requestID)
-			_ = err
 		case opAudit:
-			_, err := s.db.Exec(`INSERT INTO audit_log (ts, action, entity, detail) VALUES (?,?,?,?)`,
+			_, err = s.db.Exec(`INSERT INTO audit_log (ts, action, entity, detail) VALUES (?,?,?,?)`,
 				time.Now().UnixMilli(), op.action, op.entity, op.detail)
-			_ = err
+		}
+		if err != nil {
+			// Best-effort writes must still be observable: a failing INSERT
+			// (disk full, DB locked) should never be completely silent.
+			s.writeFailures.Add(1)
+			log.Printf("tallow-store: async %s write failed: %v", op.kind, err)
 		}
 		s.mu.Unlock()
 		if op.flushDone != nil {
@@ -228,13 +246,11 @@ func (s *Store) worker() {
 	}
 }
 
-// enqueue adds an op to the worker queue without blocking the caller. If the
-// store is closed or the queue is full the op is dropped (best-effort), keeping
-// request latency low.
 func (s *Store) enqueue(op writeOp) error {
 	s.enqMu.Lock()
 	if s.closed {
 		s.enqMu.Unlock()
+		s.writeDrops.Add(1)
 		return errStoreClosed
 	}
 	select {
@@ -243,6 +259,7 @@ func (s *Store) enqueue(op writeOp) error {
 		return nil
 	default:
 		s.enqMu.Unlock()
+		s.writeDrops.Add(1)
 		return errQueueFull
 	}
 }
@@ -430,17 +447,25 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 }
 
 func (s *Store) deleteAgedLocked(now time.Time) error {
+	// A retention window of 0 or less means "keep forever": skip the DELETE so
+	// a natural-but-wrong "disable this capture" reading of 0 cannot wipe data.
 	cut := func(days int) int64 {
 		return now.AddDate(0, 0, -days).UnixMilli()
 	}
-	if _, err := s.db.Exec(`DELETE FROM raw_bodies WHERE started_at < ?`, cut(s.cfg.RawBodiesDays)); err != nil {
-		return err
+	if s.cfg.RawBodiesDays > 0 {
+		if _, err := s.db.Exec(`DELETE FROM raw_bodies WHERE started_at < ?`, cut(s.cfg.RawBodiesDays)); err != nil {
+			return err
+		}
 	}
-	if _, err := s.db.Exec(`DELETE FROM requests WHERE started_at < ?`, cut(s.cfg.MetadataDays)); err != nil {
-		return err
+	if s.cfg.MetadataDays > 0 {
+		if _, err := s.db.Exec(`DELETE FROM requests WHERE started_at < ?`, cut(s.cfg.MetadataDays)); err != nil {
+			return err
+		}
 	}
-	if _, err := s.db.Exec(`DELETE FROM errors WHERE started_at < ?`, cut(s.cfg.ErrorsDays)); err != nil {
-		return err
+	if s.cfg.ErrorsDays > 0 {
+		if _, err := s.db.Exec(`DELETE FROM errors WHERE started_at < ?`, cut(s.cfg.ErrorsDays)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
