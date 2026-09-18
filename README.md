@@ -287,6 +287,17 @@ auto-detected capability mapping · external cache/vector-DB dependencies.
 
 ## License
 
-Tallow is **source-available, non-commercial**. It is *not* MIT/Apache: the license
-reserves commercial-use rights. (A specific license text will be added before any
-public release — see the source for the definitive terms.)
+Tallow is licensed under the **Business Source License 1.1** ([LICENSE](LICENSE)).
+
+- **You may**: use it internally (including production use inside your
+  organization), self-host it, modify it, and redistribute it.
+- **You may not**: offer it (or a product substantially overlapping its
+  gateway capabilities) to third parties as a paid hosted or embedded
+  competing service.
+- **Change Date**: four years after first publication of each version, the
+  work converts to **MIT** under the license's change terms.
+- Need different terms (embedding, hosted offering, commercial licensing)?
+  Open a discussion or contact the repository owner.
+
+Note: BUSL-1.1 is a source-available license, not an open-source license; the
+work converts to MIT on the Change Date. License text (c) MariaDB plc.
