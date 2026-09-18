@@ -36,8 +36,10 @@ passthrough, pure-Go static binary).
 ## Quick start
 
 ```sh
-# Build (pure Go, no C toolchain)
-CGO_ENABLED=0 go build -o tallow ./cmd/tallow
+# Build (pure Go, no C toolchain; version stamped from git tags)
+make release
+# or by hand:
+CGO_ENABLED=0 go build -ldflags "-X main.version=$(git describe --tags --always)" -o tallow ./cmd/tallow
 CGO_ENABLED=0 go build -o tallowctl ./cmd/tallowctl
 
 # 1. Set a master key (env, or a 0600 keyfile). It encrypts provider keys at rest.

@@ -1,18 +1,21 @@
-# Tallow — developer task runner.
-#
-# The core gates run anywhere `go` runs. The deeper SAST gates (govulncheck,
-# golangci-lint, gosec) are delegated to .github/workflows/ci.yml, which installs
-# them on demand; they are optional here so `make` works offline.
-
 GO ?= go
 PKGS := ./...
 
-.PHONY: all build test test-race vet fmt fmt-check tidy clean
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w -X main.version=$(VERSION)
+
+.PHONY: all build release test test-race vet fmt fmt-check tidy clean
 
 all: fmt-check vet build test
 
 build:
 	$(GO) build ./...
+
+# Static release binaries with the version stamped from git tags.
+# Pure Go on purpose: CGO_ENABLED=0.
+release:
+	CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o tallow ./cmd/tallow
+	CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o tallowctl ./cmd/tallowctl
 
 test:
 	$(GO) test ./...
