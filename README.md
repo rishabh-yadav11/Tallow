@@ -54,10 +54,12 @@ TALLOW_PROVIDER_KEY="sk-..." tallowctl key add myprovider:account-1 --config ./c
 ./tallow --config ./config.toml
 
 # 5. Point any OpenAI-compatible client at it
-#    base_url = http://127.0.0.1:8080/v1, api_key = one of `auth.api_keys`
+#    base_url = http://127.0.0.1:8080, api_key = one of `auth.api_keys`
 ```
 
 Open the dashboard in another terminal: `tallowctl dashboard`.
+
+[![CI](https://github.com/rishabh-yadav11/Tallow/actions/workflows/ci.yml/badge.svg)](https://github.com/rishabh-yadav11/Tallow/actions/workflows/ci.yml)
 
 ---
 
@@ -220,6 +222,9 @@ live aggregation.
 
 A `rollup_watermark` guarantees each request is aggregated exactly once before its
 metadata rows are aged out; `VACUUM` runs periodically.
+
+A retention window of `0` means **keep forever** (no age-based delete for that
+class of data); positive values are the number of days a row is kept.
 
 ---
 

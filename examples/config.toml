@@ -42,6 +42,7 @@ ttl = "10m"                # exact-match entry lifetime.
 # max_bytes = 268435456    # optional byte cap on cached bodies (default 256 MiB).
 
 [retention]
+# Each window is in days; a value of 0 means KEEP FOREVER (no age-based delete).
 raw_bodies_days = 5        # ~3-7 days: age-based delete.
 metadata_days = 30         # per-request metadata: age-based delete.
 errors_days = 90           # errors: longer window, age-based delete.
