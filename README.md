@@ -264,6 +264,7 @@ only this:
 | `GET /health-states` | provider/key circuit-breaker states |
 | `GET /logs?limit=N` | recent request metadata (incl. `route_reason`) |
 | `GET /rollups` · `GET /audit` · `GET /cache` | retention/rollup/audit/cache views |
+| `GET /config` | active config path + version |
 | `POST /reload` | trigger config hot-reload |
 
 ---
@@ -276,6 +277,27 @@ only this:
 - Global + per-key in-flight caps, with a **bounded queue** (wait, then 429).
 - Per-host connection pooling / HTTP keep-alive (one shared `http.Transport`).
 - Pure-Go SQLite (`modernc.org/sqlite`) → `CGO_ENABLED=0`, truly static single binary.
+
+---
+
+## Development
+
+```sh
+make test        # go test ./...
+make test-race   # go test -race ./...
+make all         # fmt-check + vet + build + test
+make release     # version-stamped static binaries (tallow + tallowctl)
+```
+
+Tests are stdlib-only (`testing`, no external assertion deps) and live beside the
+code as `<pkg>_test.go` — every package under `internal/` has unit coverage,
+including race-tested concurrent paths (registry hot-swap, observability
+collector) and the admin interface exercised over a real Unix socket. The
+`cmd/tallowctl` keystore tests include a plaintext-leak contract: the on-disk
+keystore must never contain a secret in raw or base64 form. CI
+([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs build, vet,
+`go test -race`, and `gofmt` gates on every push, plus `govulncheck` and gosec
+scans.
 
 ---
 
