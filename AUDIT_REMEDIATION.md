@@ -76,7 +76,7 @@ nothing writes to it.
 
 | Package | Before | After |
 | --- | --- | --- |
-| `internal/store` | 41.3% | 79.2% |
+| `internal/store` | 41.3% | 79.5% |
 | `internal/secret` | 78.9% | 85.7% |
 | `internal/budget` | 72.9% | 98.8% |
 | `internal/compact` | 66.7% | 90.5% |
