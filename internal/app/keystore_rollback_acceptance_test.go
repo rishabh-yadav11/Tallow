@@ -122,15 +122,18 @@ func newGatewayWithKeystore(t *testing.T) (a *app.App, cfgPath, keystorePath str
 	return a, cfgPath, keystorePath, dir
 }
 
-// TestKeystoreGhostIsNotResurrectedByTheGatewayReload is the missing case.
+// TestAFailedKeyStoreSetIsNotResurrectedByTheNextSave is the rollback case.
 //
 // A Store that failed a Set is held open, the filesystem is repaired, and a
 // later Set is performed on the SAME Store. If Set left the failed entry in the
 // map, that later save serialises the whole map and persists a credential the
-// operator was told was never stored. App.Reload is called in between because
-// that is what the gateway does, and it must not be the thing that flushes the
-// ghost out.
-func TestKeystoreGhostIsNotResurrectedByTheGatewayReload(t *testing.T) {
+// operator was told was never stored, so the ghost surfaces on the next process
+// start. The name says "next save" rather than "gateway reload" because the
+// resurrection happens inside the long-lived Store's own save, and this test
+// drives a Store directly. The gateway's reload is a separate concern, covered
+// by TestGatewayReloadDoesNotDisturbTheKeystore and
+// TestAnUnreadableKeystoreFailsTheReloadClosed.
+func TestAFailedKeyStoreSetIsNotResurrectedByTheNextSave(t *testing.T) {
 	_, _, keystorePath, dir := newGatewayWithKeystore(t)
 
 	box, err := secret.NewBox([]byte("integration-master-key"))

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"net/http/httptest"
@@ -86,25 +87,37 @@ name = "flash"
 
 // startGatewayWithProviderRPM starts a real App whose single provider carries
 // the given aggregate RPM cap, with two usable keys on it.
-func startGatewayWithProviderRPM(t *testing.T, upstreamURL string, providerRPM int) (*app.App, string) {
+//
+// The two keys get DISTINCT secrets. Storing the same value under both refs would
+// mean the suite could not tell whether the router actually spread the traffic
+// or used one credential twice, which is precisely the property the shared-cap
+// test exists to check. Returning the keystore path lets a test read the secrets
+// back for comparison against what the upstream was actually sent.
+func startGatewayWithProviderRPM(t *testing.T, upstreamURL string, providerRPM int) (*app.App, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	box, err := secret.NewBox([]byte("integration-master-key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ks, err := secret.LoadStore(filepath.Join(dir, "keys.json"), box)
+	ksPath := filepath.Join(dir, "keys.json")
+	ks, err := secret.LoadStore(ksPath, box)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, ref := range []string{"p1:k1", "p1:k2"} {
-		if err := ks.Set(ref, "sk-fake"); err != nil {
+	// Distinct per key, so a credential observed upstream identifies which key
+	// served it.
+	for ref, val := range map[string]string{
+		"p1:k1": "sk-fake-key-one",
+		"p1:k2": "sk-fake-key-two",
+	} {
+		if err := ks.Set(ref, val); err != nil {
 			t.Fatal(err)
 		}
 	}
 	cfg := fmt.Sprintf(rpmCapCfg,
 		filepath.Join(dir, "admin.sock"),
-		filepath.Join(dir, "keys.json"),
+		ksPath,
 		filepath.Join(dir, "tallow.db"),
 		upstreamURL, providerRPM,
 	)
@@ -119,7 +132,78 @@ func startGatewayWithProviderRPM(t *testing.T, upstreamURL string, providerRPM i
 	}
 	srv := httptest.NewServer(a.ProxyHandler())
 	t.Cleanup(srv.Close)
-	return a, srv.URL
+	return a, srv.URL, ksPath
+}
+
+// postWithSession posts with an explicit X-Session-Id.
+//
+// It exists because the gateway's routing is sticky: absent a session header, the
+// sticky key is derived from the client bearer token and the alias, and every
+// request in these tests shares both, so ALL of them pin to whichever key was
+// picked first. Sending one request per distinct session is what actually makes
+// the key pool round-robin across keys, which is the property the shared-cap
+// test is about. A test that wanted two keys but sent one session would see the
+// cap enforced per key in appearance while never having touched the second one.
+func postWithSession(t *testing.T, url, session, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Session-Id", session)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+// credentialUpstream is a fakeUpstream that also records the credential each
+// request arrived with. The shared-cap claim is about provider traffic being
+// split across the provider's keys, and the only place that can be observed from
+// outside the gateway is what the upstream was actually sent.
+type credentialUpstream struct {
+	*fakeUpstream
+	credsMu sync.Mutex
+	creds   []string
+}
+
+func (c *credentialUpstream) handler(w http.ResponseWriter, r *http.Request) {
+	c.credsMu.Lock()
+	c.creds = append(c.creds, r.Header.Get("Authorization"))
+	c.credsMu.Unlock()
+	c.fakeUpstream.handler(w, r)
+}
+
+func (c *credentialUpstream) seenCredentials() []string {
+	c.credsMu.Lock()
+	defer c.credsMu.Unlock()
+	return append([]string(nil), c.creds...)
+}
+
+func setupCredentialUpstream(t *testing.T) (*httptest.Server, *credentialUpstream) {
+	t.Helper()
+	up := &credentialUpstream{fakeUpstream: &fakeUpstream{}}
+	up.srv = httptest.NewServer(http.HandlerFunc(up.handler))
+	t.Cleanup(up.srv.Close)
+	return up.srv, up
+}
+
+// distinct returns the credentials that are not the empty string and appear
+// exactly once, which is what "two different credentials were used" means once
+// the header formatting has been stripped off.
+func distinct(creds []string) map[string]int {
+	m := make(map[string]int, len(creds))
+	for _, c := range creds {
+		c = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(c), "Bearer "))
+		if c == "" {
+			continue
+		}
+		m[c]++
+	}
+	return m
 }
 
 // TestProviderRPMCapIsSharedAcrossKeys is the aggregate assertion. The cap
@@ -128,9 +212,9 @@ func startGatewayWithProviderRPM(t *testing.T, upstreamURL string, providerRPM i
 // pass any single-key test and still overrun the provider's real quota, which is
 // the entire reason the provider-level cap exists.
 func TestProviderRPMCapIsSharedAcrossKeys(t *testing.T) {
-	upSrv, up := setup(t)
+	upSrv, up := setupCredentialUpstream(t)
 	const cap = 4
-	_, gw := startGatewayWithProviderRPM(t, upSrv.URL, cap)
+	_, gw, _ := startGatewayWithProviderRPM(t, upSrv.URL, cap)
 
 	// Enough traffic to overrun the cap twice over. Every request is distinct
 	// so nothing is served from cache: a cache hit consumes no provider RPM and
@@ -189,23 +273,83 @@ func TestProviderRPMCapIsSharedAcrossKeys(t *testing.T) {
 // allowance twice and fail here even though TestProviderRPMCapIsSharedAcrossKeys
 // passed on a single alias.
 func TestProviderRPMCapHoldsAcrossTwoKeysExplicitly(t *testing.T) {
-	upSrv, _ := setup(t)
+	upSrv, up := setupCredentialUpstream(t)
 	const cap = 4
-	_, gw := startGatewayWithProviderRPM(t, upSrv.URL, cap)
+	_, gw, _ := startGatewayWithProviderRPM(t, upSrv.URL, cap)
 
-	// Three requests, which the router will spread across both keys, then a
-	// fourth that must be refused. If the cap were per key, the aggregate would
-	// still have room and the fourth would succeed.
+	// One request per session, so the round-robin key pool actually alternates
+	// between the provider's two keys instead of sticky routing pinning every
+	// request to the first one. If the cap were per key, the aggregate would
+	// still have room after the first key's allowance and this would pass
+	// `cap+2` requests.
 	served := 0
 	for i := 0; i < cap+2; i++ {
 		body := fmt.Sprintf(`{"model":"flash","messages":[{"role":"user","content":"split-%d"}]}`, i)
-		resp, _ := post(t, gw+"/v1/chat/completions", body)
+		resp := postWithSession(t, gw+"/v1/chat/completions", fmt.Sprintf("split-session-%d", i), body)
 		if resp.StatusCode == http.StatusOK {
 			served++
 		}
 	}
 	if served > cap {
 		t.Errorf("served %d requests with a shared provider cap of %d", served, cap)
+	}
+	if served == 0 {
+		t.Fatal("no request was served: a cap assertion would pass vacuously")
+	}
+
+	// The aggregate assertion above only bites if BOTH keys were actually used
+	// to spend the cap. If the router had served all of it through one key, then
+	// a per-key cap would also have stopped at `cap` here and the test would pass
+	// for the wrong reason. This is the check that distinguishes "shared cap,
+	// traffic split across keys" from "one key happened to be enough".
+	creds := distinct(up.seenCredentials())
+	if len(creds) < 2 {
+		t.Errorf("the provider cap was spent using %d distinct credential(s) "+
+			"(%v); the aggregate cap was never actually shared across the "+
+			"provider's two keys, so this test does not establish sharing",
+			len(creds), creds)
+	}
+}
+
+// TestProviderRPMCapChargesEachRequestOnce checks the accounting, not just the
+// cap. The two keys hold distinct secrets, so the upstream can attribute every
+// accepted request to a key, and the number of upstream hits must equal the
+// number the gateway counted as served. A charge that is refunded on success
+// would let the gateway serve more than `cap` while looking correct here.
+func TestProviderRPMCapChargesEachRequestOnce(t *testing.T) {
+	upSrv, up := setupCredentialUpstream(t)
+	const cap = 3
+	_, gw, _ := startGatewayWithProviderRPM(t, upSrv.URL, cap)
+
+	served, limited := 0, 0
+	for i := 0; i < cap*4; i++ {
+		body := fmt.Sprintf(`{"model":"flash","messages":[{"role":"user","content":"acct-%d"}]}`, i)
+		// Distinct sessions, so both keys are charged and the traffic is really
+		// split rather than pinned to one by sticky routing.
+		resp := postWithSession(t, gw+"/v1/chat/completions", fmt.Sprintf("acct-session-%d", i), body)
+		switch resp.StatusCode {
+		case http.StatusOK:
+			served++
+		case http.StatusTooManyRequests:
+			limited++
+		default:
+			t.Fatalf("request %d: unexpected status %d", i, resp.StatusCode)
+		}
+	}
+
+	// The upstream hit count is the ground truth for provider traffic. Anything
+	// above `cap` means real requests went out past a cap the operator set.
+	if got := int(up.hits.Load()); got > cap {
+		t.Errorf("the upstream received %d requests under a provider cap of %d: "+
+			"the cap is not bounding real provider traffic", got, cap)
+	}
+	if got := int(up.hits.Load()); got != served {
+		t.Errorf("the upstream saw %d requests but the gateway counted %d served: "+
+			"the RPM accounting and the actual traffic disagree", got, served)
+	}
+	if limited == 0 {
+		t.Error("no request was rate limited: the test never reached the cap, so " +
+			"it proves nothing about enforcement")
 	}
 }
 
@@ -217,7 +361,7 @@ func TestProviderRPMCapHoldsAcrossTwoKeysExplicitly(t *testing.T) {
 func TestBudgetViewRemainsCoherentWhenACapIsHit(t *testing.T) {
 	upSrv, _ := setup(t)
 	const cap = 2
-	a, gw := startGatewayWithProviderRPM(t, upSrv.URL, cap)
+	a, gw, _ := startGatewayWithProviderRPM(t, upSrv.URL, cap)
 
 	// Drive past the cap so both the accepted and the refused states are seen.
 	for i := 0; i < cap+2; i++ {

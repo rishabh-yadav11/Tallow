@@ -240,8 +240,20 @@ func TestRepeatedStaleAbandonsCannotAccumulateHeadroom(t *testing.T) {
 // path would silently leak capacity.
 func TestAnAbandonInsideItsOwnWindowStillRefunds(t *testing.T) {
 	const rpm = 2
+	const window = time.Minute
 
-	now := time.Unix(1000, 0)
+	// The clock starts just before the end of its own window, and the abandon
+	// happens a second later, INSIDE that window. This detail is load-bearing.
+	//
+	// The first version of this test used time.Unix(1000, 0) with a router whose
+	// window is one minute, so both the Allow and the refund happened at t=1000
+	// while the window ran to t=1060. FixedWindow.Remaining short-circuits to
+	// "full headroom" whenever now is past resetAt, without consulting the count
+	// at all, so the assertion read Limit and passed whether or not the refund
+	// had actually been issued. Deleting the refund call from releaseSelection
+	// entirely left this test green. The window is now positioned so the read
+	// has to go through the count.
+	now := time.Unix(1000, 0).Add(window - time.Second)
 	r := rpmRouter(t, rpm, &now)
 
 	sel, err := r.Select("flash", "", nil)
@@ -252,12 +264,64 @@ func TestAnAbandonInsideItsOwnWindowStillRefunds(t *testing.T) {
 		t.Fatalf("after one admission remaining=%d, want %d", got, rpm-1)
 	}
 
-	// Abandon within the same window: the slot must come back.
+	// Abandon one second later, still inside the same window: the slot must come
+	// back.
+	now = now.Add(time.Second)
 	r.releaseSelection(sel)
 	if got := providerRemaining(t, r, now); got != rpm {
 		t.Errorf("remaining=%d after an in-window abandon, want the full %d: the "+
 			"stale-refund guard also rejected legitimate same-window refunds, "+
 			"leaking provider capacity", got, rpm)
+	}
+}
+
+// TestAnAbandonReturnsOnlyTheSlotItCharged checks the refund is paired with its
+// own Allow rather than with the window.
+//
+// The in-window test above proves a refund happens. It cannot prove the refund
+// is the RIGHT one, because a refund that ignores its pairing would still restore
+// a single slot. Here two requests are charged and only one is abandoned, so a
+// refund that is not scoped to the selection it belongs to shows up as a count
+// that is too high, which is the direction that breaks the cap rather than the
+// one that merely wastes capacity.
+func TestAnAbandonReturnsOnlyTheSlotItCharged(t *testing.T) {
+	const rpm = 3
+	const window = time.Minute
+
+	now := time.Unix(1000, 0).Add(window - 2*time.Second)
+	r := rpmRouter(t, rpm, &now)
+
+	// Two admissions, both real and both kept.
+	kept, err := r.Select("flash", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abandoned, err := r.Select("flash", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := providerRemaining(t, r, now); got != rpm-2 {
+		t.Fatalf("after two admissions remaining=%d, want %d", got, rpm-2)
+	}
+
+	// Abandon the second one, still inside the window. Exactly one slot returns:
+	// the one this selection charged.
+	now = now.Add(time.Second)
+	r.releaseSelection(abandoned)
+	if got := providerRemaining(t, r, now); got != rpm-1 {
+		t.Errorf("remaining=%d after abandoning one of two admissions, want %d: the "+
+			"refund did not correspond to the charge it was supposed to offset",
+			got, rpm-1)
+	}
+
+	// And the kept request's slot is still spent, which is the assertion that
+	// separates a paired refund from a blanket window reset.
+	now = now.Add(time.Second)
+	r.Release(kept, 0)
+	if got := providerRemaining(t, r, now); got != rpm-1 {
+		t.Errorf("remaining=%d after releasing the completed request, want %d: a "+
+			"completed request must keep its slot for the rest of the window",
+			got, rpm-1)
 	}
 }
 
