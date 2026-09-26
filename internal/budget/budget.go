@@ -51,6 +51,37 @@ func (w *FixedWindow) Peek(now time.Time) bool {
 	return w.count < w.Limit
 }
 
+// Refund returns one previously consumed unit to the window. It is the exact
+// inverse of Allow for the same `now`, and is used when a request is admitted
+// but then abandoned (e.g. the caller discovers the target was gone and routes
+// elsewhere), so a failed attempt does not permanently consume capacity.
+//
+// count is CONSUMED units, so a refund DECREMENTS it; headroom is
+// limit - count. Two safety properties matter, because a refund not perfectly
+// paired with its Allow would let a provider exceed its configured RPM:
+//   - Refunding a window that already rolled over is a no-op; the Allow it
+//     would offset happened in the previous window and is long gone.
+//   - The count is clamped at zero so an unmatched refund cannot walk the
+//     count negative, which would manufacture headroom on every extra refund.
+func (w *FixedWindow) Refund(now time.Time) {
+	if w.Limit <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// Only a window that has actually rolled forward rejects the refund. The
+	// zero-resetAt case must be excluded explicitly: a FixedWindow built as a
+	// struct literal (as tests and some constructors do) has a zero resetAt,
+	// and now.After(zero) is true for every realistic clock, so without this
+	// guard EVERY refund on such a window would be silently discarded.
+	if !w.resetAt.IsZero() && now.After(w.resetAt) {
+		return // window rolled over; the old charge is already gone.
+	}
+	if w.count > 0 {
+		w.count--
+	}
+}
+
 // Remaining reports headroom in the current window; -1 = unlimited.
 func (w *FixedWindow) Remaining(now time.Time) int {
 	if w.Limit <= 0 {
@@ -223,6 +254,14 @@ func (p *ProviderBudget) SetRPM(rpm int) {
 // Allow consumes a provider-level RPM slot.
 func (p *ProviderBudget) Allow(now time.Time) bool {
 	return p.rpm.Allow(now)
+}
+
+// Release returns a provider-level RPM slot consumed by Allow. Without this,
+// a provider's aggregate cap was consumed permanently by every request ever
+// routed to it, so the cap ratcheted downward and eventually starved the
+// provider regardless of actual traffic (audit M5).
+func (p *ProviderBudget) Release(now time.Time) {
+	p.rpm.Refund(now)
 }
 
 // Remaining reports provider-level RPM headroom; -1 = unlimited.

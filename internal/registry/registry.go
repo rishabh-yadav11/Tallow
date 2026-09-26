@@ -10,10 +10,21 @@ import (
 )
 
 // Registry is the concurrency-safe snapshot of providers and aliases.
+//
+// The doc comment above ("swapped atomically ... no request ever observes a
+// half-applied configuration") describes the registry ITSELF and is true: the
+// two maps move together under one lock. It must not be read as a claim that a
+// registry swap and the router's budget map are installed together - those are
+// separate objects with separate locks, and the window between them is audit
+// finding C4, which internal/app closes by ordering the two publishes.
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[string]*model.Provider
 	aliases   map[string]*model.Alias
+	// version increments on every Swap. It lets readers that memoize data
+	// derived from the snapshot (routing's candidate cache) detect a change
+	// with a single integer compare instead of deep-comparing the snapshot.
+	version uint64
 }
 
 // New builds a registry from resolved providers (key secrets already filled)
@@ -42,7 +53,16 @@ func (r *Registry) Swap(providers []model.Provider, aliases []model.Alias) {
 	r.mu.Lock()
 	r.providers = pm
 	r.aliases = am
+	r.version++
 	r.mu.Unlock()
+}
+
+// Version reports the current snapshot generation. Any value derived from the
+// snapshot (and cached by a caller) is stale once this number changes.
+func (r *Registry) Version() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.version
 }
 
 // Provider returns a provider by name (the caller must not mutate it).

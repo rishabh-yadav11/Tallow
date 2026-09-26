@@ -3,6 +3,7 @@
 package routing
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -28,6 +29,14 @@ type Router struct {
 	bmu  sync.RWMutex // guards budgets + pBudget against hot-reload writes.
 	rrmu sync.Mutex
 	rr   map[string]int // provider -> round-robin offset.
+
+	// M6: candidate lists are a pure function of the registry snapshot, but
+	// were rebuilt on every Select (53% of all allocations, 37.6% of Select
+	// CPU). They are memoized here and invalidated by registry version, so a
+	// config hot-reload is the only thing that rebuilds them.
+	cmu     sync.Mutex
+	candVer uint64                 // registry version candMap was built from
+	candMap map[string][]candidate // alias -> expanded candidates
 }
 
 // NewRouter wires the router. stickyTTL <= 0 disables sticky affinity.
@@ -40,9 +49,11 @@ func NewRouter(reg *registry.Registry, h *health.Registry, stickyTTL time.Durati
 		health:  h,
 		budgets: map[string]*budget.KeyBudget{},
 		pBudget: map[string]*budget.ProviderBudget{},
-		sticky:  NewSticky(stickyTTL),
+		sticky:  NewSticky(stickyTTL, now),
 		now:     now,
 		rr:      map[string]int{},
+		// Seeded as already-stale so the first Select populates the cache.
+		candMap: map[string][]candidate{},
 	}
 }
 
@@ -79,7 +90,40 @@ func (r *Router) SetBudgets(keys map[string]budget.KeyLimits, providers map[stri
 			delete(r.pBudget, id)
 		}
 	}
+	// M10: prune round-robin offsets for providers that no longer exist. The rr
+	// map is keyed by provider id and was only ever added to, so a gateway that
+	// reloaded config repeatedly with changing provider names grew it without
+	// bound, retaining an int for every provider id ever seen.
+	r.rrmu.Lock()
+	for id := range r.rr {
+		if _, ok := providers[id]; !ok {
+			delete(r.rr, id)
+		}
+	}
+	r.rrmu.Unlock()
+
+	// M6: a budget change can coincide with a registry change; drop the
+	// candidate cache so the next Select re-expands against the current
+	// snapshot instead of trusting a possibly stale list.
+	r.cmu.Lock()
+	r.candMap = map[string][]candidate{}
+	r.candVer = 0
+	r.cmu.Unlock()
 }
+
+// errStaleSelection marks a selection whose provider/key vanished from the
+// registry underneath it. C1: validity used to be *inferred* from an empty
+// BaseURL, and the caller then dereferenced sel.kb on the assumption that a
+// selection always has a budget. That assumption is false after a hot-reload
+// drops the key, and the resulting nil dereference remotely killed the gateway.
+// Callers now get an explicit signal instead of guessing.
+var errStaleSelection = errors.New("selection target no longer in registry")
+
+// errNoBudget marks a key that is routable but has no budget entry. C4: the
+// old code did `if kb != nil { ... }`, which silently treated a missing budget
+// as "unlimited" - fail-open. A key with no budget is now rejected, and this is
+// a distinct error from staleness so the routing trail says which it was.
+var errNoBudget = errors.New("no budget installed for key")
 
 // Selection is a routed, budget-reserved destination.
 type Selection struct {
@@ -96,6 +140,33 @@ type Selection struct {
 	Timeout time.Duration
 
 	kb *budget.KeyBudget
+	// pb records a provider-level RPM charge this selection consumed but that
+	// Select then ABANDONED, so it must be handed back.
+	//
+	// This is deliberately not how a completed request is accounted. Provider
+	// rpm is a request RATE limit, not a concurrency limit: a request that ran
+	// to completion has still consumed one unit of the provider's per-minute
+	// quota, and refunding it on release would make the cap unenforceable.
+	// TestE2EStickyProviderRPMEnforced exists to pin exactly that. The only
+	// charge refunded is one taken for a candidate Select rejected before the
+	// request was ever sent there, so audit M5's "consumed but never released"
+	// is real but scoped to the abandon path.
+	pb    *budget.ProviderBudget
+	pbSet bool
+}
+
+// claimProviderRPM records an abandoned provider-level RPM charge for refund,
+// and reports whether this call was the one that claimed it.
+//
+// Several candidate-loop exits can each decide to abandon a selection, so
+// ownership must be settled in exactly one place. Otherwise a refund would be
+// applied for a charge never taken, manufacturing headroom past the RPM cap.
+func (sel *Selection) claimProviderRPM(pb *budget.ProviderBudget) bool {
+	if sel == nil || sel.pbSet {
+		return false
+	}
+	sel.pb, sel.pbSet = pb, true
+	return true
 }
 
 // Candidates are the ordered provider/model pairs for an alias, including
@@ -104,28 +175,87 @@ type candidate struct {
 	provider string
 	model    string
 	target   model.Target
-	targetOK bool
 }
 
+// maxFallbackDepth bounds transitive fallback expansion (M4). Cycles are
+// handled by `seen`; this is a second belt-and-braces stop so a pathological
+// graph cannot produce an unbounded candidate list even if `seen` is bypassed.
+const maxFallbackDepth = 8
+
+// candidates expands an alias's targets plus their transitive provider fallback
+// chains, in preference order.
+//
+// The result is a pure function of the registry snapshot, yet it accounted for
+// 53% of all allocations and 37.6% of Select CPU (M6) because it was rebuilt
+// on every request. Callers reach it through r.cachedCandidates, which memoizes
+// per registry version.
 func (r *Router) candidates(alias *model.Alias) []candidate {
 	var out []candidate
 	seen := map[string]bool{}
+	// queue holds providers whose fallback chain still needs expanding. M4: the
+	// original walked exactly one level, so a->b->c never reached c. A worklist
+	// walks the graph to a fixed point, bounded by maxFallbackDepth.
+	type pending struct {
+		provider string
+		model    string
+		target   model.Target
+		depth    int
+	}
+	var queue []pending
 	for _, t := range alias.Targets {
 		if !seen[t.Provider] {
-			out = append(out, candidate{provider: t.Provider, model: t.Model, target: t, targetOK: true})
+			out = append(out, candidate{provider: t.Provider, model: t.Model, target: t})
 			seen[t.Provider] = true
 		}
-		// Expand provider fallback chain with the same upstream model.
-		if p, ok := r.reg.Provider(t.Provider); ok {
-			for _, f := range p.Fallback {
-				if !seen[f] {
-					out = append(out, candidate{provider: f, model: t.Model, target: t})
-					seen[f] = true
-				}
+		queue = append(queue, pending{provider: t.Provider, model: t.Model, target: t})
+	}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur.depth >= maxFallbackDepth {
+			continue
+		}
+		p, ok := r.reg.Provider(cur.provider)
+		if !ok {
+			continue
+		}
+		// A fallback provider inherits the *originating* upstream model and
+		// target, so the request stays semantically the same request.
+		for _, f := range p.Fallback {
+			if !seen[f] {
+				out = append(out, candidate{provider: f, model: cur.model, target: cur.target})
+				seen[f] = true
+				queue = append(queue, pending{provider: f, model: cur.model, target: cur.target, depth: cur.depth + 1})
 			}
 		}
 	}
 	return out
+}
+
+// cachedCandidates returns the memoized candidate list for an alias, rebuilding
+// it only when the registry snapshot has changed (M6).
+//
+// The returned slice is shared and must be treated as read-only by callers; it
+// is never mutated after being cached.
+func (r *Router) cachedCandidates(aliasName string, a *model.Alias) []candidate {
+	ver := r.reg.Version()
+
+	r.cmu.Lock()
+	defer r.cmu.Unlock()
+	if r.candVer == ver {
+		if c, ok := r.candMap[aliasName]; ok {
+			return c
+		}
+	}
+	// Either the registry moved on or this alias is not cached yet.
+	built := r.candidates(a)
+	if r.candVer != ver {
+		// A new snapshot invalidates every alias, not just this one.
+		r.candMap = make(map[string][]candidate, len(r.candMap)+1)
+		r.candVer = ver
+	}
+	r.candMap[aliasName] = built
+	return built
 }
 
 // Select routes alias to a provider/key, consuming budgets. skip is a set of
@@ -145,30 +275,40 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 		if p, k, tgt, ok := r.sticky.Get(sessionKey, now); ok && !skip[p+"/"+k] && !skip[p] {
 			// Health gate: an unhealthy key/provider must not be re-pinned.
 			if r.health.Provider(p).Allow(now) && r.health.Key(p, k).Allow(now) {
-				if sel, err := r.acquire(p, k, tgt.Model, tgt, now); err == nil {
-					if sel.BaseURL != "" {
-						sel.Alias = alias
-						sel.SessionKey = sessionKey
-						sel.Model = tgt.Model
-						sel.Target = tgt
-						sel.Reason = finalReason(reasons, "sticky:"+p+"/"+k)
-						r.sticky.Put(sessionKey, p, k, tgt)
-						return sel, nil
-					}
-					// Provider/key removed from registry on hot-reload: the pin
-					// is stale. Forget it, return the reserved slot, and route
-					// normally (mirrors the non-sticky removed path below).
-					reasons = append(reasons, "sticky:"+p+"/"+k+":removed")
+				sel, err := r.acquire(p, k, tgt.Model, tgt, now)
+				switch {
+				case err == nil:
+					sel.Alias = alias
+					sel.SessionKey = sessionKey
+					sel.Model = tgt.Model
+					sel.Target = tgt
+					sel.Reason = finalReason(reasons, "sticky:"+p+"/"+k)
+					r.sticky.Put(sessionKey, p, k, tgt)
+					return sel, nil
+				case errors.Is(err, errStaleSelection), errors.Is(err, errNoBudget):
+					// The pin is stale: the provider/key (or its budget) was
+					// removed on hot-reload. Forget it and route normally.
+					// r.releaseSelection is nil-safe, so a budget-less
+					// selection cannot panic here (C1).
+					r.releaseSelection(sel)
 					r.sticky.Forget(sessionKey)
-					sel.kb.Release(0)
+					reasons = append(reasons, "sticky:"+p+"/"+k+":removed")
+				default:
+					// Budget or provider RPM exhausted on the pinned target:
+					// fall through to normal routing rather than stranding the
+					// session, but forget the pin so the next attempt re-picks.
+					r.releaseSelection(sel)
+					r.sticky.Forget(sessionKey)
+					reasons = append(reasons, "sticky:"+p+"/"+k+":exhausted")
 				}
+			} else {
+				reasons = append(reasons, "sticky:"+p+"/"+k+":stale")
+				r.sticky.Forget(sessionKey)
 			}
-			reasons = append(reasons, "sticky:"+p+"/"+k+":stale")
-			r.sticky.Forget(sessionKey)
 		}
 	}
 
-	for _, c := range r.candidates(a) {
+	for _, c := range r.cachedCandidates(alias, a) {
 		provID := "provider:" + c.provider
 		if skip[c.provider] {
 			reasons = append(reasons, provID+":skip")
@@ -189,21 +329,40 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 		}
 		sel, err := r.acquireKey(c.provider, now, &reasons, skip)
 		if err != nil {
-			reasons = append(reasons, provID+":no_key")
+			// C1: the candidate's provider disappeared between building the
+			// candidate list and acquiring. Release via the nil-safe helper.
+			r.releaseSelection(sel)
+			if errors.Is(err, errStaleSelection) {
+				reasons = append(reasons, "provider:"+c.provider+":removed")
+			} else {
+				reasons = append(reasons, provID+":no_key")
+			}
 			continue
 		}
+		// C1: same nil-deref hazard on the removed-provider path.
 		if sel.BaseURL == "" {
 			// Provider was removed from the registry on hot-reload; skip this
 			// candidate rather than forwarding to an empty upstream URL.
-			sel.kb.Release(0)
+			r.releaseSelection(sel)
 			reasons = append(reasons, "provider:"+c.provider+":removed")
 			continue
 		}
 		if pb != nil && !pb.Allow(now) {
-			sel.kb.Release(0)
+			// Allow returned false, so the provider window was NOT charged and
+			// there is nothing to refund. Releasing the key slot lets the loop
+			// try the next candidate. Note this is the second RPM check for
+			// this candidate: the first was the cheap Remaining() peek above,
+			// and this one closes the race between the peek and here.
+			r.releaseSelection(sel)
 			reasons = append(reasons, provID+":provider_rpm_race")
 			continue
 		}
+		// M5: this Allow is the ONLY provider-RPM charge on the non-sticky
+		// path (acquireKey does not charge it), so the selection owns exactly
+		// one slot. Claiming it means an abandon in this iteration refunds it
+		// rather than leaking it; a request that runs keeps it, because
+		// provider rpm is a rate limit, not a concurrency limit.
+		sel.claimProviderRPM(pb)
 		sel.Target = c.target
 		sel.Model = c.model
 		sel.Alias = alias
@@ -226,6 +385,27 @@ func finalReason(trail []string, final string) string {
 	return strings.Join(trail, "; ") + " -> " + final
 }
 
+// releaseSelection returns a reservation that Select will not use, without
+// assuming the selection has a budget. C1: the old code called sel.kb.Release
+// directly, so a budget-less selection (legal after a hot-reload drops the
+// key's budget) dereferenced nil and took the process down.
+//
+// This is the ABANDON path: Select gives the slot back because it will not use
+// this candidate, so any provider RPM it charged is refunded here (M5). A
+// selection that is actually used goes through Release instead.
+func (r *Router) releaseSelection(sel *Selection) {
+	if sel == nil {
+		return
+	}
+	if sel.kb != nil {
+		sel.kb.Release(0)
+	}
+	if sel.pb != nil && sel.pbSet {
+		sel.pb.Release(r.now())
+	}
+	sel.pb, sel.pbSet, sel.kb = nil, false, nil
+}
+
 // acquire reserves a specific provider/key (used by sticky path). It enforces
 // both the key budget and the provider-level RPM cap, mirroring the non-sticky
 // acquireKey path so a pinned session cannot exceed the aggregate provider cap.
@@ -235,20 +415,35 @@ func (r *Router) acquire(provider, key, model string, target model.Target, now t
 	kb := r.budgets[id]
 	pb := r.pBudget[provider]
 	r.bmu.RUnlock()
-	if kb != nil {
-		if ok, _ := kb.Acquire(now); !ok {
-			return nil, fmt.Errorf("budget exhausted")
-		}
+
+	// C4: fail CLOSED. A key with no budget entry is NOT unlimited; treating a
+	// missing budget as "no limit" is fail-open, so a hot-reload window that
+	// dropped a budget silently removed the key's spend cap. Reject instead.
+	if kb == nil {
+		return nil, fmt.Errorf("%w: %s", errNoBudget, id)
+	}
+	if ok, _ := kb.Acquire(now); !ok {
+		return nil, fmt.Errorf("budget exhausted")
 	}
 	if pb != nil && !pb.Allow(now) {
 		// Provider RPM exhausted; do not burn the key's reserved slot.
-		if kb != nil {
-			kb.Release(0)
-		}
+		kb.Release(0)
 		return nil, fmt.Errorf("provider rpm exhausted")
 	}
 	sel := &Selection{Provider: provider, Key: key, Model: model, Target: target, kb: kb}
+	// The provider RPM charge taken above belongs to this selection. Claiming
+	// it here means a later abandon (releaseSelection) hands the slot back,
+	// while a request that actually runs keeps the charge for the rest of the
+	// window - provider rpm is a rate limit, not a concurrency limit.
+	sel.claimProviderRPM(pb)
 	fillDest(r.reg, sel)
+	if sel.BaseURL == "" {
+		// Provider vanished from the registry between the budget read and now.
+		// C1: return the reserved slot through the nil-safe path, which also
+		// refunds the provider RPM just charged - the request never went here.
+		r.releaseSelection(sel)
+		return sel, errStaleSelection
+	}
 	return sel, nil
 }
 
@@ -295,25 +490,48 @@ func (r *Router) acquireKey(provider string, now time.Time, reasons *[]string, s
 		r.bmu.RLock()
 		kb := r.budgets[id]
 		r.bmu.RUnlock()
-		if kb != nil {
-			if ok, reason := kb.Acquire(now); !ok {
-				*reasons = append(*reasons, "key:"+k.ID+":"+reason)
-				continue
-			}
+		// C4: fail closed. Every routable key must have a budget; a key without
+		// one is rejected instead of being served with no limits at all.
+		if kb == nil {
+			*reasons = append(*reasons, "key:"+k.ID+":no_budget")
+			continue
+		}
+		if ok, reason := kb.Acquire(now); !ok {
+			*reasons = append(*reasons, "key:"+k.ID+":"+reason)
+			continue
 		}
 		sel := &Selection{Provider: provider, Key: k.ID, kb: kb}
 		fillDest(r.reg, sel)
+		if sel.BaseURL == "" {
+			// Provider removed from the registry between the key scan and now.
+			// C1: return the reserved slot through the nil-safe path.
+			kb.Release(0)
+			sel.kb = nil
+			return sel, errStaleSelection
+		}
 		return sel, nil
 	}
 	return nil, fmt.Errorf("no usable key")
 }
 
 // Release returns the reserved in-flight slot and accumulates cost.
-func (r *Router) Release(sel *Selection, costCents int64) {
-	if sel == nil || sel.kb == nil {
+//
+// It deliberately does NOT refund provider-level RPM. Provider rpm is a rate
+// limit over requests, so a completed request has consumed its slot for the
+// rest of the window; refunding here would let a caller loop through a
+// provider's cap indefinitely. Only a candidate that Select abandoned is
+// refunded, in releaseSelection.
+func (r *Router) Release(sel *Selection, costMicros int64) {
+	if sel == nil {
 		return
 	}
-	sel.kb.Release(costCents)
+	if sel.kb != nil {
+		sel.kb.Release(costMicros)
+		// Clear the handle so a repeated Release cannot double-decrement the
+		// in-flight counter or double-count cost.
+		sel.kb = nil
+	}
+	sel.pb, sel.pbSet = nil, false
 }
 
 // RecordSuccess closes the relevant breakers and re-affirms sticky.
@@ -339,8 +557,25 @@ func (r *Router) RecordFailure(sel *Selection) {
 type Sticky struct {
 	mu  sync.Mutex
 	ttl time.Duration
+	now func() time.Time
 	m   map[string]stickyEntry
+	// opsSinceSweep counts Put calls since the last idle sweep. A count is
+	// used rather than a timestamp so the sweep cadence does not depend on
+	// wall-clock jumps (M12).
+	opsSinceSweep int
 }
+
+// Sticky memory bounds. Session keys arrive from the client via X-Session-Id,
+// so they are attacker-controlled: 100k distinct ids cost ~43 MB and nothing
+// ever removed them, because ttl == 0 means "never expire" and that was the
+// value a config omission produced (audit H7). The TTL is therefore only ONE of
+// two bounds - maxEntries is the other, and it applies even when the TTL is
+// disabled. stickySweepEvery amortizes expiry checks so idle entries are
+// reclaimed promptly without scanning the map on every request.
+const (
+	stickyMaxEntries = 10000
+	stickySweepEvery = 64
+)
 
 type stickyEntry struct {
 	provider, key string
@@ -348,9 +583,61 @@ type stickyEntry struct {
 	at            time.Time
 }
 
-// NewSticky builds a sticky store. ttl <= 0 disables expiry (always sticky).
-func NewSticky(ttl time.Duration) *Sticky {
-	return &Sticky{ttl: ttl, m: map[string]stickyEntry{}}
+// NewSticky builds a sticky store. ttl <= 0 disables idle expiry (always
+// sticky until evicted by the size cap or an explicit Forget).
+//
+// now is injected rather than read from time.Now so Put and Get agree on a
+// single clock source (M12). Previously Put stamped time.Now() while Get
+// compared against the router's injected clock, so an injected clock in tests
+// (and any NTP step in production) could pin an entry that was already
+// expired, or refuse to expire one that was not.
+func NewSticky(ttl time.Duration, now func() time.Time) *Sticky {
+	if now == nil {
+		now = time.Now
+	}
+	return &Sticky{ttl: ttl, now: now, m: map[string]stickyEntry{}}
+}
+
+// sweep drops idle-expired entries. It must be called with s.mu held.
+// Entries are removed by the same rule as Get, so a sweep can never remove an
+// entry that Get would consider live.
+func (s *Sticky) sweep(now time.Time) {
+	s.opsSinceSweep = 0
+	if s.ttl <= 0 {
+		// Idle expiry is disabled, so a sweep has nothing to reclaim; the size
+		// cap is what bounds memory in this configuration.
+		return
+	}
+	for k, e := range s.m {
+		if now.Sub(e.at) > s.ttl {
+			delete(s.m, k)
+		}
+	}
+}
+
+// evictLocked enforces the size cap by dropping the entry with the oldest
+// timestamp. It must be called with s.mu held.
+//
+// Go randomizes map iteration order, so finding the true oldest entry requires
+// a full scan. That is affordable precisely because this only runs on the
+// insert that reaches the cap, i.e. once per stickyMaxEntries pins.
+func (s *Sticky) evictLocked() {
+	if len(s.m) < stickyMaxEntries {
+		return
+	}
+	var (
+		oldestKey string
+		oldestAt  time.Time
+		found     bool
+	)
+	for k, e := range s.m {
+		if !found || e.at.Before(oldestAt) {
+			oldestKey, oldestAt, found = k, e.at, true
+		}
+	}
+	if found {
+		delete(s.m, oldestKey)
+	}
 }
 
 // Get returns a live (non-idle-expired) pin.
@@ -365,6 +652,10 @@ func (s *Sticky) Get(sessionKey string, now time.Time) (string, string, model.Ta
 		delete(s.m, sessionKey)
 		return "", "", model.Target{}, false
 	}
+	// Refresh the idle timer. NOTE (H7): this makes the TTL a *sliding* idle
+	// window, so a session polled more often than the TTL never expires. That
+	// is intentional for cache reuse, but it is why the TTL cannot be the only
+	// memory bound - the size cap above is what stops unbounded growth.
 	e.at = now
 	s.m[sessionKey] = e
 	return e.provider, e.key, e.target, true
@@ -373,8 +664,22 @@ func (s *Sticky) Get(sessionKey string, now time.Time) (string, string, model.Ta
 // Put records a pin.
 func (s *Sticky) Put(sessionKey, provider, key string, target model.Target) {
 	s.mu.Lock()
-	s.m[sessionKey] = stickyEntry{provider: provider, key: key, target: target, at: time.Now()}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	now := s.now()
+	// Amortized idle sweep, then the size-cap eviction for the incoming entry.
+	s.opsSinceSweep++
+	if s.opsSinceSweep >= stickySweepEvery {
+		s.sweep(now)
+	}
+	s.m[sessionKey] = stickyEntry{provider: provider, key: key, target: target, at: now}
+	s.evictLocked()
+}
+
+// Len reports the number of live pins; used by tests and the admin view.
+func (s *Sticky) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.m)
 }
 
 // Forget drops a pin.
