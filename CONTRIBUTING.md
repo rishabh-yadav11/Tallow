@@ -30,7 +30,9 @@ driver is the pure-Go `modernc.org/sqlite` on purpose.
 ## Commit conventions
 
 Use Conventional Commits style (`fix:`, `feat:`, `test:`, `docs:`, `chore:`,
-`ci:`) as the existing history does.
+`ci:`) with an optional scope, e.g. `fix(routing): ...`. A scope naming the
+package is preferred here (`routing:`, `store:`, `proxy:`) and is what most of
+the recent history uses.
 
 ## Design constraints to respect
 
