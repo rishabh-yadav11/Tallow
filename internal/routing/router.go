@@ -552,21 +552,34 @@ func (r *Router) Release(sel *Selection, costMicros int64) {
 	sel.pb, sel.pbSet = nil, false
 }
 
-// InFlight reports how many concurrency slots the named key currently holds.
+// KeyUsage reports the named key's live concurrency slots and banked cost.
 //
 // Every slot taken by Select must come back through exactly one Release or
 // releaseSelection. A slot that never returns is invisible in the request logs
-// but caps the key permanently, so this exists to make a leak assertable rather
-// than merely suspected. The provider/key id is the same "provider/key" form
-// used for budget limits.
-func (r *Router) InFlight(provider, key string) int {
+// but caps the key permanently. A cost that is banked twice reports spend that
+// never happened, which is the failure C3 was about. Both are the kind of bug
+// that is invisible in production and trivial to assert here, so this accessor
+// exists to make them assertable rather than merely suspected.
+//
+// The provider/key id is the same "provider/key" form used for budget limits.
+// The cost is in micro-USD, matching the unit costs are accumulated in.
+func (r *Router) KeyUsage(provider, key string) (inflight int, costMicros int64) {
 	r.bmu.RLock()
 	kb := r.budgets[provider+"/"+key]
 	r.bmu.RUnlock()
 	if kb == nil {
-		return 0
+		return 0, 0
 	}
-	return kb.Snapshot(r.now()).Inflight
+	s := kb.Snapshot(r.now())
+	return s.Inflight, s.CostMicros
+}
+
+// InFlight reports how many concurrency slots the named key currently holds.
+//
+// It is the slot half of KeyUsage, kept for callers that only need the slot.
+func (r *Router) InFlight(provider, key string) int {
+	inflight, _ := r.KeyUsage(provider, key)
+	return inflight
 }
 
 // RecordSuccess closes the relevant breakers and re-affirms sticky.
