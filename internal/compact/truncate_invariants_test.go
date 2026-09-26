@@ -9,7 +9,7 @@ import (
 // The bound is a BYTE bound (len() is used throughout Apply). Verify the result
 // never exceeds it for any max, including below the marker width, and that the
 // result is always valid UTF-8.
-func TestZZZBoundAndUTF8AcrossAllMaxima(t *testing.T) {
+func TestTruncateHonorsByteBoundAndUTF8AcrossAllMaxima(t *testing.T) {
 	// Multi-byte content that will straddle many cut points.
 	bodies := map[string]string{
 		"cjk":     strings.Repeat("世界你好", 500),
@@ -34,7 +34,7 @@ func TestZZZBoundAndUTF8AcrossAllMaxima(t *testing.T) {
 
 // When the bound is large enough for content but not content+marker, the
 // content must still win: the result is cut to max with no marker.
-func TestZZZNoMarkerWhenItWouldOverrun(t *testing.T) {
+func TestTruncateDropsMarkerRatherThanOverrunBound(t *testing.T) {
 	marker := len(shortTruncationMarker)
 	body := strings.Repeat("a", 1000)
 	// max == marker: kept = 0, so no content, marker exactly fills.
@@ -51,7 +51,7 @@ func TestZZZNoMarkerWhenItWouldOverrun(t *testing.T) {
 
 // Content that already fits must be returned byte-identical - no marker, no
 // change. A truncation that did not happen must not be reported.
-func TestZZZFittingContentIsUntouched(t *testing.T) {
+func TestTruncateLeavesFittingContentByteIdentical(t *testing.T) {
 	for n := 0; n <= 200; n++ {
 		body := strings.Repeat("a", n)
 		if got := truncate(body, 200); got != body {
@@ -68,7 +68,7 @@ func TestZZZFittingContentIsUntouched(t *testing.T) {
 // A body one byte over the bound with a multi-byte tail must retreat to the
 // rune boundary, so the result is strictly shorter than the marker-budgeted
 // slice but still valid.
-func TestZZZRuneBoundaryRetreat(t *testing.T) {
+func TestTruncateRetreatsToRuneBoundary(t *testing.T) {
 	// 3-byte runes. max chosen so kept lands mid-rune.
 	body := strings.Repeat("世", 100) // 300 bytes
 	for max := 1; max <= 300; max++ {
@@ -85,7 +85,7 @@ func TestZZZRuneBoundaryRetreat(t *testing.T) {
 }
 
 // The result must never be LONGER than the input, for any bound.
-func TestZZZNeverGrows(t *testing.T) {
+func TestTruncateNeverGrows(t *testing.T) {
 	body := strings.Repeat("世界", 100) // 600 bytes
 	for max := 1; max <= 1000; max++ {
 		if got := truncate(body, max); len(got) > len(body) {
@@ -96,7 +96,7 @@ func TestZZZNeverGrows(t *testing.T) {
 }
 
 // max<=0 must yield the empty string, never the input.
-func TestZZZNonPositiveMax(t *testing.T) {
+func TestTruncateNonPositiveMaxYieldsEmpty(t *testing.T) {
 	body := strings.Repeat("x", 100)
 	for _, max := range []int{0, -1, -1000} {
 		if got := truncate(body, max); got != "" {

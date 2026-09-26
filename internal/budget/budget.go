@@ -74,19 +74,19 @@ func (w *FixedWindow) Peek(now time.Time) bool {
 //     refund through and let the provider exceed its configured RPM.
 //   - The count is clamped at zero so an unmatched refund cannot walk the
 //     count negative, which would manufacture headroom on every extra refund.
+//     The clamp also covers the case where no window has been established yet,
+//     since a window that has never been charged has a count of zero.
 func (w *FixedWindow) Refund(now time.Time) {
 	if w.Limit <= 0 {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// The zero-startAt case must be excluded explicitly: a FixedWindow built as
-	// a struct literal (as tests and some constructors do) has a zero startAt,
-	// and any realistic clock is after the zero time, so without this guard
-	// EVERY refund on such a window would be silently discarded.
-	if w.startAt.IsZero() {
-		return // no window has been established, so nothing was ever charged.
-	}
+	// The zero-startAt case needs no explicit guard: if no Allow has
+	// established a window then count is still 0, and the clamp below already
+	// refuses to decrement it. The check is therefore redundant rather than
+	// load-bearing, and a mutation test that deletes it confirms the clamp
+	// covers the same case.
 	if now.Before(w.startAt) {
 		return // the charge predates the current window; it is long gone.
 	}

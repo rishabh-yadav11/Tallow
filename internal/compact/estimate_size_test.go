@@ -2,8 +2,12 @@ package compact
 
 import "testing"
 
-// EstimateSize drives the "trimmed N bytes" log line, so a wrong estimate
-// either hides trimming that happened or reports trimming that did not.
+// EstimateSize is currently unreferenced by production code: nothing in the
+// tree calls it, and the "trimmed N bytes" log line its doc comment describes
+// was never wired up. It is covered here anyway, because the semantics are
+// subtle enough (role filter, string filter, byte length) that the first
+// caller should not have to rediscover them, and because dead code that is
+// wrong is a trap for whoever does wire it up.
 
 // TestEstimateSizeCountsOnlyToolContent pins the two filters: role must be
 // "tool" and content must be a string. Anything else contributes zero.
@@ -79,8 +83,8 @@ func TestEstimateSizeCountsOnlyToolContent(t *testing.T) {
 			want: 0,
 		},
 		{
-			// Byte length, not rune count: EstimateSize feeds a byte-trim
-			// report, so multi-byte content must count bytes.
+			// Byte length, not rune count: callers use this to reason about
+			// byte-bounded trimming, so multi-byte content must count bytes.
 			name: "counts bytes not runes",
 			messages: []any{
 				map[string]any{"role": "tool", "content": "世界"}, // 6 bytes, 2 runes
