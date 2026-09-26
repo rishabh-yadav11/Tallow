@@ -517,9 +517,15 @@ func (a *App) watchConfig(ctx context.Context) error {
 	}
 }
 
+// healthTick is how often healthLoop wakes up to consider probing. It is a var
+// rather than a constant so tests can drive the loop's scheduling without
+// waiting out a 15s tick, which is the same test-only-seam approach publishHook
+// uses below. It is 15s in production and nothing writes to it.
+var healthTick = 15 * time.Second
+
 // healthLoop proactively probes providers/keys, folding into circuit breakers.
 func (a *App) healthLoop(ctx context.Context) error {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(healthTick)
 	defer t.Stop()
 	last := map[string]time.Time{}
 	for {

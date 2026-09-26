@@ -26,6 +26,9 @@ func newProbeApp(t *testing.T, providers []model.Provider, aliases []model.Alias
 	a := &App{reg: registry.New(providers, aliases)}
 	a.health = health.NewRegistry()
 	a.probeSem = make(chan struct{}, 4)
+	// healthLoop reads a.client under a.mu and hands it straight to probe, so
+	// it must be non-nil even in tests that never construct a real App.
+	a.client = newHTTPClient()
 	return a
 }
 
@@ -64,11 +67,14 @@ func TestProbeRecordsSuccessOn2xx(t *testing.T) {
 			t.Errorf("probe body missing %s: %s", want, gotBody)
 		}
 	}
-	// Both levels must record success.
-	if s := a.health.Provider("p1").State(time.Now()).String(); s == "open" {
+	// Both levels must record success. Assert the EXACT state, not merely
+	// "not open": a breaker with no recorded result is also "not open", so a
+	// weaker assertion would pass even if probe recorded nothing at all, and
+	// that is the regression this test exists to catch.
+	if s := a.health.Provider("p1").State(time.Now()).String(); s != "closed" {
 		t.Errorf("provider state = %q after a 200 probe, want closed", s)
 	}
-	if s := a.health.Key("p1", "k1").State(time.Now()).String(); s == "open" {
+	if s := a.health.Key("p1", "k1").State(time.Now()).String(); s != "closed" {
 		t.Errorf("key state = %q after a 200 probe, want closed", s)
 	}
 }
@@ -92,22 +98,16 @@ func TestProbeRecordsFailureOnErrorStatus(t *testing.T) {
 			p := model.Provider{Name: "p1", BaseURL: srv.URL}
 			a.probe(a.reg, srv.Client(), p, model.Key{ID: "k1", Secret: "sk"}, "m1")
 
-			// The breaker may take a couple of failures to open, so assert on
-			// the failure being RECORDED rather than on the state flipping.
-			pb := a.health.Provider("p1")
-			kb := a.health.Key("p1", "k1")
-			_ = pb
-			_ = kb
 			// Repeated probes must eventually open it, proving failures count.
 			for i := 0; i < 10; i++ {
 				a.probe(a.reg, srv.Client(), p, model.Key{ID: "k1", Secret: "sk"}, "m1")
 			}
-			if s := a.health.Provider("p1").State(time.Now()).String(); s == "closed" {
-				t.Errorf("provider state = %q after 11 failed probes at %d, want it to open",
+			if s := a.health.Provider("p1").State(time.Now()).String(); s != "open" {
+				t.Errorf("provider state = %q after 11 failed probes at %d, want open",
 					s, code)
 			}
-			if s := a.health.Key("p1", "k1").State(time.Now()).String(); s == "closed" {
-				t.Errorf("key state = %q after 11 failed probes at %d, want it to open", s, code)
+			if s := a.health.Key("p1", "k1").State(time.Now()).String(); s != "open" {
+				t.Errorf("key state = %q after 11 failed probes at %d, want open", s, code)
 			}
 		})
 	}
@@ -254,12 +254,44 @@ func TestProbeSurvivesCancellation(t *testing.T) {
 	}
 }
 
-// TestHealthLoopHonorsPerProviderIntervalAndHealthCheckFlag exercises the loop's
-// scheduling: providers with health_check off are skipped entirely, and a
-// provider with no alias model is skipped because there is nothing to probe
-// with. Both skips are load-bearing, since probing with an empty model would
-// produce a guaranteed failure and open every breaker on startup.
-func TestHealthLoopSkipsProvidersItMustNotProbe(t *testing.T) {
+// runHealthLoopTicks drives healthLoop for a bounded number of ticks with a
+// short tick interval, then cancels it. It exists so the loop's scheduling
+// decisions can be observed without waiting out the production 15s tick.
+func runHealthLoopTicks(t *testing.T, a *App, ticks int) {
+	t.Helper()
+	old := healthTick
+	healthTick = 5 * time.Millisecond
+	t.Cleanup(func() { healthTick = old })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = a.healthLoop(ctx)
+	}()
+
+	// Wait for at least `ticks` ticks to have been processed, then stop.
+	// A probe is dispatched in its own goroutine, so also give those a moment.
+	time.Sleep(time.Duration(ticks) * 5 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("healthLoop did not return after its context was cancelled")
+	}
+	// Let any probe goroutine the loop dispatched finish and settle.
+	time.Sleep(100 * time.Millisecond)
+}
+
+// TestHealthLoopProbesOnlyEligibleProviders exercises the loop's scheduling.
+// Two skips are load-bearing: a provider with health_check off must never be
+// probed, and a provider with no alias model has nothing to probe WITH, so
+// probing it would send an empty model and guarantee a failure, opening the
+// breaker on a perfectly healthy provider at startup.
+//
+// The third provider is the positive control: a loop that skipped everything
+// would otherwise pass this test, and the skip assertions would be vacuous.
+func TestHealthLoopProbesOnlyEligibleProviders(t *testing.T) {
 	var probed atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		probed.Add(1)
@@ -274,17 +306,88 @@ func TestHealthLoopSkipsProvidersItMustNotProbe(t *testing.T) {
 			// health_check on, but no alias target names a model for it, so the
 			// probe model is empty and it must be skipped too.
 			{Name: "nomodel", BaseURL: srv.URL, HealthCheck: true, Keys: []model.Key{{ID: "k"}}},
+			// health_check on WITH a model, so this one must actually be probed.
+			{Name: "on", BaseURL: srv.URL, HealthCheck: true, Keys: []model.Key{{ID: "k"}}},
 		},
-		[]model.Alias{})
+		[]model.Alias{
+			{Name: "al", Targets: []model.Target{{Provider: "on", Model: "m1"}}},
+		})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	_ = a.healthLoop(ctx)
+	// One tick is enough: the eligible provider is probed on the first tick, and
+	// the per-provider interval check suppresses it on later ones.
+	runHealthLoopTicks(t, a, 1)
 
-	if n := probed.Load(); n != 0 {
-		t.Errorf("%d probes were sent, want 0: providers that must not be probed were probed", n)
+	// Exactly the eligible provider's single key was probed, and nothing else.
+	// Any probe at all for "off" or "nomodel" would break the count, since each
+	// has exactly one key and would add one.
+	if n := probed.Load(); n != 1 {
+		t.Errorf("%d probes sent, want 1: only the provider with health_check on "+
+			"and a known model may be probed", n)
 	}
 	if s := a.health.Provider("off").State(time.Now()).String(); s == "open" {
 		t.Error("a provider with health_check off was marked unhealthy by the probe loop")
+	}
+	if s := a.health.Provider("nomodel").State(time.Now()).String(); s == "open" {
+		t.Error("a provider with no alias model was marked unhealthy by the probe loop")
+	}
+	// The probed provider must be healthy, proving the probe really reached it.
+	if s := a.health.Provider("on").State(time.Now()).String(); s == "open" {
+		t.Errorf("the probed provider opened on a 200: %q", s)
+	}
+}
+
+// TestHealthLoopHonorsPerProviderInterval pins the interval throttle. A
+// provider probed every tick would burn its API quota continuously, and the
+// interval is the only thing preventing that. A second tick must not re-probe.
+func TestHealthLoopHonorsPerProviderInterval(t *testing.T) {
+	var probed atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probed.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := newProbeApp(t,
+		[]model.Provider{
+			// health_interval of 1h, far longer than the test runs.
+			{Name: "on", BaseURL: srv.URL, HealthCheck: true, HealthInterval: time.Hour,
+				Keys: []model.Key{{ID: "k"}}},
+		},
+		[]model.Alias{
+			{Name: "al", Targets: []model.Target{{Provider: "on", Model: "m1"}}},
+		})
+
+	// 20 ticks at 5ms is 100ms of loop time, still far under the 1h interval.
+	runHealthLoopTicks(t, a, 20)
+
+	if n := probed.Load(); n != 1 {
+		t.Errorf("%d probes sent across 20 ticks, want 1: the per-provider "+
+			"health_interval was not honored", n)
+	}
+}
+
+// TestHealthLoopStopsOnContextCancellation checks the loop honours shutdown.
+// Run cancels the root context on SIGINT/SIGTERM, and healthLoop returning on
+// ctx.Done() is what lets Run return instead of hanging.
+func TestHealthLoopStopsOnContextCancellation(t *testing.T) {
+	a := newProbeApp(t, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := a.healthLoop(ctx)
+		if err == nil {
+			t.Error("healthLoop returned nil on cancellation, want ctx.Err()")
+		} else if err != context.Canceled {
+			t.Errorf("healthLoop returned %v, want context.Canceled", err)
+		}
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("healthLoop did not stop when its context was cancelled")
 	}
 }
