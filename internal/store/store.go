@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -90,9 +91,11 @@ type StoreConfig struct {
 	VacuumEvery   time.Duration
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS requests (
-	id                TEXT PRIMARY KEY,
+// createRequestsTable is the requests table definition, kept separate from the
+// rest of the schema so migrateRequestSeq can rebuild exactly this table.
+const createRequestsTable = `CREATE TABLE IF NOT EXISTS requests (
+	seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+	id                TEXT NOT NULL UNIQUE,
 	started_at        INTEGER NOT NULL,
 	dur_ms            INTEGER NOT NULL,
 	provider          TEXT NOT NULL DEFAULT '',
@@ -108,7 +111,10 @@ CREATE TABLE IF NOT EXISTS requests (
 	completion_tokens INTEGER NOT NULL DEFAULT 0,
 	cost_micros        INTEGER NOT NULL DEFAULT 0,
 	err               TEXT NOT NULL DEFAULT ''
-);
+)`
+
+const schema = `
+` + createRequestsTable + `;
 CREATE INDEX IF NOT EXISTS idx_requests_started ON requests(started_at);
 CREATE INDEX IF NOT EXISTS idx_requests_pk ON requests(provider, key);
 
@@ -220,6 +226,10 @@ func Open(cfg StoreConfig) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateRequestSeq(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	s := &Store{
 		db:    db,
 		cfg:   cfg,
@@ -312,6 +322,91 @@ func migrateCoalescedColumn(db *sql.DB) error {
 		return fmt.Errorf("store: add requests.coalesced: %w", err)
 	}
 	return nil
+}
+
+// migrateRequestSeq gives requests a monotonic ingestion sequence.
+//
+// The rollup watermark used to be a max() over started_at, which is a client-
+// supplied event time rather than an ingestion order. A request whose started_at
+// predates a row already folded into the watermark was skipped by the "started_at
+// > watermark" query and never appeared in any rollup, permanently: the
+// watermark had already passed it. The async write queue makes this routine, not
+// exotic - a request recorded a moment late, or any request from a host whose
+// clock is behind, lands in exactly this window. Those requests were counted in
+// RecentRequests and billed by observ, but silently missing from the daily and
+// weekly rollups that operators use for trend reporting.
+//
+// SQLite's implicit rowid already assigns a monotonic sequence, but it is not
+// guaranteed monotonic under deletes unless the table is AUTOINCREMENT, and it
+// cannot be referenced by a stable name. The rebuild below creates an explicit
+// AUTOINCREMENT column and backfills it in the existing row order, which is the
+// order the rows were inserted and therefore the order the old watermark was
+// already tracking. Backfilled rows keep id as the unique key, so a rebuild
+// cannot introduce a duplicate and cannot lose a row.
+func migrateRequestSeq(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name='seq'`).Scan(&n); err != nil {
+		return fmt.Errorf("store: inspect requests.seq: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("store: begin seq migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`ALTER TABLE requests RENAME TO requests_old`); err != nil {
+		return fmt.Errorf("store: rename requests: %w", err)
+	}
+	// The schema constant creates the table with seq already present, so this
+	// CREATE picks up the new column and leaves requests_old untouched.
+	if _, err := tx.Exec(createRequestsTable); err != nil {
+		return fmt.Errorf("store: recreate requests: %w", err)
+	}
+	// rowid is the original insertion order, so ordering by it preserves the
+	// sequence the pre-existing watermark was already tracking.
+	if _, err := tx.Exec(`INSERT INTO requests
+		(seq, id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, coalesced, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err)
+		SELECT rowid, id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, coalesced, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err
+		FROM requests_old ORDER BY rowid`); err != nil {
+		return fmt.Errorf("store: backfill requests.seq: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE requests_old`); err != nil {
+		return fmt.Errorf("store: drop requests_old: %w", err)
+	}
+	// The rename dropped and recreated the indexes on the old table's name.
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_requests_started ON requests(started_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_requests_pk ON requests(provider, key)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("store: recreate requests index: %w", err)
+		}
+	}
+	// Re-base the watermark onto the new sequence. The value left behind by the
+	// pre-seq scheme is a Unix-millisecond started_at, on the order of 1.7e12,
+	// which dwarfs every sequence number this table will ever assign. Left as
+	// is, the first rollup run after the upgrade would read "seq > 1700000000000",
+	// match nothing, and - since the watermark is only advanced by a scan that
+	// found rows - never repair itself. The store would keep recording requests
+	// that no rollup ever counted again.
+	//
+	// Starting from MAX(seq) is the correct handover point: the legacy scheme
+	// had already folded every row up to its own watermark into a rollup, and
+	// the backfilled sequences run in the same insertion order it was tracking,
+	// so those rows stay counted exactly once rather than being replayed.
+	var maxSeq sql.NullInt64
+	if err := tx.QueryRow(`SELECT MAX(seq) FROM requests`).Scan(&maxSeq); err != nil {
+		return fmt.Errorf("store: read requests.seq high-water mark: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO meta (k, v) VALUES (?,?)
+		ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
+		watermarkKey, strconv.FormatInt(maxSeq.Int64, 10)); err != nil {
+		return fmt.Errorf("store: rebase rollup watermark: %w", err)
+	}
+	return tx.Commit()
 }
 
 // worker is the single background goroutine that performs all deferred writes.
@@ -467,6 +562,7 @@ func (s *Store) RunRetention(ctx context.Context) error {
 }
 
 type rollRow struct {
+	seq                int64
 	ts                 int64
 	provider, key      string
 	prompt, completion int
@@ -481,9 +577,16 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 		return err
 	}
 
+	// The watermark is an ingestion sequence, not a timestamp. started_at is
+	// the event time the request recorded, which is not monotonic: a request
+	// written after the watermark advanced but carrying an earlier started_at
+	// (a late-recorded request, or a host whose clock runs behind) would be
+	// excluded by "started_at > wm" and never folded into any rollup, ever.
+	// seq is assigned at INSERT and only ever increases, so every row is
+	// folded exactly once and none is skipped.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT started_at, provider, key, prompt_tokens, completion_tokens, cost_micros, status
-		 FROM requests WHERE started_at > ? ORDER BY started_at`, wm)
+		`SELECT seq, started_at, provider, key, prompt_tokens, completion_tokens, cost_micros, status
+		 FROM requests WHERE seq > ? ORDER BY seq`, wm)
 	if err != nil {
 		return err
 	}
@@ -491,7 +594,7 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 	for rows.Next() {
 		var r rollRow
 		var status string
-		if err := rows.Scan(&r.ts, &r.provider, &r.key, &r.prompt, &r.completion, &r.cost, &status); err != nil {
+		if err := rows.Scan(&r.seq, &r.ts, &r.provider, &r.key, &r.prompt, &r.completion, &r.cost, &status); err != nil {
 			rows.Close()
 			return err
 		}
@@ -510,7 +613,7 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 		key    string
 	}
 	agg := map[bucketKey]*[5]int64{}
-	var maxTS int64 = wm
+	var maxSeq int64 = wm
 	for _, r := range batch {
 		day := dayStartMs(r.ts)
 		week := weekStartMs(r.ts)
@@ -528,8 +631,8 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 			a[3] += int64(r.completion)
 			a[4] += r.cost
 		}
-		if r.ts > maxTS {
-			maxTS = r.ts
+		if r.seq > maxSeq {
+			maxSeq = r.seq
 		}
 	}
 
@@ -557,10 +660,18 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 		}
 	}
 
-	if maxTS > wm {
+	// The watermark is the ingestion sequence, so its unit is a row sequence
+	// and not a timestamp. It is only ever advanced by a scan that actually found
+	// rows, so an out-of-range value can never be climbed back: "seq > wm"
+	// matching nothing leaves the watermark untouched and the rollup permanently
+	// empty. The only place a legacy value can be corrected is the migration that
+	// introduces the sequence, which re-bases it onto MAX(seq); see
+	// migrateRequestSeq. This guard therefore only ever moves the watermark
+	// forward, onto a sequence that was really folded in just now.
+	if maxSeq > wm {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO meta (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
-			watermarkKey, fmt.Sprintf("%d", maxTS)); err != nil {
+			watermarkKey, fmt.Sprintf("%d", maxSeq)); err != nil {
 			return err
 		}
 	}
