@@ -78,7 +78,15 @@ type metricsResp struct {
 	CostMicros       int64
 	LatencyP50Ms     int64
 	LatencyP95Ms     int64
-	ByProvider       map[string]providerStat
+	// LatencyWindow and LatencySamples are the basis the percentiles above were
+	// computed from. The collector computes them from a bounded sliding
+	// reservoir, not from the lifetime counters beside them (M8), so a reader
+	// of this dashboard needs them: without them the displayed p95 is
+	// indistinguishable from an all-time percentile and reads healthy during
+	// exactly the incident a percentile is consulted for.
+	LatencyWindow  string
+	LatencySamples int64
+	ByProvider     map[string]providerStat
 }
 
 func (m *metricsResp) UnmarshalJSON(data []byte) error {
@@ -93,6 +101,8 @@ func (m *metricsResp) UnmarshalJSON(data []byte) error {
 	m.CostMicros = f.num("CostMicros", "cost_micros", "CostCents", "cost_cents")
 	m.LatencyP50Ms = f.num("LatencyP50Ms", "latency_p50_ms")
 	m.LatencyP95Ms = f.num("LatencyP95Ms", "latency_p95_ms")
+	m.LatencyWindow = f.str("LatencyWindow", "latency_window")
+	m.LatencySamples = f.num("LatencySamples", "latency_samples")
 	if raw := f.get("ByProvider", "by_provider"); raw != nil {
 		_ = json.Unmarshal(raw, &m.ByProvider)
 	}
@@ -490,6 +500,19 @@ func renderDashboard(s *snapshot) string {
 		to.PromptTokens, to.CompletionTokens)
 	fmt.Fprintf(&b, "cost %s   p50 %d ms   p95 %d ms\n",
 		microDollars(to.CostMicros), to.LatencyP50Ms, to.LatencyP95Ms)
+	// Name the window the percentiles were computed over (M8). The collector
+	// keeps a bounded sliding reservoir, not lifetime latencies, so a bare
+	// "p95 90 ms" is indistinguishable from an all-time figure - and reads
+	// reassuringly healthy during an incident, which is the moment an
+	// operator consults it. One short suffix makes the basis explicit.
+	//
+	// The collector names its own window ("last_512_requests"); sample count is
+	// appended because it is the part that differs day to day and tells the
+	// reader how much evidence the percentile actually rests on.
+	if to.LatencyWindow != "" {
+		fmt.Fprintf(&b, "%s\n", mutedStyle.Render(
+			fmt.Sprintf("latency over %s, %d sampled", to.LatencyWindow, to.LatencySamples)))
+	}
 	b.WriteString("\n")
 
 	// 3. providers / keys
