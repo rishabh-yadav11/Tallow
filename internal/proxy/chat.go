@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rishabh-yadav11/tallow/internal/cache"
@@ -191,6 +193,10 @@ func (h *Handler) serveUncached(
 ) {
 	skip := map[string]bool{}
 	maxAttempts := h.maxAttempts(alias)
+	// attemptErrs collects the per-attempt reasons that the loop below discards
+	// by retrying past them. They are what "upstream attempts exhausted" must
+	// be able to explain itself with.
+	var attemptErrs []string
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		sel, err := h.deps.Router.Select(alias, sessionKey, skip)
 		if err != nil {
@@ -228,6 +234,7 @@ func (h *Handler) serveUncached(
 		if ferr.transport {
 			skip[sel.Provider] = true
 		}
+		attemptErrs = append(attemptErrs, attemptReason(sel, ferr))
 
 		if ferr.streamStarted {
 			// Streaming already begun: never splice recovery - let the client
@@ -251,9 +258,38 @@ func (h *Handler) serveUncached(
 	}
 
 	meta.Status = "error"
-	meta.Err = "upstream attempts exhausted"
+	meta.Err = exhaustedMessage(attemptErrs)
 	h.record(*meta, nil, body, started)
 	writeErr(w, http.StatusBadGateway, "upstream_error", meta.Err)
+}
+
+// attemptReason renders one failed upstream attempt as a short, self-contained
+// string naming the route that failed and why.
+//
+// Without it, a request that failed on every target reported the same
+// "upstream attempts exhausted" for a refused private base_url, a bad API key,
+// and a dead socket alike. Those need different fixes, and an operator who
+// cannot tell them apart has to reproduce the failure by hand.
+func attemptReason(sel *routing.Selection, ferr *forwardError) string {
+	return sel.Provider + "/" + sel.Key + ": " + ferr.Error()
+}
+
+// exhaustedMessage is the client-facing summary of a fully-failed failover
+// chain. It names the count of attempts and carries every reason, bounded so a
+// long fallback chain cannot produce an unbounded error string.
+func exhaustedMessage(attemptErrs []string) string {
+	const maxReported = 4
+	if len(attemptErrs) == 0 {
+		return "upstream attempts exhausted"
+	}
+	shown := attemptErrs
+	suffix := ""
+	if len(shown) > maxReported {
+		shown = shown[:maxReported]
+		suffix = fmt.Sprintf(" (+%d more)", len(attemptErrs)-maxReported)
+	}
+	return fmt.Sprintf("upstream attempts exhausted after %d: %s%s",
+		len(attemptErrs), strings.Join(shown, "; "), suffix)
 }
 
 // fetch is the outcome of a buffered, cacheable upstream fetch.
@@ -347,6 +383,9 @@ func (h *Handler) routeAndBuffer(
 ) (any, error) {
 	skip := map[string]bool{}
 	maxAttempts := h.maxAttempts(alias)
+	// attemptErrs is the streaming path's reason list, for the same reason: a
+	// chain that fails everywhere must say why rather than only that it failed.
+	var attemptErrs []string
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		sel, err := h.deps.Router.Select(alias, sessionKey, skip)
 		if err != nil {
@@ -378,12 +417,13 @@ func (h *Handler) routeAndBuffer(
 		if ferr.transport {
 			skip[sel.Provider] = true
 		}
+		attemptErrs = append(attemptErrs, attemptReason(sel, ferr))
 		if !ferr.retryable {
 			f := fetch{sel: sel, err: ferr, attempts: attempt + 1}
 			return f, nil
 		}
 	}
-	return fetch{err: &forwardError{msg: "upstream attempts exhausted"}}, nil
+	return fetch{err: &forwardError{msg: exhaustedMessage(attemptErrs)}}, nil
 }
 
 // fetchBuffered performs one upstream request without writing to a client, so
