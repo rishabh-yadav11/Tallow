@@ -10,10 +10,14 @@ import (
 
 // FixedWindow is a counter that resets every Window. Thread-safe.
 type FixedWindow struct {
-	Limit   int
-	Window  time.Duration
-	mu      sync.Mutex
-	count   int
+	Limit  int
+	Window time.Duration
+	mu     sync.Mutex
+	count  int
+	// startAt is when the current window began. A window that has not rolled
+	// yet has a zero startAt, which Refund treats as "no current window", so the
+	// first Allow is what establishes it.
+	startAt time.Time
 	resetAt time.Time
 }
 
@@ -27,6 +31,7 @@ func (w *FixedWindow) Allow(now time.Time) bool {
 	defer w.mu.Unlock()
 	if now.After(w.resetAt) {
 		w.count = 0
+		w.startAt = now
 		w.resetAt = now.Add(w.Window)
 	}
 	if w.count >= w.Limit {
@@ -57,10 +62,16 @@ func (w *FixedWindow) Peek(now time.Time) bool {
 // elsewhere), so a failed attempt does not permanently consume capacity.
 //
 // count is CONSUMED units, so a refund DECREMENTS it; headroom is
-// limit - count. Two safety properties matter, because a refund not perfectly
+// limit - count. Three safety properties matter, because a refund not perfectly
 // paired with its Allow would let a provider exceed its configured RPM:
-//   - Refunding a window that already rolled over is a no-op; the Allow it
-//     would offset happened in the previous window and is long gone.
+//   - A refund whose timestamp falls outside the window the charge landed in is
+//     a no-op. The Allow it would offset happened in a different window, whose
+//     count has already been reset, so decrementing would manufacture headroom
+//     that was never paid for. Comparing against the window's START, not only
+//     its reset, is what makes this hold when a refund timestamp lands inside
+//     the current window's span but before the charge it is offsetting did.
+//     Comparing only against resetAt was not enough: that check let a stale
+//     refund through and let the provider exceed its configured RPM.
 //   - The count is clamped at zero so an unmatched refund cannot walk the
 //     count negative, which would manufacture headroom on every extra refund.
 func (w *FixedWindow) Refund(now time.Time) {
@@ -69,13 +80,15 @@ func (w *FixedWindow) Refund(now time.Time) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Only a window that has actually rolled forward rejects the refund. The
-	// zero-resetAt case must be excluded explicitly: a FixedWindow built as a
-	// struct literal (as tests and some constructors do) has a zero resetAt,
-	// and now.After(zero) is true for every realistic clock, so without this
-	// guard EVERY refund on such a window would be silently discarded.
-	if !w.resetAt.IsZero() && now.After(w.resetAt) {
-		return // window rolled over; the old charge is already gone.
+	// The zero-startAt case must be excluded explicitly: a FixedWindow built as
+	// a struct literal (as tests and some constructors do) has a zero startAt,
+	// and any realistic clock is after the zero time, so without this guard
+	// EVERY refund on such a window would be silently discarded.
+	if w.startAt.IsZero() {
+		return // no window has been established, so nothing was ever charged.
+	}
+	if now.Before(w.startAt) {
+		return // the charge predates the current window; it is long gone.
 	}
 	if w.count > 0 {
 		w.count--
