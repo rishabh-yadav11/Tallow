@@ -172,6 +172,15 @@ type RouteError struct {
 	// removed candidate makes this false, because then at least one provider was
 	// genuinely unusable and an upstream error is the honest answer.
 	Limited bool
+	// RetryAfter is how long a rate-limited caller should wait before trying
+	// again, derived from the provider RPM window that rejected it. It is only
+	// meaningful when Limited is true, and is zero when the rejection was not
+	// driven by a provider RPM window.
+	//
+	// This exists because a 429 without it leaves the caller to invent a backoff.
+	// Every client library has a different guess, and a guess that is too short
+	// simply walks into the same limit again.
+	RetryAfter time.Duration
 }
 
 func (e *RouteError) Error() string {
@@ -333,6 +342,11 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 	}
 
 	var reasons []string
+	// retryAfter accumulates the soonest provider RPM reset across the rejected
+	// candidates. It stays zero unless a provider RPM window actually refused
+	// the request, and newRouteErrorWithRetry discards it entirely for failures
+	// that were not limit-driven.
+	var retryAfter time.Duration
 
 	// Sticky affinity first: keep session on its provider/key for cache reuse.
 	if sessionKey != "" {
@@ -389,6 +403,15 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 		r.bmu.RUnlock()
 		if pb != nil && pb.Remaining(now) == 0 {
 			reasons = append(reasons, provID+":provider_rpm")
+			// Remember the soonest reset seen, so a rate-limited caller is told
+			// when it can come back. Taking the earliest rather than the last is
+			// what makes the hint useful: with several providers exhausted, the
+			// first one to free up is when a retry can succeed.
+			if pb != nil {
+				if reset := pb.RPMResetsAt(now); retryAfter == 0 || reset.Sub(now) < retryAfter {
+					retryAfter = reset.Sub(now)
+				}
+			}
 			continue
 		}
 		sel, err := r.acquireKey(c.provider, now, &reasons, skip)
@@ -438,7 +461,7 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 		return sel, nil
 	}
 
-	return nil, newRouteError(alias, reasons)
+	return nil, newRouteErrorWithRetry(alias, reasons, retryAfter)
 }
 
 // limitReasons is the closed set of routing reasons that mean "a limit was
@@ -475,6 +498,13 @@ var limitReasons = map[string]bool{
 // and answering 429 when the real cause is a dead provider would send the caller
 // off to wait when the thing it needed was to fail over.
 func newRouteError(alias string, reasons []string) *RouteError {
+	return newRouteErrorWithRetry(alias, reasons, 0)
+}
+
+// newRouteErrorWithRetry is newRouteError plus the wait a rate-limited caller
+// needs. Keeping the classification in one place means the retry hint cannot be
+// set on a failure that is not actually limit-driven.
+func newRouteErrorWithRetry(alias string, reasons []string, retryAfter time.Duration) *RouteError {
 	limited := len(reasons) > 0
 	for _, r := range reasons {
 		// Reasons are "<scope>:<id>:<cause>"; the cause is the last segment.
@@ -486,7 +516,12 @@ func newRouteError(alias string, reasons []string) *RouteError {
 			limited = false
 		}
 	}
-	return &RouteError{Alias: alias, Reasons: reasons, Limited: limited}
+	if !limited {
+		// Never hand a retry hint out for a failure that was not a limit, or a
+		// dead provider would be reported as "come back in N seconds".
+		retryAfter = 0
+	}
+	return &RouteError{Alias: alias, Reasons: reasons, Limited: limited, RetryAfter: retryAfter}
 }
 
 // finalReason renders the routing trail: skipped candidates, then the choice.

@@ -257,6 +257,20 @@ func NewProviderBudget(rpm int) *ProviderBudget {
 	return &ProviderBudget{rpm: FixedWindow{Limit: rpm, Window: time.Minute}}
 }
 
+// RPMWindow is the width of the provider RPM window. The proxy needs it to turn
+// the router's reset time into the seconds a Retry-After header carries, and
+// hardcoding a minute at the call site would silently go wrong if the window
+// were ever configured to a different width.
+func (p *ProviderBudget) RPMWindow() time.Duration {
+	return p.rpm.Window
+}
+
+// RPMResetsAt reports when the provider's current RPM window rolls over, so a
+// caller can tell the client when to come back rather than leaving it to guess.
+func (p *ProviderBudget) RPMResetsAt(now time.Time) time.Time {
+	return p.rpm.ResetsAt(now)
+}
+
 // SetRPM updates the provider-level RPM cap without resetting the live window.
 func (p *ProviderBudget) SetRPM(rpm int) {
 	p.rpm.mu.Lock()

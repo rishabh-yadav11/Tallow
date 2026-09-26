@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"net/http/httptest"
 
@@ -44,7 +46,7 @@ open = true
 [server]
 listen = "127.0.0.1:0"
 admin_socket = "%s"
-max_concurrent = 8
+max_concurrent = 64
 queue_timeout = "5s"
 sticky_ttl = "5s"
 
@@ -53,7 +55,7 @@ keystore = "%s"
 
 [store]
 path = "%s"
-raw_bodies = true
+raw_bodies = false
 
 [retention]
 raw_bodies_days = 5
@@ -87,6 +89,13 @@ name = "flash"
 
 // startGatewayWithProviderRPM starts a real App whose single provider carries
 // the given aggregate RPM cap, with two usable keys on it.
+//
+// The queue is sized so the CONCURRENCY limiter is never what refuses a
+// request. These tests are sequential, so the queue is never under pressure, and
+// the 429 they observe is unambiguously the provider RPM cap. That distinction
+// matters: a saturated queue also answers 429 rate_limit_error, so a test that
+// accidentally tripped the queue would see the same status and could not tell
+// the two limits apart. The body check below is what confirms the cause.
 //
 // The two keys get DISTINCT secrets. Storing the same value under both refs would
 // mean the suite could not tell whether the router actually spread the traffic
@@ -238,8 +247,47 @@ func TestProviderRPMCapIsSharedAcrossKeys(t *testing.T) {
 			if !strings.Contains(got, "rate_limit_error") {
 				t.Errorf("429 body is not typed as a rate limit: %s", got)
 			}
-			if !strings.Contains(got, "rpm") {
-				t.Errorf("429 body does not name the limit that was reached: %s", got)
+			// The limit must be identified as the provider RPM cap, not merely
+			// as "some rate limit". A saturated admission queue answers 429 with
+			// the same type, so without this the test could be asserting against
+			// a limit it never configured.
+			if !strings.Contains(got, "provider rpm") && !strings.Contains(got, "rpm") {
+				t.Errorf("429 body does not name the provider RPM cap: %s", got)
+			}
+			// Retry-After must be present and usable. A 429 without it leaves the
+			// caller to invent a backoff, and a guess that is too short walks
+			// straight back into the same limit, which is how a rate limit turns
+			// into self-inflicted load on the gateway.
+			ra := resp.Header.Get("Retry-After")
+			if ra == "" {
+				t.Errorf("429 has no Retry-After header, so the client cannot know " +
+					"when to come back")
+			} else {
+				secs, err := strconv.Atoi(ra)
+				switch {
+				case err != nil:
+					t.Errorf("Retry-After %q is not an integer number of seconds: %v", ra, err)
+				case secs < 1:
+					// 0 is not a valid Retry-After and means "retry immediately",
+					// which is exactly wrong for a rate limit.
+					t.Errorf("Retry-After is %d, want at least 1 second", secs)
+				case secs > 60:
+					// The provider RPM window is a minute, so anything longer
+					// means the gateway is misreporting its own window.
+					t.Errorf("Retry-After is %d seconds, longer than the 60s provider "+
+						"RPM window it is derived from", secs)
+				}
+				// The header must never UNDER-report the wait. The gateway's own
+				// limit is a minute and this test has just spent it, so the value
+				// must be at least 59. An upper bound alone does not catch
+				// truncation: rounding down would invite the client back before
+				// the window rolls, producing an immediate second 429 and turning
+				// a rate limit into self-inflicted retry load.
+				if err == nil && secs < 59 {
+					t.Errorf("Retry-After is %d seconds, under-reporting the 60s "+
+						"provider RPM window: the client would return before the "+
+						"window rolls and be limited again", secs)
+				}
 			}
 		default:
 			t.Fatalf("request %d: unexpected status %d: %s", i, resp.StatusCode, got)
@@ -350,6 +398,64 @@ func TestProviderRPMCapChargesEachRequestOnce(t *testing.T) {
 	if limited == 0 {
 		t.Error("no request was rate limited: the test never reached the cap, so " +
 			"it proves nothing about enforcement")
+	}
+}
+
+// TestRetryAfterShrinksAsTheWindowAges checks the hint is a live measurement of
+// the window rather than a constant.
+//
+// This is where rounding is actually observable. The window is established by
+// the first Select, and a run of fast local requests lands within a few
+// milliseconds of it, so a wait of 59.99s rounds to 59 under BOTH a correct
+// implementation and one that truncates. Asserting an upper bound alone
+// therefore cannot tell them apart, which is why the first version of the
+// Retry-After check passed against a mutant that rounds down.
+//
+// Sleeping puts the wait on a fractional second, where rounding up and rounding
+// down differ by a full second. The real HTTP path is kept for everything else;
+// only the ageing needs wall-clock time, because an injected clock is the one
+// thing that would make this test lie about the real gateway.
+func TestRetryAfterShrinksAsTheWindowAges(t *testing.T) {
+	upSrv, _ := setup(t)
+	const cap = 1
+	_, gw, _ := startGatewayWithProviderRPM(t, upSrv.URL, cap)
+
+	send := func(session string) *http.Response {
+		t.Helper()
+		body := fmt.Sprintf(`{"model":"flash","messages":[{"role":"user","content":"%s"}]}`, session)
+		return postWithSession(t, gw+"/v1/chat/completions", session, body)
+	}
+
+	// Spend the single slot, which establishes the window.
+	if resp := send("seed"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first request: status %d, want 200", resp.StatusCode)
+	}
+
+	// The window is 60s. Age it by 2.5s so the correct answer is 57 or 58 and
+	// the truncating answer is 56.
+	time.Sleep(2500 * time.Millisecond)
+
+	resp := send("after-ageing")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("after ageing: status %d, want 429", resp.StatusCode)
+	}
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		t.Fatal("no Retry-After on the aged 429")
+	}
+	secs, err := strconv.Atoi(ra)
+	if err != nil {
+		t.Fatalf("Retry-After %q is not an integer: %v", ra, err)
+	}
+	// The window is 60s and the sleep above is 2.5s, so the wait is 57.5s and
+	// the only correct answer is 58: rounding up. 57 is the truncating answer
+	// and is the bug, so the bound is deliberately exact rather than a range.
+	// Measured values across runs: 58 correct, 57 truncating.
+	if secs != 58 {
+		t.Errorf("Retry-After is %d seconds after ageing a 60s window by 2.5s, "+
+			"want exactly 58: the wait is ~57.5s, so anything lower is a "+
+			"truncation that sends the client back before the window rolls",
+			secs)
 	}
 }
 

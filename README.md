@@ -323,6 +323,12 @@ Notes for API consumers:
   look at provider health instead of at the limit that was actually reached. If
   any candidate was rejected for any other reason, the failure is a real routing
   failure and stays a `502`.
+- A `429` caused by an exhausted provider RPM window carries a `Retry-After`
+  header, in whole seconds, rounded **up** from the live window's remaining time.
+  Without it every client library invents its own backoff, and a guess that is
+  too short just walks back into the same limit. Rounding up matters as much as
+  the header: rounding down invites the client back before the window rolls. The
+  hint is omitted when the wait is genuinely unknown, rather than guessed.
 - Per-host connection pooling / HTTP keep-alive (one shared `http.Transport`).
 - Request bodies are capped (8 MiB by default, `server.max_request_bytes`), and the
   server sets explicit read, read-header, idle, and header-size bounds so a slow

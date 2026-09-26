@@ -216,13 +216,15 @@ func (h *Handler) serveUncached(
 			// looking at provider health when the cause is a limit the operator
 			// set, and it invites a retry, which is the wrong response to a rate
 			// limit. 429 plus Retry-After is the status that tells the caller
-			// when to come back.
+			// when to come back. The wait is derived from the live provider RPM
+			// window, not guessed.
 			if errors.Is(err, routing.ErrNoRoute) {
 				var re *routing.RouteError
 				if errors.As(err, &re) && re.Limited {
 					// The reason trail names the limit that was hit. It is
 					// derived from the operator's own configuration, so it
 					// discloses nothing the caller does not already control.
+					writeRetryAfter(w, re.RetryAfter)
 					writeErr(w, http.StatusTooManyRequests, "rate_limit_error", meta.Err)
 					return
 				}
@@ -446,6 +448,12 @@ func (h *Handler) routeAndBuffer(
 				var re *routing.RouteError
 				if errors.As(err, &re) && re.Limited {
 					fe.status = http.StatusTooManyRequests
+					// The retry hint has to be carried on the error, because the
+					// response for this path is written later, in failFetch. The
+					// first version of the Retry-After work set the header at
+					// this detection point only, so the buffered path, which is
+					// the common one, produced a correct 429 with no hint at all.
+					fe.retryAfter = re.RetryAfter
 				}
 			}
 			return fetch{err: fe}, nil
@@ -534,6 +542,10 @@ func (h *Handler) failRequest(
 	kind := "upstream_error"
 	if st == http.StatusTooManyRequests {
 		kind = "rate_limit_error"
+		// The 429 is only correct because a LIMIT was hit, so the hint that
+		// explains the wait belongs with it. Emitting the status without this
+		// leaves every client to guess its own backoff.
+		writeRetryAfter(w, f.err.retryAfter)
 	}
 	writeErr(w, st, kind, f.err.Error())
 }

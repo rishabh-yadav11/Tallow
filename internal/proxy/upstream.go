@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rishabh-yadav11/tallow/internal/routing"
 )
@@ -30,6 +31,17 @@ type forwardError struct {
 	status        int
 	msg           string
 	private       string
+	// retryAfter is how long a rate-limited caller should wait, carried from the
+	// routing failure that produced this error. It is set only for a
+	// limit-driven 429, and is written as a Retry-After header by the response
+	// writer.
+	//
+	// It has to live here rather than being written at the point of detection,
+	// because the buffered path returns a forwardError and the response is
+	// written later, in a different function. Without it the correct 429 status
+	// arrived on the buffered path but the retry hint silently did not, which is
+	// the common case rather than an edge case.
+	retryAfter time.Duration
 }
 
 func (e *forwardError) Error() string { return e.msg }

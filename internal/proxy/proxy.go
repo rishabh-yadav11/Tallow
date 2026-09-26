@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,6 +190,26 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeRetryAfter sets a Retry-After header from a routing-supplied wait.
+//
+// It is a no-op when the wait is unknown, which is the correct answer: the header
+// is advisory, and emitting a guess would be worse than omitting it.
+//
+// The value is whole seconds, rounded UP and floored at 1. Rounding down would
+// invite the client back before the window actually rolls, and 0 is not a valid
+// Retry-After and reads as "retry immediately", which is exactly wrong for a
+// rate limit.
+func writeRetryAfter(w http.ResponseWriter, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	secs := int64((d + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
 }
 
 func writeErr(w http.ResponseWriter, status int, typ, msg string) {
