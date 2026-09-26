@@ -5,8 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/rishabh-yadav11/tallow/internal/routing"
@@ -156,44 +160,160 @@ func dataUsage(line []byte) (int, int, bool) {
 	if bytes.Equal(payload, []byte("[DONE]")) {
 		return 0, 0, false
 	}
-	var v struct {
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(payload, &v); err != nil {
-		return 0, 0, false
-	}
-	return v.Usage.PromptTokens, v.Usage.CompletionTokens, true
+	return usageTokens(payload)
 }
 
 func parseUsage(body []byte) (int, int) {
-	var v struct {
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &v); err != nil {
-		return 0, 0
-	}
-	return v.Usage.PromptTokens, v.Usage.CompletionTokens
+	p, c, _ := usageTokens(body)
+	return p, c
 }
+
+// usageTokens extracts prompt and completion token counts from a response body
+// or SSE payload, coercing each field INDEPENDENTLY.
+//
+// H3: the previous version declared a single typed `int` per field inside one
+// all-or-nothing json.Unmarshal. encoding/json aborts the ENTIRE struct decode
+// on the first type mismatch for a typed field - it does not skip it the way it
+// does for map[string]any - so a single float- or string-encoded token count
+// discarded BOTH numbers. Measured against the real functions:
+//
+//	{"usage":{"prompt_tokens":1500,"completion_tokens":250}}        -> p=1500 c=250
+//	{"usage":{"prompt_tokens":1500.0,"completion_tokens":250.0}}      -> p=0    c=0
+//	{"usage":{"prompt_tokens":"1500","completion_tokens":"250"}}      -> p=0    c=0
+//	{"usage":{"prompt_tokens":null,"completion_tokens":250}}          -> p=0    c=250
+//	{"usage":{"input_tokens":1500,"completion_tokens":250}}           -> p=0    c=0
+//
+// Float and string encodings are emitted by several OpenAI-compatible gateways
+// and by vLLM's older tokenizer accounting, and `input_tokens` is the
+// Anthropic-style spelling. The caller discarded the ok=false return, so the
+// loss was silent and compounded C3: cost recorded as zero with no error.
+//
+// Decoding into json.RawMessage and coercing per field means a bad
+// prompt_tokens degrades to 0 while completion_tokens survives, and a field
+// encoded as a float or a numeric string is accepted rather than discarded.
+func usageTokens(payload []byte) (prompt, completion int, ok bool) {
+	var v struct {
+		Usage map[string]json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &v); err != nil || v.Usage == nil {
+		return 0, 0, false
+	}
+	// Accept every spelling seen in the wild, not just the OpenAI one, since the
+	// gateway fronts several provider dialects and a missing count is silent
+	// under-billing either way.
+	prompt = firstTokenCount(v.Usage, "prompt_tokens", "input_tokens", "prompt_eval_count")
+	completion = firstTokenCount(v.Usage, "completion_tokens", "output_tokens", "eval_count")
+	return prompt, completion, true
+}
+
+// firstTokenCount returns the first parseable token count among the given keys.
+func firstTokenCount(usage map[string]json.RawMessage, keys ...string) int {
+	for _, k := range keys {
+		raw, ok := usage[k]
+		if !ok {
+			continue
+		}
+		if n, ok := coerceTokenCount(raw); ok {
+			return n
+		}
+	}
+	return 0
+}
+
+// coerceTokenCount parses one token-count field, accepting the encodings that
+// real providers actually emit.
+//
+// A negative count is rejected rather than clamped: there is no arithmetic in
+// which a negative token count is meaningful, and admitting one would let a
+// hostile or buggy upstream subtract from the gateway's usage totals. A count
+// so large it cannot be a real request is likewise rejected, because
+// costMicros is derived from it by multiplication and an absurd value would
+// overflow the budget arithmetic rather than merely misreport.
+func coerceTokenCount(raw json.RawMessage) (int, bool) {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return 0, false
+	}
+	// Strip surrounding quotes so a numeric string ("250") parses like a number.
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return 0, false
+		}
+		s = strings.TrimSpace(str)
+	}
+	// Accept "1500" and "1500.0" and "1.5e3" alike. A float decode is required
+	// because encoding/json refuses an integer literal into a float field only
+	// when it has a fractional part; parsing as float and rounding accepts
+	// every case uniformly.
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	// Round rather than truncate: providers that emit 1500.0 mean 1500 tokens,
+	// and truncating 1500.9 to 1500 is fine, but truncating a value that arrived
+	// as 1500.999999 due to float accumulation should not lose a whole token.
+	n := int(math.Round(f))
+	if n < 0 || n > maxTokenCount {
+		return 0, false
+	}
+	return n, true
+}
+
+// maxTokenCount bounds an accepted token count. 1e12 is far beyond any real
+// request and keeps the downstream cost multiplication well inside int64.
+const maxTokenCount = 1e12
 
 func isRetryableStatus(code int) bool {
 	return code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500
 }
 
-// upstreamErrorMsg extracts an OpenAI-style error message, else a status label.
+// upstreamErrorMsg builds the client-facing error for an upstream failure.
+//
+// M1: this used to return the upstream's own error text verbatim, so a provider
+// response of "invalid api key sk-live-AAAA1111 for org_zzz999" reached the
+// client with the credential prefix and the account id intact. The gateway was
+// functioning as an error-message relay for its own upstream providers'
+// internals.
+//
+// The detail is not discarded - it is the single most useful thing an operator
+// has when a request fails - so it is logged at ERROR and the client receives a
+// stable generic message plus the upstream status. A caller can correlate
+// through the gateway log rather than through a credential disclosure.
 func upstreamErrorMsg(status int, body []byte) string {
+	detail := upstreamErrorDetail(body)
+	if detail != "" {
+		// Logged, not returned. slog is used rather than a package-level logger
+		// so this composes with whatever handler the app installed.
+		slog.Error("upstream request failed",
+			"status", status,
+			"detail", detail)
+	}
+	return http.StatusText(status)
+}
+
+// upstreamErrorDetail extracts an OpenAI-style error message for LOGGING only.
+// Never return this to a client; see upstreamErrorMsg.
+func upstreamErrorDetail(body []byte) string {
 	var v struct {
 		Error struct {
 			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
 		} `json:"error"`
 	}
-	if json.Unmarshal(body, &v) == nil && v.Error.Message != "" {
-		return v.Error.Message
+	if json.Unmarshal(body, &v) != nil {
+		return ""
 	}
-	return http.StatusText(status)
+	parts := make([]string, 0, 3)
+	if v.Error.Message != "" {
+		parts = append(parts, v.Error.Message)
+	}
+	if v.Error.Type != "" {
+		parts = append(parts, "type="+v.Error.Type)
+	}
+	if v.Error.Code != nil {
+		parts = append(parts, fmt.Sprintf("code=%v", v.Error.Code))
+	}
+	return strings.Join(parts, " ")
 }

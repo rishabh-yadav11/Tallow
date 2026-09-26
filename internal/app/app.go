@@ -249,8 +249,37 @@ func newHTTPClient() *http.Client {
 		ExpectContinueTimeout: time.Second,
 		Proxy:                 http.ProxyFromEnvironment,
 	}
-	return &http.Client{Transport: tr}
+	return &http.Client{Transport: tr, CheckRedirect: refuseCredentialRedirect}
 }
+
+// refuseCredentialRedirect refuses to follow a redirect on the upstream client.
+//
+// M2: with Go's default CheckRedirect, a 307 or 308 from an upstream causes the
+// client to re-send the request - including the `Authorization: Bearer
+// <provider secret>` header - to whatever host the redirect names. A
+// compromised, misconfigured, or attacker-controlled upstream could therefore
+// harvest provider credentials by redirecting to a host it controls, and Go
+// preserves headers on the same-host case too, so even a "same host only" rule
+// would leak on a host that resolves to an attacker address.
+//
+// The guarantee enforced here is absolute and simple: the upstream request goes
+// to exactly the URL the router selected, and nowhere else. Redirects are
+// refused rather than followed-and-sanitised because every follow is a chance
+// to leak, and a legitimate OpenAI-compatible endpoint does not redirect a
+// POSTed chat completion.
+//
+// ErrUseLastResponse makes the client return the 3xx response as-is rather than
+// treating it as a failure, so the caller sees the redirect status and produces
+// a normal retryable-or-not decision from it. Returning a bare error would
+// surface as a transport error and lose the status.
+func refuseCredentialRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+// NewHTTPClientForTest exposes the production client constructor so the
+// redirect guard can be tested where it is actually installed, not merely at
+// the call site that happens to configure it in a test.
+func NewHTTPClientForTest() *http.Client { return newHTTPClient() }
 
 // ProxyHandler exposes the client-facing HTTP handler.
 func (a *App) ProxyHandler() http.Handler { return a.proxyHandler.Routes() }
