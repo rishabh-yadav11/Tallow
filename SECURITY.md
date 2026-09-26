@@ -44,6 +44,15 @@ A refused connection produces a `502` to the client and logs the reason, naming
 the address that was refused and how to proceed. The request never reaches the
 internal host.
 
+**The client's error never names the upstream.** The `502` body and the audit row
+report which route failed, `provider/key`, and a failure category such as
+`connection failed`, and nothing else. They never carry a `base_url`, host, port,
+or credential, including in a transport error, where Go would otherwise render
+the whole URL. The address a request was sent to is an internal detail of the
+guard, so the full text goes to the log, where the operator can read it, and not
+to the caller. The caller already knows which alias it asked for; it does not get
+to learn the addresses behind it.
+
 ### Using a private upstream
 
 A private upstream is a legitimate deployment: vLLM on `10.0.0.5`, Ollama on

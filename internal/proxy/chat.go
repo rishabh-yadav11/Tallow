@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -235,6 +236,7 @@ func (h *Handler) serveUncached(
 			skip[sel.Provider] = true
 		}
 		attemptErrs = append(attemptErrs, attemptReason(sel, ferr))
+		logTransportFailure(sel, ferr)
 
 		if ferr.streamStarted {
 			// Streaming already begun: never splice recovery - let the client
@@ -270,8 +272,29 @@ func (h *Handler) serveUncached(
 // "upstream attempts exhausted" for a refused private base_url, a bad API key,
 // and a dead socket alike. Those need different fixes, and an operator who
 // cannot tell them apart has to reproduce the failure by hand.
+//
+// A TRANSPORT error is safe to render verbatim because the message is made
+// client-safe where it is constructed, in send, not here. That is deliberate.
+// Attempting to redact here instead would mean parsing *url.Error text, and the
+// address is not confined to the URL field: net.OpError repeats it as
+// `dial tcp <addr>: connect: ...`, so a prefix-stripped "cause" still leaks.
+// Only the construction site has both the error and the knowledge that it is
+// being rendered to a client.
 func attemptReason(sel *routing.Selection, ferr *forwardError) string {
 	return sel.Provider + "/" + sel.Key + ": " + ferr.Error()
+}
+
+// logTransportFailure records the full text of a transport failure, which
+// carries the upstream address that the client-facing message withholds. The
+// operator can read it here; the caller cannot.
+func logTransportFailure(sel *routing.Selection, ferr *forwardError) {
+	if !ferr.transport || ferr.logDetail() == ferr.Error() {
+		return
+	}
+	slog.Error("upstream transport failure",
+		"provider", sel.Provider,
+		"key", sel.Key,
+		"detail", ferr.logDetail())
 }
 
 // exhaustedMessage is the client-facing summary of a fully-failed failover

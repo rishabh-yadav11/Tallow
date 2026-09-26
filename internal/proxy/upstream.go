@@ -18,15 +18,30 @@ import (
 
 // forwardError distinguishes retryable, transport-level, and already-streamed
 // failures so the retry loop can apply the exact first-token policy.
+//
+// msg is CLIENT-SAFE. It reaches response bodies and audit rows, so it must
+// never carry the upstream base_url, a host, a port, or a credential. Errors
+// that cannot satisfy that must put their detail in private instead, which is
+// logged and never returned.
 type forwardError struct {
 	retryable     bool
 	transport     bool
 	streamStarted bool
 	status        int
 	msg           string
+	private       string
 }
 
 func (e *forwardError) Error() string { return e.msg }
+
+// logDetail returns the full error text for logging, including anything the
+// client-safe msg withheld.
+func (e *forwardError) logDetail() string {
+	if e.private == "" {
+		return e.msg
+	}
+	return e.private
+}
 
 // result carries token usage and (for non-stream) the response body.
 type result struct {
@@ -60,7 +75,19 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 	}
 	resp, err := h.deps.Client.Do(req)
 	if err != nil {
-		return nil, &forwardError{retryable: true, transport: true, msg: "upstream: " + err.Error()}
+		return nil, &forwardError{
+			retryable: true,
+			transport: true,
+			// Only the category, never the error. err is a *url.Error, which
+			// renders as `Post "<full base_url>": <cause>`, and its cause
+			// repeats the address too: net.OpError prefixes "dial tcp <addr>:".
+			// So neither the whole string nor a stripped prefix of it is safe
+			// to return. The full text goes to private for the log, and the
+			// client learns only that the connection failed, which is all it
+			// can act on.
+			msg:     "connection failed",
+			private: "upstream: " + err.Error(),
+		}
 	}
 	return resp, nil
 }
