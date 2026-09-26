@@ -428,7 +428,19 @@ func (r *Router) releaseSelection(sel *Selection) {
 		sel.kb.Release(0)
 	}
 	if sel.pb != nil && sel.pbSet {
-		sel.pb.Release(r.now())
+		// M5: the refund is stamped with the ADMISSION time, not the release
+		// time, and that is load-bearing. Select charged this provider's RPM at
+		// admittedAt, so the refund has to belong to the same window as the
+		// charge it offsets. Stamping it with r.now() is wrong whenever the
+		// window rolls over between the two: FixedWindow.Refund then compares a
+		// release-time timestamp against the CURRENT window's start, decides the
+		// refund is in-window, and decrements a count that this selection's
+		// charge never contributed to. The provider ends up with one request per
+		// abandon more headroom than the operator configured, so a request that
+		// outlives its window silently bypasses the provider RPM cap. The
+		// admittedAt stamp makes the pair exact: the same timestamp that was
+		// charged is the one refunded.
+		sel.pb.Release(sel.accountedAt(r.now()))
 	}
 	sel.pb, sel.pbSet, sel.kb = nil, false, nil
 }
