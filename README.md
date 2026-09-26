@@ -247,6 +247,30 @@ and swaps the live registry atomically. A few knobs are startup-only (listen
 address, admin socket, concurrency cap, cache TTL/entries, retention durations),
 documented in the example.
 
+### Where Tallow is allowed to connect
+
+`base_url` decides where a request carrying your provider `Authorization: Bearer
+<secret>` header and the user's full prompt is sent, so it is guarded rather
+than trusted by convention.
+
+**By default a `base_url` must resolve to a public address.** Loopback, RFC1918,
+CGNAT, link-local (including `169.254.169.254`), IPv6 unique-local, `0.0.0.0/8`,
+`240.0.0.0/4`, multicast, and the IPv4-mapped forms of all of them are refused.
+The check runs on the address actually being dialled, not as a string check on
+the hostname, and every address a hostname resolves to must be permitted — so a
+name pointing at both a public and a private address is refused rather than
+connecting to whichever one the dialer picked.
+
+A private upstream (vLLM on `10.0.0.5`, Ollama on `localhost`, a vPC) is a
+legitimate deployment. Opt out deliberately with
+`config.SetAllowPrivateBaseURL(true)` before `app.New`, and read
+[SECURITY.md](SECURITY.md#network-egress-the-base_url-ssrf-guard) for what that
+acceptance means. It is intentionally not a `config.toml` key, so a writer who
+can edit the config cannot opt one provider entry out of the policy.
+
+Independently, the upstream client refuses to follow redirects at all, so a
+307/308 can never re-send the credential to another host.
+
 ---
 
 ## Admin interface (stable, minimal)
@@ -276,6 +300,11 @@ only this:
 - In-process caching only — no Redis/vector DB.
 - Global + per-key in-flight caps, with a **bounded queue** (wait, then 429).
 - Per-host connection pooling / HTTP keep-alive (one shared `http.Transport`).
+- Request bodies are capped (8 MiB by default, `server.max_request_bytes`), and the
+  server sets explicit read, read-header, idle, and header-size bounds so a slow
+  or oversized client cannot pin a connection or exhaust memory.
+- Identical concurrent misses on one cache key are **coalesced** into a single
+  upstream call, so a hot key cannot fan out N upstream requests.
 - Pure-Go SQLite (`modernc.org/sqlite`) → `CGO_ENABLED=0`, truly static single binary.
 
 ---

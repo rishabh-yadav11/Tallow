@@ -79,6 +79,10 @@ timeout = "120s"
 name = "local-llm"
 base_url = "http://127.0.0.1:11434/v1"
 health_check = false          # local server; skip proactive probing.
+# NOTE: by default Tallow refuses a base_url that resolves to a non-public
+# address, so 127.0.0.1 is refused. To use a private upstream like this one,
+# call config.SetAllowPrivateBaseURL(true) before app.New. See SECURITY.md
+# ("Network egress: the base_url SSRF guard") for what that acceptance means.
 
   [[provider.key]]
   id = "default"
