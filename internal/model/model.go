@@ -86,6 +86,6 @@ type RequestMeta struct {
 	// cents were previously used here, which truncated every sub-cent request
 	// to zero; micro-USD preserves the real spend and is the unit every budget
 	// and rollup is compared in.
-	CostMicros int64 `json:"cost_micros"`
+	CostMicros int64  `json:"cost_micros"`
 	Err        string `json:"err"`
 }
