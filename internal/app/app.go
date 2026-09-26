@@ -269,6 +269,16 @@ func (a *App) AdminSocket() string {
 	return a.cfg.Server.AdminSocket
 }
 
+// publishHook is a test-only seam invoked inside Reload after budgets are
+// published but before the registry snapshot is swapped. It exists because the
+// audit C4 invariant is a property of the ORDER of two independently-locked
+// mutations, and the window between them is far too narrow to observe from a
+// concurrent test. It is nil in production, so the call is a single nil check
+// on a package-level var and changes nothing about reload behavior.
+//
+// Do not use it to mutate state; only to assert.
+var publishHook func()
+
 // Reload re-reads config and swaps the live state (hot reload). It reuses all
 // long-lived objects (store, cache, collector, HTTP client, proxy handler) so
 // no handles/connections leak and no counters are reset on reload.
@@ -294,9 +304,38 @@ func (a *App) Reload() error {
 	a.mu.Lock()
 	a.cfg = cfg
 	a.params = params
+	// C4: budgets are published BEFORE the registry, deliberately.
+	//
+	// The invariant that matters is "every routable key has a budget entry", and
+	// the two halves are mutated under two different locks (r.bmu and reg.mu),
+	// so no single critical section can hold it. Ordering alone can:
+	//
+	//   - Budgets first: a key that is not yet in the registry is simply not
+	//     routable, so nothing can reach it. The stray budget entry is inert and
+	//     is swept by the next SetBudgets. There is no window in which a
+	//     routable key lacks a budget.
+	//   - Registry first (the old order): a newly added key IS routable the
+	//     instant Swap returns, and its budget arrives two statements later.
+	//     Every request in that window reads kb == nil. The router now rejects
+	//     those (errNoBudget) rather than treating them as unlimited, so the
+	//     window fails closed instead of open - but it would still reject
+	//     traffic to a perfectly valid key, which is an outage, not a
+	//     correctness fix. Publishing budgets first removes the window itself.
+	//
+	// Removal is safe under this order for the same reason: Swap drops the
+	// provider first, so an orphaned budget is briefly unreachable but never
+	// unrestrained.
+	a.router.SetBudgets(keyLimits(providers), provRPM(providers))
+	if publishHook != nil {
+		// Test-only seam. The C4 invariant is a property of the ORDER of two
+		// mutations, and the window between them is nanoseconds wide, so a
+		// concurrent observer cannot reliably catch a regression. This hook
+		// lets a test inspect the intermediate state deterministically. It is
+		// nil in production; see c4_publish_test.go.
+		publishHook()
+	}
 	a.reg.Swap(providers, aliases)
 	a.health.Prune(providers)
-	a.router.SetBudgets(keyLimits(providers), provRPM(providers))
 	a.observ.SetEnabled(cfg.Observability.Enabled)
 	a.Keystore = keystore
 	a.mu.Unlock()

@@ -111,6 +111,24 @@ func (r *Router) SetBudgets(keys map[string]budget.KeyLimits, providers map[stri
 	r.cmu.Unlock()
 }
 
+// BudgetFor reports the key budget installed for a "provider/key" id, and
+// whether one exists.
+//
+// It exists so the reload publish path can be OBSERVED rather than assumed. The
+// audit C4 invariant ("every routable key has a budget entry") spans two
+// independently-locked objects, and the window in which it could be violated is
+// too narrow for a concurrent test to catch reliably. Exposing a read-only
+// accessor is what makes the intermediate state assertable, so a regression in
+// the publish ORDER fails a test instead of shipping. The handle is returned
+// only for inspection; mutating it is the caller's responsibility and the
+// router is the only intended user.
+func (r *Router) BudgetFor(id string) (*budget.KeyBudget, bool) {
+	r.bmu.RLock()
+	defer r.bmu.RUnlock()
+	kb, ok := r.budgets[id]
+	return kb, ok
+}
+
 // errStaleSelection marks a selection whose provider/key vanished from the
 // registry underneath it. C1: validity used to be *inferred* from an empty
 // BaseURL, and the caller then dereferenced sel.kb on the assumption that a

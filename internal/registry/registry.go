@@ -11,12 +11,22 @@ import (
 
 // Registry is the concurrency-safe snapshot of providers and aliases.
 //
-// The doc comment above ("swapped atomically ... no request ever observes a
-// half-applied configuration") describes the registry ITSELF and is true: the
-// two maps move together under one lock. It must not be read as a claim that a
-// registry swap and the router's budget map are installed together - those are
-// separate objects with separate locks, and the window between them is audit
-// finding C4, which internal/app closes by ordering the two publishes.
+// WHAT IS ATOMIC: Swap replaces the provider and alias maps under one lock, so
+// a reader never observes a half-built snapshot - it sees the whole old
+// generation or the whole new one.
+//
+// WHAT IS NOT ATOMIC: a registry swap is NOT atomic with respect to anything
+// derived from the snapshot by another object. The router, in particular, keeps
+// its budget map under its own lock, and it reads both. The invariant
+// "every routable key has a budget entry" therefore spans two locks and cannot
+// be made atomic by this type alone. Audit finding C4 is exactly that gap, and
+// it is closed by two things together: internal/app publishes budgets BEFORE
+// swapping the registry (so a key is never routable before its budget exists),
+// and internal/routing fails closed when a routable key has no budget rather
+// than treating the gap as unlimited.
+//
+// Do not read "swapped atomically" as covering the budget map, and do not add a
+// new derived map to the router without considering this boundary.
 type Registry struct {
 	mu        sync.RWMutex
 	providers map[string]*model.Provider
