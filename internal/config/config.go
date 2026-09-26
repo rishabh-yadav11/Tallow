@@ -292,8 +292,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate provider %q", p.Name)
 		}
 		seenP[p.Name] = true
-		if p.BaseURL == "" {
-			return fmt.Errorf("provider %q: base_url required", p.Name)
+		// M14: base_url is the field that decides where a request carrying the
+		// provider Authorization header and the full user prompt is sent, so it
+		// gets a real structural check rather than a bare non-empty test. The
+		// address-space half of the policy cannot live here - it depends on what
+		// the name resolves to at connection time - and is enforced per-dial by
+		// config.DialControl.
+		if err := ValidateBaseURL(p.Name, p.BaseURL); err != nil {
+			return err
 		}
 		seenK := map[string]bool{}
 		for _, k := range p.Key {

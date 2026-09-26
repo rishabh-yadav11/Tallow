@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -306,7 +307,24 @@ func provRPM(providers []model.Provider) map[string]int {
 }
 
 func newHTTPClient() *http.Client {
+	// M14: the dialer is where the SSRF policy is enforced, because the resolved
+	// address - not the base_url string - is what decides whether a request
+	// carrying the provider Authorization header and the full user prompt is
+	// about to leave the machine for a host inside the network. Control runs
+	// before the socket is created, so a refused connection never reaches the
+	// internal host, and running per-dial rather than per-request also covers a
+	// pooled idle connection and a name that re-resolves between requests.
+	//
+	// The dialer is set as a field rather than via Transport.DialContext so that
+	// it applies uniformly, and Proxy is honoured, which means a deployment that
+	// sets HTTPS_PROXY still gets the guard on the proxy hop.
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   config.DialControl,
+	}
 	tr := &http.Transport{
+		DialContext:           dialer.DialContext,
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
