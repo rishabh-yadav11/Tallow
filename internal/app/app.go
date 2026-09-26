@@ -136,6 +136,9 @@ func (a *App) load(path string) error {
 		Compaction:    compact.Config{Enabled: *cfg.Compaction.Enabled, MaxToolOutputChars: cfg.Compaction.MaxToolOutputChars},
 		CacheEnabled:  *cfg.Cache.Enabled,
 		RawBodies:     *cfg.Store.RawBodies,
+		// H6: the body cap is a server-level concern, so it is resolved once
+		// here and enforced by the handler with http.MaxBytesReader.
+		MaxRequestBytes: params.MaxBodyBytes,
 	})
 
 	a.mu.Lock()
@@ -152,14 +155,71 @@ func (a *App) load(path string) error {
 	a.proxyHandler = ph
 	a.mu.Unlock()
 
-	a.setAuth(cfg.Auth.APIKeys)
-	a.setAuthOpen(cfg.Auth.Open)
+	a.setAuth(cfg.Auth.APIKeys, cfg.Auth.Open)
 	a.adminSrv = admin.New(a, cfg.Server.AdminSocket)
-	a.proxySrv = &http.Server{Addr: cfg.Server.Listen, Handler: ph.Routes()}
-	if params.ReadTimeout > 0 {
-		a.proxySrv.ReadTimeout = params.ReadTimeout
-	}
+	a.proxySrv = newProxyServer(cfg.Server.Listen, ph.Routes(), params)
 	return nil
+}
+
+// maxHeaderBytes bounds the request header block. It matches net/http's own
+// default so nothing changes for well-behaved clients, while making the bound
+// explicit and auditable here.
+const maxHeaderBytes = 1 << 20
+
+// newProxyServer builds the client-facing HTTP server with explicit timeouts.
+//
+// H6: the server previously set only ReadTimeout, and only when it happened to
+// be positive - which it never was by default, because applyDefaults skipped the
+// field. WriteTimeout, IdleTimeout and ReadHeaderTimeout were never set at all,
+// so a slowloris client could hold a connection open indefinitely.
+//
+// ReadHeaderTimeout is set separately from ReadTimeout because it is the one
+// that actually bounds header reading; ReadTimeout covers the body, and 0 for
+// WriteTimeout is deliberate, because a streaming LLM completion has no useful
+// upper bound of its own and the per-provider upstream timeout already governs
+// how long a request may take. IdleTimeout bounds the keep-alive pool so idle
+// connections do not accumulate.
+func newProxyServer(addr string, handler http.Handler, params config.Params) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       params.ReadTimeout,
+		ReadHeaderTimeout: readHeaderTimeout(params),
+		WriteTimeout:      params.WriteTimeout,
+		IdleTimeout:       params.IdleTimeout,
+		// Stated explicitly rather than inherited. net/http's default is 1 MiB,
+		// which is already a bound, but a limit that is only implicit in another
+		// package's default is a limit nobody can audit. 1 MiB is generous for
+		// OpenAI-compatible requests, whose bodies are JSON, not file uploads.
+		MaxHeaderBytes: maxHeaderBytes,
+	}
+}
+
+// readHeaderTimeout derives the header-read bound.
+//
+// The result is ALWAYS positive. A zero ReadHeaderTimeout in net/http means
+// "no limit", so returning the caller's value when it is zero would silently
+// re-open the slowloris exposure this bound exists to close, and a Config
+// assembled without going through applyDefaults (as tests and embedders do)
+// would hit exactly that path. The floor therefore applies even to a zero
+// read_timeout: a header that cannot be completed quickly is not worth waiting
+// for, independent of how long the body is allowed to take.
+//
+// The cap applies for the same reason in the other direction: a config that
+// sets a long read_timeout must not buy an unbounded header read.
+func readHeaderTimeout(params config.Params) time.Duration {
+	const (
+		floor = 10 * time.Second
+		cap   = 10 * time.Second
+	)
+	d := params.ReadTimeout
+	if d <= 0 || d < floor {
+		return floor
+	}
+	if d > cap {
+		return cap
+	}
+	return d
 }
 
 func (a *App) resolveSecrets(providers []model.Provider, ks *secret.Store) {
@@ -176,8 +236,19 @@ func (a *App) resolveSecrets(providers []model.Provider, ks *secret.Store) {
 	}
 }
 
-func (a *App) setAuth(keys []string) {
-	m := map[string]bool{}
+// setAuth installs the allow-list and the open flag in ONE critical section.
+//
+// H5: these were two separate lock acquisitions - setAuth(keys) followed by
+// setAuthOpen(open). checkAuth short-circuits on authOpen, so when an operator
+// closed an open gateway (open=true -> open=false plus a key list) in a single
+// reload there was a window in which the new allow-list was live but authOpen
+// was still true, and unauthenticated requests were accepted. The reverse
+// direction errs safe: an early open=false rejects requests briefly, which is
+// an availability blip rather than a security hole.
+//
+// Both fields now move together, so no reader can observe one without the other.
+func (a *App) setAuth(keys []string, open bool) {
+	m := make(map[string]bool, len(keys))
 	for _, k := range keys {
 		if k != "" {
 			m[k] = true
@@ -185,12 +256,6 @@ func (a *App) setAuth(keys []string) {
 	}
 	a.authMu.Lock()
 	a.auth = m
-	a.authMu.Unlock()
-}
-
-// setAuthOpen records the safe-by-default open flag. Callers must hold authMu.
-func (a *App) setAuthOpen(open bool) {
-	a.authMu.Lock()
 	a.authOpen = open
 	a.authMu.Unlock()
 }
@@ -275,11 +340,6 @@ func newHTTPClient() *http.Client {
 func refuseCredentialRedirect(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
 }
-
-// NewHTTPClientForTest exposes the production client constructor so the
-// redirect guard can be tested where it is actually installed, not merely at
-// the call site that happens to configure it in a test.
-func NewHTTPClientForTest() *http.Client { return newHTTPClient() }
 
 // ProxyHandler exposes the client-facing HTTP handler.
 func (a *App) ProxyHandler() http.Handler { return a.proxyHandler.Routes() }
@@ -369,8 +429,7 @@ func (a *App) Reload() error {
 	a.Keystore = keystore
 	a.mu.Unlock()
 
-	a.setAuth(cfg.Auth.APIKeys)
-	a.setAuthOpen(cfg.Auth.Open)
+	a.setAuth(cfg.Auth.APIKeys, cfg.Auth.Open)
 	if a.store != nil {
 		_ = a.store.Audit("reload", "config", a.CfgPath)
 	}

@@ -53,6 +53,19 @@ func (c *Collector) Enabled() bool { return c.enabled.Load() }
 func (c *Collector) SetEnabled(v bool) { c.enabled.Store(v) }
 
 // Record folds one request into the live totals. No-op when disabled.
+//
+// M9: the per-provider map used to be keyed unconditionally by meta.Provider.
+// Gateway-level failures - a request for an unroutable alias, a body that
+// never selected a target - carry no provider, so each one created a permanent
+// bucket keyed by the empty string. That bucket's error rate was then visible
+// alongside every real provider, where it read as an eleventh provider that
+// nobody operated, and it diluted the provider health picture exactly when
+// routing was broken. A request with no provider is now counted only in the
+// global totals; it is not attributed to a provider that never served it.
+//
+// The failure is NOT lost. It still increments c.errors, so the gateway-level
+// error rate and the /stats error count reflect it, and the row is still
+// persisted by the retention store with its error message.
 func (c *Collector) Record(m model.RequestMeta, durMs int64) {
 	if !c.enabled.Load() {
 		return
@@ -69,16 +82,21 @@ func (c *Collector) Record(m model.RequestMeta, durMs int64) {
 	c.prompt += int64(m.PromptTokens)
 	c.completion += int64(m.CompletionTokens)
 	c.costMicros += m.CostMicros
-	pp := c.byProvider[m.Provider]
-	if pp == nil {
-		pp = &perProvider{}
-		c.byProvider[m.Provider] = pp
+	// An empty provider name means the gateway failed before or instead of
+	// choosing one. Bucketing it would invent a provider (M9), so it is left
+	// out of the per-provider view while remaining in the totals above.
+	if m.Provider != "" {
+		pp := c.byProvider[m.Provider]
+		if pp == nil {
+			pp = &perProvider{}
+			c.byProvider[m.Provider] = pp
+		}
+		pp.requests++
+		if m.Status == "error" {
+			pp.errors++
+		}
+		pp.costMicros += m.CostMicros
 	}
-	pp.requests++
-	if m.Status == "error" {
-		pp.errors++
-	}
-	pp.costMicros += m.CostMicros
 	c.latencies = append(c.latencies, durMs)
 	if len(c.latencies) > c.latCapacity {
 		c.latencies = c.latencies[len(c.latencies)-c.latCapacity:]

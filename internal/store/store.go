@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS requests (
 	upstream_model    TEXT NOT NULL DEFAULT '',
 	stream            INTEGER NOT NULL DEFAULT 0,
 	cached            INTEGER NOT NULL DEFAULT 0,
+	coalesced         INTEGER NOT NULL DEFAULT 0,
 	status            TEXT NOT NULL DEFAULT 'ok',
 	route_reason      TEXT NOT NULL DEFAULT '',
 	prompt_tokens     INTEGER NOT NULL DEFAULT 0,
@@ -215,6 +216,10 @@ func Open(cfg StoreConfig) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateCoalescedColumn(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	s := &Store{
 		db:    db,
 		cfg:   cfg,
@@ -284,6 +289,31 @@ func migrateCostUnits(db *sql.DB) error {
 	return nil
 }
 
+// migrateCoalescedColumn adds the coalesced column to a database created before
+// request coalescing (H8) existed.
+//
+// CREATE TABLE IF NOT EXISTS does not add a column to an existing table, so an
+// upgraded database would otherwise reject every INSERT that names the column.
+// Migrating keeps an operator's existing history store readable instead of
+// forcing them to delete it. Existing rows backfill to 0, which is the correct
+// historical value: before coalescing, every recorded request had issued its own
+// upstream call and owned its own spend.
+func migrateCoalescedColumn(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name='coalesced'`).Scan(&n); err != nil {
+		return fmt.Errorf("store: inspect requests: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	// SQLite rejects ADD COLUMN NOT NULL without a non-null default, so the
+	// default is a requirement here rather than a convenience.
+	if _, err := db.Exec(`ALTER TABLE requests ADD COLUMN coalesced INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("store: add requests.coalesced: %w", err)
+	}
+	return nil
+}
+
 // worker is the single background goroutine that performs all deferred writes.
 func (s *Store) worker() {
 	defer s.wg.Done()
@@ -293,10 +323,10 @@ func (s *Store) worker() {
 		switch op.kind {
 		case opRequest:
 			_, err = s.db.Exec(
-				`INSERT INTO requests (id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err)
-				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				`INSERT INTO requests (id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, coalesced, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err)
+				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				op.req.ID, op.req.StartedAt.UnixMilli(), op.req.DurMillis, op.req.Provider, op.req.Key, op.req.Model, op.req.UpstreamModel,
-				b2i(op.req.Stream), b2i(op.req.Cached), op.req.Status, op.req.RouteReason, op.req.PromptTokens, op.req.CompletionTokens, op.req.CostMicros, op.req.Err,
+				b2i(op.req.Stream), b2i(op.req.Cached), b2i(op.req.Coalesced), op.req.Status, op.req.RouteReason, op.req.PromptTokens, op.req.CompletionTokens, op.req.CostMicros, op.req.Err,
 			)
 		case opRaw:
 			_, err = s.db.Exec(`INSERT INTO raw_bodies (id, started_at, req_body, resp_body) VALUES (?,?,?,?)`,
@@ -596,7 +626,7 @@ func (s *Store) RecentRequests(limit int) ([]model.RequestMeta, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err
+	rows, err := s.db.Query(`SELECT id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, coalesced, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err
 		FROM requests ORDER BY started_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -605,13 +635,14 @@ func (s *Store) RecentRequests(limit int) ([]model.RequestMeta, error) {
 	var out []model.RequestMeta
 	for rows.Next() {
 		var m model.RequestMeta
-		var started, stream, cached int64
-		if err := rows.Scan(&m.ID, &started, &m.DurMillis, &m.Provider, &m.Key, &m.Model, &m.UpstreamModel, &stream, &cached, &m.Status, &m.RouteReason, &m.PromptTokens, &m.CompletionTokens, &m.CostMicros, &m.Err); err != nil {
+		var started, stream, cached, coalesced int64
+		if err := rows.Scan(&m.ID, &started, &m.DurMillis, &m.Provider, &m.Key, &m.Model, &m.UpstreamModel, &stream, &cached, &coalesced, &m.Status, &m.RouteReason, &m.PromptTokens, &m.CompletionTokens, &m.CostMicros, &m.Err); err != nil {
 			return nil, err
 		}
 		m.StartedAt = time.UnixMilli(started)
 		m.Stream = stream != 0
 		m.Cached = cached != 0
+		m.Coalesced = coalesced != 0
 		out = append(out, m)
 	}
 	return out, rows.Err()

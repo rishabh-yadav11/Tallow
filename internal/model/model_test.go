@@ -22,6 +22,7 @@ var requestMetaWireKeys = []string{
 	"upstream_model",
 	"stream",
 	"cached",
+	"coalesced",
 	"status",
 	"route_reason",
 	"prompt_tokens",
@@ -100,6 +101,7 @@ func TestRequestMetaMarshalValues(t *testing.T) {
 				"upstream_model":    "gpt-4o-2024-11-20",
 				"stream":            true,
 				"cached":            true,
+				"coalesced":         false,
 				"status":            "ok",
 				"route_reason":      "alias",
 				"prompt_tokens":     float64(1500),
@@ -132,6 +134,7 @@ func TestRequestMetaMarshalValues(t *testing.T) {
 				"upstream_model":    "claude-sonnet-4",
 				"stream":            false,
 				"cached":            false,
+				"coalesced":         false,
 				"status":            "error",
 				"route_reason":      "failover",
 				"prompt_tokens":     float64(0),
@@ -183,7 +186,7 @@ func TestRequestMetaZeroValueJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	const want = `{"id":"","started_at":"0001-01-01T00:00:00Z","dur_ms":0,"provider":"","key":"","model":"","upstream_model":"","stream":false,"cached":false,"status":"","route_reason":"","prompt_tokens":0,"completion_tokens":0,"cost_micros":0,"err":""}`
+	const want = `{"id":"","started_at":"0001-01-01T00:00:00Z","dur_ms":0,"provider":"","key":"","model":"","upstream_model":"","stream":false,"cached":false,"coalesced":false,"status":"","route_reason":"","prompt_tokens":0,"completion_tokens":0,"cost_micros":0,"err":""}`
 	if string(b) != want {
 		t.Errorf("zero RequestMeta JSON mismatch:\n got:  %s\n want: %s", b, want)
 	}

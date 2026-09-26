@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/rishabh-yadav11/tallow/internal/cache"
 	"github.com/rishabh-yadav11/tallow/internal/compact"
 	"github.com/rishabh-yadav11/tallow/internal/observ"
@@ -33,12 +35,17 @@ type Deps struct {
 	Compaction    compact.Config
 	CacheEnabled  bool
 	RawBodies     bool
+	// MaxRequestBytes caps the buffered request body. Zero or negative means
+	// unbounded, which is the pre-H6 behaviour and is never the default.
+	MaxRequestBytes int64
 }
 
 // Handler implements the OpenAI-compatible surface.
 type Handler struct {
 	deps  Deps
 	slots chan struct{}
+	// inflight coalesces concurrent cache misses on the same key (H8).
+	inflight singleflight.Group
 }
 
 // NewHandler constructs the HTTP handler with a bounded concurrency queue.
@@ -53,6 +60,17 @@ func NewHandler(d Deps) *Handler {
 }
 
 // Routes returns the mux for the client-facing API.
+//
+// H4: auth used to be a call at the TOP of chatCompletions and nowhere else, so
+// /v1/models, /v1/models/{id}, and /health answered unauthenticated clients even
+// with a populated allow-list, disclosing the full alias inventory and the
+// provider topology behind it. It is now middleware wrapped around the whole
+// mux, so a new route is authenticated by construction and cannot be added
+// unauthenticated by accident.
+//
+// /health is exempted because a liveness probe that needs a credential cannot
+// be used by most orchestrators, and it returns a static "ok" with no tenant
+// information. The exemption is explicit and narrow rather than a default.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
@@ -60,7 +78,21 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/v1/models", h.listModels)
 	mux.HandleFunc("/v1/models/", h.getModel)
 	mux.HandleFunc("/health", h.health)
-	return mux
+	return h.authenticated(mux)
+}
+
+// authenticated applies the bearer check to every route except /health.
+func (h *Handler) authenticated(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !h.auth(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
@@ -100,16 +132,25 @@ func (h *Handler) getModel(w http.ResponseWriter, r *http.Request) {
 // auth validates the request's bearer token against the allow-list. A nil
 // closure, or an empty allow-list (open/loopback trust), accepts any token
 // including a missing header.
+//
+// On success the validated identity is stashed on the request for the cache key
+// (C2). On failure the 401 is written here and false is returned; the caller
+// must not write a body afterwards.
 func (h *Handler) auth(w http.ResponseWriter, r *http.Request) bool {
 	if h.deps.Auth == nil {
+		// Open gateway: there is no authenticated principal, so the cache
+		// namespace falls back to the empty identity. See cacheScope for why
+		// that is safe and documented rather than merely convenient.
+		setIdentity(r, "")
 		return true
 	}
 	token, _ := bearerToken(r)
-	if h.deps.Auth(token) {
-		return true
+	if !h.deps.Auth(token) {
+		writeErr(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
+		return false
 	}
-	writeErr(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
-	return false
+	setIdentity(r, token)
+	return true
 }
 
 // bearerToken extracts the bearer credential.

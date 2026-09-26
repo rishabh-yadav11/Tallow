@@ -38,7 +38,17 @@ type Server struct {
 	MaxConcurrent int    `toml:"max_concurrent"` // global in-flight cap.
 	QueueTimeout  string `toml:"queue_timeout"`  // bounded-queue wait (duration).
 	ReadTimeout   string `toml:"read_timeout"`
-	StickyTTL     string `toml:"sticky_ttl"` // idle expiry of sticky affinity.
+	// WriteTimeout bounds how long a response may take. 0 means the per-provider
+	// upstream timeout governs; a negative value is rejected by Validate.
+	WriteTimeout string `toml:"write_timeout"`
+	// IdleTimeout bounds how long an idle keep-alive connection is held.
+	IdleTimeout string `toml:"idle_timeout"`
+	// MaxRequestBytes caps the buffered request body (H6). 0 means the built-in
+	// default of 8 MiB; a negative value is rejected by Validate.
+	MaxRequestBytes int64 `toml:"max_request_bytes"`
+	// StickyTTL is the idle expiry of sticky affinity. Unlike before, it
+	// defaults rather than defaulting to "never expire" (H7).
+	StickyTTL string `toml:"sticky_ttl"`
 }
 
 type Auth struct {
@@ -159,6 +169,37 @@ func (c *Config) applyDefaults() error {
 	if c.Server.AdminSocket == "" {
 		c.Server.AdminSocket = defaultAdminSocket()
 	}
+	// H6: these three were previously left at the zero value, which meant
+	// ReadTimeout, WriteTimeout and IdleTimeout were all unset and therefore
+	// infinite. A slowloris client could hold a connection open indefinitely.
+	// The defaults are unconditional: an operator who genuinely wants no
+	// write timeout cannot get it, and that is deliberate, because a streaming
+	// LLM response has no useful upper bound on its own and the per-provider
+	// upstream timeout already governs it. A non-positive override is rejected
+	// by Validate rather than silently treated as "unlimited".
+	if c.Server.ReadTimeout == "" {
+		c.Server.ReadTimeout = "30s"
+	}
+	if c.Server.WriteTimeout == "" {
+		// Longer than ReadTimeout because a streaming completion legitimately
+		// produces output for minutes.
+		c.Server.WriteTimeout = "0s"
+	}
+	if c.Server.IdleTimeout == "" {
+		c.Server.IdleTimeout = "120s"
+	}
+	if c.Server.MaxRequestBytes == 0 {
+		c.Server.MaxRequestBytes = 8 << 20
+	}
+	// H7: StickyTTL had no default, and 0 made the expiry branch unreachable
+	// because the guard read `if s.ttl > 0 && ...`. A config that simply
+	// omitted the knob therefore accumulated one permanent sticky entry per
+	// client-chosen X-Session-Id, with no cap and no eviction. 15m matches the
+	// shipped example config and is long enough to hold a real conversation
+	// together.
+	if c.Server.StickyTTL == "" {
+		c.Server.StickyTTL = "15m"
+	}
 	if c.Retention.RawBodiesDays == 0 {
 		c.Retention.RawBodiesDays = 5
 	}
@@ -224,9 +265,23 @@ func defaultAdminSocket() string {
 }
 
 // Validate enforces the schema version and structural invariants.
+//
+// H9: durations used to be parsed only in BuildParams, which runs AFTER
+// Validate has already declared the document valid, so a config with
+// `queue_timeout = "not-a-duration"` loaded successfully and then failed at an
+// unpredictable later point, and one with `queue_timeout = "-1h"` or
+// `metadata_days = -30` was accepted outright. Parsing and range-checking
+// durations here makes a bad config fail fast at load, with the offending key
+// named.
 func (c *Config) Validate() error {
 	if c.Version != SchemaVersion {
 		return fmt.Errorf("unsupported config version %d (want %d)", c.Version, SchemaVersion)
+	}
+	if err := c.validateDurations(); err != nil {
+		return err
+	}
+	if err := c.validateCounts(); err != nil {
+		return err
 	}
 	seenP := map[string]bool{}
 	for _, p := range c.Provider {
@@ -274,6 +329,115 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("alias %q: target for provider %q missing model", a.Name, t.Provider)
 			}
 		}
+	}
+	return nil
+}
+
+// validateDurations parses every duration knob and range-checks it.
+//
+// Each entry names the exact TOML key, so an operator is told which line to fix
+// rather than receiving a bare parse failure from a later stage.
+//
+// An EMPTY field is skipped rather than treated as zero. applyDefaults fills
+// every one of these in on the Load path, so an empty field reaching here means
+// the caller built a Config by hand, and rejecting that would make Validate
+// unusable on its own. What matters for H9 is that an operator cannot write a
+// garbage or negative duration and have it accepted.
+func (c *Config) validateDurations() error {
+	type durRule struct {
+		key       string
+		value     string
+		allowZero bool
+	}
+	rules := []durRule{
+		{"server.queue_timeout", c.Server.QueueTimeout, false},
+		{"server.read_timeout", c.Server.ReadTimeout, true},
+		// WriteTimeout 0 means unbounded, which is the documented default: a
+		// streaming completion has no useful upper bound of its own.
+		{"server.write_timeout", c.Server.WriteTimeout, true},
+		{"server.idle_timeout", c.Server.IdleTimeout, true},
+		// H7: sticky_ttl must be positive. 0 used to mean "never expire", which
+		// with a client-chosen X-Session-Id made the sticky map unbounded.
+		{"server.sticky_ttl", c.Server.StickyTTL, false},
+		{"cache.ttl", c.Cache.TTL, false},
+		{"retention.rollup_interval", c.Retention.RollupCron, false},
+		{"retention.vacuum_interval", c.Retention.VacuumCron, false},
+	}
+	for _, r := range rules {
+		if r.value == "" {
+			continue
+		}
+		d, err := Dur(r.value)
+		if err != nil {
+			return fmt.Errorf("%s: %w", r.key, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("%s: must not be negative, got %s", r.key, d)
+		}
+		if d == 0 && !r.allowZero {
+			return fmt.Errorf("%s: must be positive, got 0", r.key)
+		}
+	}
+	for _, p := range c.Provider {
+		if p.HealthInterval != "" {
+			if _, err := Dur(p.HealthInterval); err != nil {
+				return fmt.Errorf("provider %q: health_interval: %w", p.Name, err)
+			}
+		}
+		if p.Timeout != "" {
+			d, err := Dur(p.Timeout)
+			if err != nil {
+				return fmt.Errorf("provider %q: timeout: %w", p.Name, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("provider %q: timeout: must be positive, got %s", p.Name, d)
+			}
+		}
+		for ki, k := range p.Key {
+			if k.Window == "" {
+				continue
+			}
+			d, err := Dur(k.Window)
+			if err != nil {
+				return fmt.Errorf("provider %q key %q: window: %w", p.Name, k.ID, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("provider %q key %q (%d): window: must be positive, got %s", p.Name, k.ID, ki, d)
+			}
+		}
+	}
+	return nil
+}
+
+// validateCounts range-checks the non-duration numeric knobs.
+//
+// A negative retention day count means "delete everything immediately", which
+// is silent data loss rather than a startup error, and a negative cache byte
+// bound becomes a nonsensical limit. Both are rejected here.
+func (c *Config) validateCounts() error {
+	if c.Server.MaxConcurrent < 0 {
+		return fmt.Errorf("server.max_concurrent: must not be negative, got %d", c.Server.MaxConcurrent)
+	}
+	if c.Server.MaxRequestBytes < 0 {
+		return fmt.Errorf("server.max_request_bytes: must not be negative, got %d", c.Server.MaxRequestBytes)
+	}
+	if c.Cache.MaxEntries < 0 {
+		return fmt.Errorf("cache.max_entries: must not be negative, got %d", c.Cache.MaxEntries)
+	}
+	if c.Cache.MaxBytes < 0 {
+		return fmt.Errorf("cache.max_bytes: must not be negative, got %d", c.Cache.MaxBytes)
+	}
+	if c.Retention.RawBodiesDays < 0 {
+		return fmt.Errorf("retention.raw_bodies_days: must not be negative, got %d", c.Retention.RawBodiesDays)
+	}
+	if c.Retention.MetadataDays < 0 {
+		return fmt.Errorf("retention.metadata_days: must not be negative, got %d", c.Retention.MetadataDays)
+	}
+	if c.Retention.ErrorsDays < 0 {
+		return fmt.Errorf("retention.errors_days: must not be negative, got %d", c.Retention.ErrorsDays)
+	}
+	if c.Compaction.MaxToolOutputChars < 0 {
+		return fmt.Errorf("compaction.max_tool_output_chars: must not be negative, got %d", c.Compaction.MaxToolOutputChars)
 	}
 	return nil
 }

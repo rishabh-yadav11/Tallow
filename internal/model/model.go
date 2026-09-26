@@ -69,19 +69,27 @@ type Target struct {
 // store and (when enabled) live observability. JSON tags match the admin API
 // wire contract (snake_case).
 type RequestMeta struct {
-	ID               string    `json:"id"`
-	StartedAt        time.Time `json:"started_at"`
-	DurMillis        int64     `json:"dur_ms"`
-	Provider         string    `json:"provider"`
-	Key              string    `json:"key"`
-	Model            string    `json:"model"`
-	UpstreamModel    string    `json:"upstream_model"`
-	Stream           bool      `json:"stream"`
-	Cached           bool      `json:"cached"`
-	Status           string    `json:"status"`
-	RouteReason      string    `json:"route_reason"`
-	PromptTokens     int       `json:"prompt_tokens"`
-	CompletionTokens int       `json:"completion_tokens"`
+	ID            string    `json:"id"`
+	StartedAt     time.Time `json:"started_at"`
+	DurMillis     int64     `json:"dur_ms"`
+	Provider      string    `json:"provider"`
+	Key           string    `json:"key"`
+	Model         string    `json:"model"`
+	UpstreamModel string    `json:"upstream_model"`
+	Stream        bool      `json:"stream"`
+	Cached        bool      `json:"cached"`
+	// Coalesced marks a request that was served from another caller's in-flight
+	// upstream fetch rather than issuing one of its own (H8). The response bytes
+	// and the routing attribution are real, but no additional provider spend
+	// occurred, so spend and token fields are reported as zero and the budget
+	// that owns the spend is the leader's row alone. Without this, N coalesced
+	// callers would each carry the full cost of the single shared upstream call
+	// and a store rollup would report N times the money actually spent.
+	Coalesced        bool   `json:"coalesced"`
+	Status           string `json:"status"`
+	RouteReason      string `json:"route_reason"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
 	// CostMicros is the request cost in micro-USD (1 USD = 1,000,000). Integer
 	// cents were previously used here, which truncated every sub-cent request
 	// to zero; micro-USD preserves the real spend and is the unit every budget

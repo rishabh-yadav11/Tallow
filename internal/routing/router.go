@@ -552,6 +552,23 @@ func (r *Router) Release(sel *Selection, costMicros int64) {
 	sel.pb, sel.pbSet = nil, false
 }
 
+// InFlight reports how many concurrency slots the named key currently holds.
+//
+// Every slot taken by Select must come back through exactly one Release or
+// releaseSelection. A slot that never returns is invisible in the request logs
+// but caps the key permanently, so this exists to make a leak assertable rather
+// than merely suspected. The provider/key id is the same "provider/key" form
+// used for budget limits.
+func (r *Router) InFlight(provider, key string) int {
+	r.bmu.RLock()
+	kb := r.budgets[provider+"/"+key]
+	r.bmu.RUnlock()
+	if kb == nil {
+		return 0
+	}
+	return kb.Snapshot(r.now()).Inflight
+}
+
 // RecordSuccess closes the relevant breakers and re-affirms sticky.
 func (r *Router) RecordSuccess(sel *Selection) {
 	now := r.now()

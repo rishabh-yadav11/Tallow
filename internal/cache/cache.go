@@ -133,6 +133,25 @@ func (c *Cache) Get(key string) (Entry, bool) {
 	return it.e, true
 }
 
+// ExpiresAt reports when the entry for key expires, or the zero time if the key
+// is absent.
+//
+// Set always recomputes the expiry from the current time, so an entry's lifetime
+// is a direct, observable property of who wrote it and when. That makes "a
+// reader silently refreshed this entry" an assertable fact rather than a
+// suspicion, which matters for coalesced fetches: a follower re-writing the
+// shared entry would extend its life on every waiter and keep a stale response
+// alive indefinitely. It is read-only and does not count as a hit or a miss.
+func (c *Cache) ExpiresAt(key string) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.entries[key]
+	if !ok {
+		return time.Time{}
+	}
+	return el.Value.(*item).e.expires
+}
+
 // Set inserts or refreshes an entry, evicting expired/least-recently-used as
 // needed to respect both the entry-count and byte budgets.
 func (c *Cache) Set(e Entry) {

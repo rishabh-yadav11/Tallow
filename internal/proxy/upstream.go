@@ -33,12 +33,15 @@ type result struct {
 	prompt     int
 	completion int
 	respBody   []byte
+	status     int
 }
 
-// forward sends one upstream request. Streaming passthrough never buffers the
-// full body; non-streaming reads the full body before writing so a failure is
-// always retried before the client sees anything.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, sel *routing.Selection, body []byte, stream bool) (result, *forwardError) {
+// send performs the upstream HTTP request and returns the raw response.
+//
+// Split out from forward so the buffered cacheable path can issue the same
+// request WITHOUT writing to a client ResponseWriter, which is what makes an
+// upstream response safe to share between coalesced callers (H8).
+func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*http.Response, *forwardError) {
 	url := strings.TrimRight(sel.BaseURL, "/") + "/chat/completions"
 	ctx := r.Context()
 	var cancel context.CancelFunc
@@ -48,7 +51,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, sel *routing.S
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return result{}, &forwardError{msg: "build upstream request: " + err.Error()}
+		return nil, &forwardError{msg: "build upstream request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -57,7 +60,33 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, sel *routing.S
 	}
 	resp, err := h.deps.Client.Do(req)
 	if err != nil {
-		return result{}, &forwardError{retryable: true, transport: true, msg: "upstream: " + err.Error()}
+		return nil, &forwardError{retryable: true, transport: true, msg: "upstream: " + err.Error()}
+	}
+	return resp, nil
+}
+
+// readUpstreamBody reads a non-streaming upstream response and applies the
+// status policy, without writing anything to a client.
+func readUpstreamBody(resp *http.Response) ([]byte, *forwardError) {
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, &forwardError{retryable: true, msg: "read upstream: " + err.Error()}
+	}
+	if resp.StatusCode >= 400 {
+		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b)}
+		fe.retryable = isRetryableStatus(resp.StatusCode)
+		return nil, fe
+	}
+	return b, nil
+}
+
+// forward sends one upstream request. Streaming passthrough never buffers the
+// full body; non-streaming reads the full body before writing so a failure is
+// always retried before the client sees anything.
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, sel *routing.Selection, body []byte, stream bool) (result, *forwardError) {
+	resp, ferr := h.send(r, sel, body)
+	if ferr != nil {
+		return result{}, ferr
 	}
 	defer resp.Body.Close()
 
