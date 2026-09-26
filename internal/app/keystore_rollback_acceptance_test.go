@@ -11,15 +11,34 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
-// This file covers the keystore rollback contract at the one place where it is
-// actually reachable: a long-lived gateway process.
+// This file covers the keystore rollback contract, and the two places it is
+// actually reachable.
 //
 // The contract Set and Delete promise is that the in-memory map always describes
 // what is on disk. That promise is only observable when the same Store outlives
 // a failed write, because that is the only situation in which a stale map can
 // be written out by a later, unrelated save.
 //
-// That rules out the CLI as an observation point. `tallowctl key` calls
+// A note on scope, because an earlier version of this comment overstated it. It
+// said the coverage sat at a "long-lived gateway process". It does not.
+// App.Reload calls secret.LoadStore afresh on every reload, and its
+// resolveSecrets only ever calls Get, so the gateway's reload path never writes
+// the keystore at all. There is no gateway-side write to fail and no stale map
+// to resurrect. A first draft of this file asserted otherwise, driving
+// App.Reload against an unwritable keystore and reading the file back
+// afterwards. It passed, and it would have passed against any implementation
+// whatsoever, because the write it claimed to exercise does not exist. That test
+// was deleted rather than kept, since a green test which cannot fail is worse
+// than a missing one.
+//
+// The long-lived Store modelled below is therefore the operator's own, as in an
+// editor or a tool holding the keystore open across several operations. That is
+// the real shape of the contract. The gateway's side is a different property,
+// and TestAnUnreadableKeystoreFailsTheReloadClosed covers it: a reload that
+// cannot read the keystore must fail rather than quietly continue holding no
+// credentials at all.
+//
+// That also rules out the CLI as an observation point. `tallowctl key` calls
 // secret.LoadStore once per invocation and performs exactly one operation before
 // exiting, so a failed add that leaves a ghost in the map dies with the process
 // and never reaches disk. A subprocess-driven CLI test can confirm the operator
@@ -29,9 +48,10 @@ import (
 // confidence it has not earned. Verified by mutation: deleting the rollback in
 // Store.Set leaves every tallowctl key test green.
 //
-// The gateway does hold the Store across requests and reloads it in-process
-// through App.Reload, called by the config watcher and by POST /admin/reload.
-// That is the path where a stale map would leak, so that is what is driven here.
+// The gateway does reload the keystore in-process through App.Reload, called by
+// the config watcher and by POST /admin/reload, but that path only ever reads: a
+// reload resolves credentials, it never writes them. The read-side failure is
+// what TestAnUnreadableKeystoreFailsTheReloadClosed covers.
 
 const rollbackCfg = `version = 1
 [auth]
@@ -275,4 +295,79 @@ func containsAny(haystack string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+// TestAnUnreadableKeystoreFailsTheReloadClosed covers the gateway's own side of
+// the keystore, which is a different property from the rollback contract above.
+//
+// A reload resolves every provider credential from the keystore, so an
+// unreadable keystore means the gateway cannot know any key. It must fail and
+// leave its previous configuration in place. The failure mode to fear is the
+// opposite: a reload that logs a warning, clears the resolved secrets, and
+// returns nil, leaving a gateway that accepts requests and routes them to
+// providers with no credential. That turns a permissions mistake into a silent
+// outage discovered by the next real caller, and it is also a data-loss shape,
+// because the previously working configuration is gone.
+//
+// The keystore is made unreadable with a permission bit rather than by deleting
+// or corrupting it, because a missing file is a normal state that LoadStore
+// treats as an empty store, and a corrupt file fails for a different reason.
+// Under root the permission bit is not enforced, so the test skips rather than
+// reporting a false pass.
+func TestAnUnreadableKeystoreFailsTheReloadClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: file permission bits are not enforced, so a " +
+			"mode 0000 file is still readable and this test would pass vacuously")
+	}
+	a, _, keystorePath, _ := newGatewayWithKeystore(t)
+
+	// LoadStore treats a missing file as an empty store rather than an error, so
+	// there is nothing to make unreadable until a credential has actually been
+	// stored. Writing one also makes the test meaningful: a keystore that
+	// resolves a real key is the state a reload is supposed to handle.
+	box, err := secret.NewBox([]byte("integration-master-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := secret.LoadStore(keystorePath, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Set("p1:k1", "sk-live-credential"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The gateway starts healthy, so a later failure is attributable to the
+	// keystore and not to a harness that never worked.
+	if err := a.Reload(); err != nil {
+		t.Fatalf("the baseline reload failed: %v", err)
+	}
+
+	if err := os.Chmod(keystorePath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(keystorePath, 0o600) })
+
+	// Confirm the file really is unreadable now, so the assertion below does not
+	// rest on a permission bit the filesystem chose to ignore.
+	if _, err := os.ReadFile(keystorePath); err == nil {
+		t.Skip("the filesystem still permits reading a mode 0000 file")
+	}
+
+	reloadErr := a.Reload()
+	if reloadErr == nil {
+		t.Errorf("App.Reload returned nil against an unreadable keystore: the " +
+			"gateway reported a successful reload while holding no credentials")
+	}
+
+	// And it must recover once the keystore is readable again. A failed reload
+	// that left the gateway permanently broken would turn a permissions mistake
+	// into a full outage that needs a restart.
+	if err := os.Chmod(keystorePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatalf("the recovery reload failed once the keystore was readable "+
+			"again: %v", err)
+	}
 }
