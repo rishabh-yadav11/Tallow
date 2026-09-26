@@ -165,11 +165,11 @@ func populatedFake() *fakeBackend {
 			Cached:           7,
 			PromptTokens:     900,
 			CompletionTokens: 300,
-			CostCents:        15,
+			CostMicros:       15,
 			LatencyP50Ms:     120,
 			LatencyP95Ms:     890,
 			ByProvider: map[string]observ.ProviderStat{
-				"prov-a": {Requests: 30, Errors: 1, CostCents: 10},
+				"prov-a": {Requests: 30, Errors: 1, CostMicros: 10},
 			},
 		},
 		providers: []ProviderView{{
@@ -217,7 +217,7 @@ func populatedFake() *fakeBackend {
 			RouteReason:      "alias",
 			PromptTokens:     10,
 			CompletionTokens: 5,
-			CostCents:        3,
+			CostMicros:       3,
 			Err:              "",
 		}},
 		rollups: []store.Rollup{{
@@ -229,7 +229,7 @@ func populatedFake() *fakeBackend {
 			Errors:      1,
 			Prompt:      900,
 			Completion:  300,
-			CostCents:   15,
+			CostMicros:  15,
 		}},
 		audit: []store.AuditEntry{{
 			TS:     time.Unix(1700000000, 0).UTC(),
@@ -391,7 +391,7 @@ func TestAdminEndpoints(t *testing.T) {
 				if !ok {
 					t.Fatalf("by_provider missing prov-a; got %v", snap.ByProvider)
 				}
-				if st.Requests != 30 || st.Errors != 1 || st.CostCents != 10 {
+				if st.Requests != 30 || st.Errors != 1 || st.CostMicros != 10 {
 					t.Errorf("prov-a stats = %+v; want requests 30, errors 1, cost 10", st)
 				}
 			},
@@ -472,7 +472,7 @@ func TestAdminEndpoints(t *testing.T) {
 					t.Fatalf("got %d logs; want 1", len(logs))
 				}
 				l := logs[0]
-				if l.ID != "req-1" || l.Provider != "prov-a" || l.Status != "ok" || l.CostCents != 3 {
+				if l.ID != "req-1" || l.Provider != "prov-a" || l.Status != "ok" || l.CostMicros != 3 {
 					t.Errorf("log = %+v", l)
 				}
 				if !l.StartedAt.Equal(time.Unix(1700000000, 0).UTC()) {
@@ -493,7 +493,7 @@ func TestAdminEndpoints(t *testing.T) {
 					t.Fatalf("got %d rollups; want 1", len(rollups))
 				}
 				r := rollups[0]
-				if r.Bucket != "2026-09-23T00" || r.Requests != 9 || r.CostCents != 15 {
+				if r.Bucket != "2026-09-23T00" || r.Requests != 9 || r.CostMicros != 15 {
 					t.Errorf("rollup = %+v", r)
 				}
 				if n := f.rollupsLimit(); n != 7 {

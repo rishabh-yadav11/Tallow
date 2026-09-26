@@ -54,16 +54,16 @@ type healthResp struct {
 }
 
 type providerStat struct {
-	Requests  int64
-	Errors    int64
-	CostCents int64
+	Requests   int64
+	Errors     int64
+	CostMicros int64
 }
 
 func (p *providerStat) UnmarshalJSON(data []byte) error {
 	f := parseFlex(data)
 	p.Requests = f.num("Requests", "requests")
 	p.Errors = f.num("Errors", "errors")
-	p.CostCents = f.num("CostCents", "cost_cents")
+	p.CostMicros = f.num("CostMicros", "cost_micros", "CostCents", "cost_cents")
 	return nil
 }
 
@@ -75,7 +75,7 @@ type metricsResp struct {
 	Cached           int64
 	PromptTokens     int64
 	CompletionTokens int64
-	CostCents        int64
+	CostMicros       int64
 	LatencyP50Ms     int64
 	LatencyP95Ms     int64
 	ByProvider       map[string]providerStat
@@ -90,7 +90,7 @@ func (m *metricsResp) UnmarshalJSON(data []byte) error {
 	m.Cached = f.num("Cached", "cached")
 	m.PromptTokens = f.num("PromptTokens", "prompt_tokens")
 	m.CompletionTokens = f.num("CompletionTokens", "completion_tokens")
-	m.CostCents = f.num("CostCents", "cost_cents")
+	m.CostMicros = f.num("CostMicros", "cost_micros", "CostCents", "cost_cents")
 	m.LatencyP50Ms = f.num("LatencyP50Ms", "latency_p50_ms")
 	m.LatencyP95Ms = f.num("LatencyP95Ms", "latency_p95_ms")
 	if raw := f.get("ByProvider", "by_provider"); raw != nil {
@@ -143,7 +143,7 @@ type logEntry struct {
 	RouteReason      string
 	PromptTokens     int
 	CompletionTokens int
-	CostCents        int64
+	CostMicros       int64
 	Err              string
 }
 
@@ -162,7 +162,7 @@ func (l *logEntry) UnmarshalJSON(data []byte) error {
 	l.RouteReason = f.str("RouteReason", "route_reason")
 	l.PromptTokens = int(f.num("PromptTokens", "prompt_tokens"))
 	l.CompletionTokens = int(f.num("CompletionTokens", "completion_tokens"))
-	l.CostCents = f.num("CostCents", "cost_cents")
+	l.CostMicros = f.num("CostMicros", "cost_micros", "CostCents", "cost_cents")
 	l.Err = f.str("Err", "err")
 	return nil
 }
@@ -419,6 +419,14 @@ func dollars(cents int64) string {
 	return fmt.Sprintf("$%.2f", float64(cents)/100.0)
 }
 
+// microDollars renders a micro-USD amount for display. The gateway reports
+// cost in micro-USD so sub-cent spend is not truncated away; the TUI shows
+// dollars. Values below one cent still render their true magnitude rather
+// than a flat $0.00, so real spend stays visible.
+func microDollars(micros int64) string {
+	return fmt.Sprintf("$%.4f", float64(micros)/1e6)
+}
+
 func fmtUptime(sec int64) string {
 	if sec < 60 {
 		return fmt.Sprintf("%ds", sec)
@@ -481,7 +489,7 @@ func renderDashboard(s *snapshot) string {
 	fmt.Fprintf(&b, "tokens %d prompt / %d completion\n",
 		to.PromptTokens, to.CompletionTokens)
 	fmt.Fprintf(&b, "cost %s   p50 %d ms   p95 %d ms\n",
-		dollars(to.CostCents), to.LatencyP50Ms, to.LatencyP95Ms)
+		microDollars(to.CostMicros), to.LatencyP50Ms, to.LatencyP95Ms)
 	b.WriteString("\n")
 
 	// 3. providers / keys

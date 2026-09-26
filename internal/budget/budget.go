@@ -79,12 +79,19 @@ func (w *FixedWindow) ResetsAt(now time.Time) time.Time {
 }
 
 // KeyLimits is the configured hard-limit set for a single key.
+//
+// CostLimitCents is the operator-facing cap in cents; CostLimitMicros is the
+// same cap in the internal micro-USD unit and is what the budget compares
+// against. Microunits matter because a single LLM call normally costs a
+// fraction of a cent, so a cents-unit accumulator truncated real spend to zero
+// and cost caps could never fire.
 type KeyLimits struct {
-	RPM            int
-	MaxRequests    int
-	Window         time.Duration
-	MaxConcurrent  int
-	CostLimitCents int64
+	RPM             int
+	MaxRequests     int
+	Window          time.Duration
+	MaxConcurrent   int
+	CostLimitCents  int64
+	CostLimitMicros int64
 }
 
 // KeyBudget tracks a key's RPM, request window, in-flight concurrency, and
@@ -94,8 +101,8 @@ type KeyBudget struct {
 	rpm         FixedWindow
 	req         FixedWindow
 	inflight    int
-	costCents   int64
-	costLimit   int64
+	costMicros  int64
+	costLimit   int64 // micro-USD
 	maxInflight int
 }
 
@@ -105,7 +112,7 @@ func NewKeyBudget(l KeyLimits) *KeyBudget {
 		rpm:         FixedWindow{Limit: l.RPM, Window: time.Minute},
 		req:         FixedWindow{Limit: l.MaxRequests, Window: l.Window},
 		maxInflight: l.MaxConcurrent,
-		costLimit:   l.CostLimitCents,
+		costLimit:   l.CostLimitMicros,
 	}
 }
 
@@ -118,7 +125,7 @@ func (b *KeyBudget) SetLimits(l KeyLimits) {
 	b.req.Limit = l.MaxRequests
 	b.req.Window = l.Window
 	b.maxInflight = l.MaxConcurrent
-	b.costLimit = l.CostLimitCents
+	b.costLimit = l.CostLimitMicros
 }
 
 // Acquire reserves a request slot. Returns failure with a reason when any hard
@@ -130,7 +137,7 @@ func (b *KeyBudget) Acquire(now time.Time) (bool, string) {
 	if b.maxInflight > 0 && b.inflight >= b.maxInflight {
 		return false, "key_max_concurrent"
 	}
-	if b.costLimit > 0 && b.costCents >= b.costLimit {
+	if b.costLimit > 0 && b.costMicros >= b.costLimit {
 		return false, "key_cost_limit"
 	}
 	if !b.rpm.Peek(now) {
@@ -148,21 +155,21 @@ func (b *KeyBudget) Acquire(now time.Time) (bool, string) {
 	return true, ""
 }
 
-// Release returns one in-flight slot and accumulates cost.
-func (b *KeyBudget) Release(costCents int64) {
+// Release returns one in-flight slot and accumulates cost (in micro-USD).
+func (b *KeyBudget) Release(costMicros int64) {
 	b.mu.Lock()
 	if b.inflight > 0 {
 		b.inflight--
 	}
-	b.costCents += costCents
+	b.costMicros += costMicros
 	b.mu.Unlock()
 }
 
 // AccumulateCost adds cost without touching in-flight (for already-released or
 // non-slot accounting paths). Kept separate from Release for clarity.
-func (b *KeyBudget) AccumulateCost(costCents int64) {
+func (b *KeyBudget) AccumulateCost(costMicros int64) {
 	b.mu.Lock()
-	b.costCents += costCents
+	b.costMicros += costMicros
 	b.mu.Unlock()
 }
 
@@ -174,8 +181,9 @@ type Snapshot struct {
 	QuotaResetsAt  time.Time
 	Inflight       int
 	MaxInflight    int
-	CostCents      int64
-	CostLimitCents int64
+	// CostMicros and CostLimitMicros are both in micro-USD.
+	CostMicros      int64
+	CostLimitMicros int64
 }
 
 // Snapshot returns a consistent live status.
@@ -183,14 +191,14 @@ func (b *KeyBudget) Snapshot(now time.Time) Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return Snapshot{
-		RPMRemaining:   b.rpm.Remaining(now),
-		RPMResetsAt:    b.rpm.ResetsAt(now),
-		QuotaRemaining: b.req.Remaining(now),
-		QuotaResetsAt:  b.req.ResetsAt(now),
-		Inflight:       b.inflight,
-		MaxInflight:    b.maxInflight,
-		CostCents:      b.costCents,
-		CostLimitCents: b.costLimit,
+		RPMRemaining:    b.rpm.Remaining(now),
+		RPMResetsAt:     b.rpm.ResetsAt(now),
+		QuotaRemaining:  b.req.Remaining(now),
+		QuotaResetsAt:   b.req.ResetsAt(now),
+		Inflight:        b.inflight,
+		MaxInflight:     b.maxInflight,
+		CostMicros:      b.costMicros,
+		CostLimitMicros: b.costLimit,
 	}
 }
 

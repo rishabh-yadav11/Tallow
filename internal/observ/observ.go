@@ -6,6 +6,7 @@
 package observ
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -22,7 +23,7 @@ type Collector struct {
 	total, errors      int64
 	cached             int64
 	prompt, completion int64
-	costCents          int64
+	costMicros         int64
 	byProvider         map[string]*perProvider
 	latencies          []int64
 	latCapacity        int
@@ -31,7 +32,7 @@ type Collector struct {
 
 type perProvider struct {
 	requests, errors int64
-	costCents        int64
+	costMicros       int64
 }
 
 // New builds a collector; enabled gates whether Record does work.
@@ -67,7 +68,7 @@ func (c *Collector) Record(m model.RequestMeta, durMs int64) {
 	}
 	c.prompt += int64(m.PromptTokens)
 	c.completion += int64(m.CompletionTokens)
-	c.costCents += m.CostCents
+	c.costMicros += m.CostMicros
 	pp := c.byProvider[m.Provider]
 	if pp == nil {
 		pp = &perProvider{}
@@ -77,7 +78,7 @@ func (c *Collector) Record(m model.RequestMeta, durMs int64) {
 	if m.Status == "error" {
 		pp.errors++
 	}
-	pp.costCents += m.CostCents
+	pp.costMicros += m.CostMicros
 	c.latencies = append(c.latencies, durMs)
 	if len(c.latencies) > c.latCapacity {
 		c.latencies = c.latencies[len(c.latencies)-c.latCapacity:]
@@ -86,24 +87,31 @@ func (c *Collector) Record(m model.RequestMeta, durMs int64) {
 
 // Snapshot is a point-in-time metric dump for the admin API.
 type Snapshot struct {
-	Enabled          bool                    `json:"enabled"`
-	UptimeSeconds    int64                   `json:"uptime_seconds"`
-	Total            int64                   `json:"total"`
-	Errors           int64                   `json:"errors"`
-	Cached           int64                   `json:"cached"`
-	PromptTokens     int64                   `json:"prompt_tokens"`
-	CompletionTokens int64                   `json:"completion_tokens"`
-	CostCents        int64                   `json:"cost_cents"`
-	LatencyP50Ms     int64                   `json:"latency_p50_ms"`
-	LatencyP95Ms     int64                   `json:"latency_p95_ms"`
-	ByProvider       map[string]ProviderStat `json:"by_provider"`
+	Enabled          bool  `json:"enabled"`
+	UptimeSeconds    int64 `json:"uptime_seconds"`
+	Total            int64 `json:"total"`
+	Errors           int64 `json:"errors"`
+	Cached           int64 `json:"cached"`
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	CostMicros       int64 `json:"cost_micros"`
+	LatencyP50Ms     int64 `json:"latency_p50_ms"`
+	LatencyP95Ms     int64 `json:"latency_p95_ms"`
+	// LatencyWindow and LatencySamples make the percentile basis explicit.
+	// The percentiles are computed from a bounded sliding reservoir, not from
+	// the lifetime counters beside them, so an operator reading
+	// latency_p95_ms during an incident needs to know the window is the most
+	// recent LatencyWindow requests and not all-time traffic.
+	LatencyWindow  string                  `json:"latency_window"`
+	LatencySamples int                     `json:"latency_samples"`
+	ByProvider     map[string]ProviderStat `json:"by_provider"`
 }
 
 // ProviderStat is per-provider counters.
 type ProviderStat struct {
-	Requests  int64 `json:"requests"`
-	Errors    int64 `json:"errors"`
-	CostCents int64 `json:"cost_cents"`
+	Requests   int64 `json:"requests"`
+	Errors     int64 `json:"errors"`
+	CostMicros int64 `json:"cost_micros"`
 }
 
 // Snapshot returns a copy of current totals.
@@ -118,7 +126,7 @@ func (c *Collector) Snapshot() Snapshot {
 		Cached:           c.cached,
 		PromptTokens:     c.prompt,
 		CompletionTokens: c.completion,
-		CostCents:        c.costCents,
+		CostMicros:       c.costMicros,
 		ByProvider:       map[string]ProviderStat{},
 	}
 	if n := len(c.latencies); n > 0 {
@@ -127,9 +135,13 @@ func (c *Collector) Snapshot() Snapshot {
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 		s.LatencyP50Ms = sorted[n*50/100]
 		s.LatencyP95Ms = sorted[n*95/100]
+		s.LatencySamples = n
 	}
+	// Always name the window, even with no samples, so consumers never have to
+	// infer whether a zero percentile means "no traffic" or "all-time 0 ms".
+	s.LatencyWindow = fmt.Sprintf("last_%d_requests", c.latCapacity)
 	for p, v := range c.byProvider {
-		s.ByProvider[p] = ProviderStat{Requests: v.requests, Errors: v.errors, CostCents: v.costCents}
+		s.ByProvider[p] = ProviderStat{Requests: v.requests, Errors: v.errors, CostMicros: v.costMicros}
 	}
 	return s
 }

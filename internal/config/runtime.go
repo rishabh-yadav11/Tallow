@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/rishabh-yadav11/tallow/internal/model"
+	"github.com/rishabh-yadav11/tallow/internal/money"
 )
 
 // Build converts the validated TOML document into runtime model values.
@@ -42,6 +43,10 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 				Window:         w,
 				MaxConcurrent:  k.MaxConcurrent,
 				CostLimitCents: k.CostLimitCents,
+				// The operator configures the cap in cents; the runtime
+				// budget enforces it in micro-USD so sub-cent spend is
+				// accounted instead of truncated away.
+				CostLimitMicros: money.CentsToMicroUSD(k.CostLimitCents),
 			})
 		}
 		provs = append(provs, mp)

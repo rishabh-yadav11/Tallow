@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -104,7 +105,7 @@ CREATE TABLE IF NOT EXISTS requests (
 	route_reason      TEXT NOT NULL DEFAULT '',
 	prompt_tokens     INTEGER NOT NULL DEFAULT 0,
 	completion_tokens INTEGER NOT NULL DEFAULT 0,
-	cost_cents        INTEGER NOT NULL DEFAULT 0,
+	cost_micros        INTEGER NOT NULL DEFAULT 0,
 	err               TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_started ON requests(started_at);
@@ -138,7 +139,7 @@ CREATE TABLE IF NOT EXISTS rollups (
 	errors            INTEGER NOT NULL DEFAULT 0,
 	prompt_tokens     INTEGER NOT NULL DEFAULT 0,
 	completion_tokens INTEGER NOT NULL DEFAULT 0,
-	cost_cents        INTEGER NOT NULL DEFAULT 0,
+	cost_micros        INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (bucket, bucket_start, provider, key)
 );
 
@@ -158,11 +159,38 @@ CREATE TABLE IF NOT EXISTS meta (
 
 const watermarkKey = "rollup_watermark"
 
+// costUnitsKey records that an existing database's cost column has been
+// converted from the old integer-cents unit to micro-USD. Cost was previously
+// accumulated in cents, which truncated every sub-cent request to zero, so
+// stored totals understate real spend; existing values are scaled up once, on
+// the first open of a pre-existing database, and the stamp makes it idempotent.
+const costUnitsKey = "cost_units"
+
 // Open opens (creating if needed) the database and applies the schema in WAL
 // mode.
 func Open(cfg StoreConfig) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return nil, err
+	}
+	// The database holds raw request/response bodies, so it must not be
+	// world-readable. The SQLite driver creates the file with the process
+	// umask (0644 in practice), so pre-create it with restrictive permissions
+	// instead; an existing file keeps whatever mode it already has.
+	if fi, err := os.Stat(cfg.Path); os.IsNotExist(err) {
+		if fh, err := os.OpenFile(cfg.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err != nil {
+			return nil, err
+		} else if err := fh.Close(); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	} else if fi != nil {
+		// Tighten permissions on a pre-existing file, but never widen them.
+		if mode := fi.Mode().Perm(); mode&0o077 != 0 {
+			if err := os.Chmod(cfg.Path, mode&^0o077); err != nil {
+				return nil, err
+			}
+		}
 	}
 	dsn := "file:" + cfg.Path + "?_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
@@ -182,6 +210,10 @@ func Open(cfg StoreConfig) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate: %w", err)
+	}
+	if err := migrateCostUnits(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	s := &Store{
 		db:    db,
@@ -209,6 +241,49 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// migrateCostUnits converts a pre-existing database's cost column from integer
+// cents to micro-USD. Because the old unit truncated sub-cent requests, stored
+// values are cent-denominated, so they are scaled by micro-USD-per-cent to keep
+// totals comparable after the upgrade. A fresh database already has cost_micros
+// and simply gets the unit stamp. The stamp makes this run at most once, so
+// reopening an already-converted database is a no-op.
+func migrateCostUnits(db *sql.DB) error {
+	var unit string
+	err := db.QueryRow(`SELECT v FROM meta WHERE k=?`, costUnitsKey).Scan(&unit)
+	if err == nil {
+		if unit == "micros" {
+			return nil
+		}
+		return fmt.Errorf("store: unknown cost unit %q in database", unit)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: read cost units: %w", err)
+	}
+
+	for _, table := range []string{"requests", "rollups"} {
+		var n int
+		// Only a pre-existing table carries the old cost_cents column.
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name='cost_cents'`, table).Scan(&n); err != nil {
+			return fmt.Errorf("store: inspect %s: %w", table, err)
+		}
+		if n == 0 {
+			continue
+		}
+		// 10,000 micro-USD per cent, preserving the stored magnitude.
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET cost_cents = cost_cents * 10000`, table)); err != nil {
+			return fmt.Errorf("store: convert %s cost: %w", table, err)
+		}
+		if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s RENAME COLUMN cost_cents TO cost_micros`, table)); err != nil {
+			return fmt.Errorf("store: rename %s cost column: %w", table, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO meta (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
+		costUnitsKey, "micros"); err != nil {
+		return fmt.Errorf("store: record cost units: %w", err)
+	}
+	return nil
+}
+
 // worker is the single background goroutine that performs all deferred writes.
 func (s *Store) worker() {
 	defer s.wg.Done()
@@ -218,10 +293,10 @@ func (s *Store) worker() {
 		switch op.kind {
 		case opRequest:
 			_, err = s.db.Exec(
-				`INSERT INTO requests (id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, status, route_reason, prompt_tokens, completion_tokens, cost_cents, err)
+				`INSERT INTO requests (id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err)
 				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				op.req.ID, op.req.StartedAt.UnixMilli(), op.req.DurMillis, op.req.Provider, op.req.Key, op.req.Model, op.req.UpstreamModel,
-				b2i(op.req.Stream), b2i(op.req.Cached), op.req.Status, op.req.RouteReason, op.req.PromptTokens, op.req.CompletionTokens, op.req.CostCents, op.req.Err,
+				b2i(op.req.Stream), b2i(op.req.Cached), op.req.Status, op.req.RouteReason, op.req.PromptTokens, op.req.CompletionTokens, op.req.CostMicros, op.req.Err,
 			)
 		case opRaw:
 			_, err = s.db.Exec(`INSERT INTO raw_bodies (id, started_at, req_body, resp_body) VALUES (?,?,?,?)`,
@@ -361,7 +436,7 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT started_at, provider, key, prompt_tokens, completion_tokens, cost_cents, status
+		`SELECT started_at, provider, key, prompt_tokens, completion_tokens, cost_micros, status
 		 FROM requests WHERE started_at > ? ORDER BY started_at`, wm)
 	if err != nil {
 		return err
@@ -423,14 +498,14 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 
 	for bk, a := range agg {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO rollups (bucket, bucket_start, provider, key, requests, errors, prompt_tokens, completion_tokens, cost_cents)
+			`INSERT INTO rollups (bucket, bucket_start, provider, key, requests, errors, prompt_tokens, completion_tokens, cost_micros)
 			 VALUES (?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(bucket, bucket_start, provider, key) DO UPDATE SET
 			   requests=requests+excluded.requests,
 			   errors=errors+excluded.errors,
 			   prompt_tokens=prompt_tokens+excluded.prompt_tokens,
 			   completion_tokens=completion_tokens+excluded.completion_tokens,
-			   cost_cents=cost_cents+excluded.cost_cents`,
+			   cost_micros=cost_micros+excluded.cost_micros`,
 			bk.bucket, bk.start, bk.prov, bk.key, a[0], a[1], a[2], a[3], a[4]); err != nil {
 			return err
 		}
@@ -521,7 +596,7 @@ func (s *Store) RecentRequests(limit int) ([]model.RequestMeta, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, status, route_reason, prompt_tokens, completion_tokens, cost_cents, err
+	rows, err := s.db.Query(`SELECT id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err
 		FROM requests ORDER BY started_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -531,7 +606,7 @@ func (s *Store) RecentRequests(limit int) ([]model.RequestMeta, error) {
 	for rows.Next() {
 		var m model.RequestMeta
 		var started, stream, cached int64
-		if err := rows.Scan(&m.ID, &started, &m.DurMillis, &m.Provider, &m.Key, &m.Model, &m.UpstreamModel, &stream, &cached, &m.Status, &m.RouteReason, &m.PromptTokens, &m.CompletionTokens, &m.CostCents, &m.Err); err != nil {
+		if err := rows.Scan(&m.ID, &started, &m.DurMillis, &m.Provider, &m.Key, &m.Model, &m.UpstreamModel, &stream, &cached, &m.Status, &m.RouteReason, &m.PromptTokens, &m.CompletionTokens, &m.CostMicros, &m.Err); err != nil {
 			return nil, err
 		}
 		m.StartedAt = time.UnixMilli(started)
@@ -552,7 +627,7 @@ type Rollup struct {
 	Errors      int64     `json:"errors"`
 	Prompt      int64     `json:"prompt_tokens"`
 	Completion  int64     `json:"completion_tokens"`
-	CostCents   int64     `json:"cost_cents"`
+	CostMicros  int64     `json:"cost_micros"`
 }
 
 // RecentRollups returns the latest rollup rows.
@@ -560,7 +635,7 @@ func (s *Store) RecentRollups(limit int) ([]Rollup, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.db.Query(`SELECT bucket, bucket_start, provider, key, requests, errors, prompt_tokens, completion_tokens, cost_cents
+	rows, err := s.db.Query(`SELECT bucket, bucket_start, provider, key, requests, errors, prompt_tokens, completion_tokens, cost_micros
 		FROM rollups ORDER BY bucket_start DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -570,7 +645,7 @@ func (s *Store) RecentRollups(limit int) ([]Rollup, error) {
 	for rows.Next() {
 		var r Rollup
 		var start int64
-		if err := rows.Scan(&r.Bucket, &start, &r.Provider, &r.Key, &r.Requests, &r.Errors, &r.Prompt, &r.Completion, &r.CostCents); err != nil {
+		if err := rows.Scan(&r.Bucket, &start, &r.Provider, &r.Key, &r.Requests, &r.Errors, &r.Prompt, &r.Completion, &r.CostMicros); err != nil {
 			return nil, err
 		}
 		r.BucketStart = time.UnixMilli(start)

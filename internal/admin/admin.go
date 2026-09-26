@@ -45,7 +45,8 @@ type ProviderView struct {
 	Keys    []KeyView `json:"keys"`
 }
 
-// KeyView is a key's live status (secret never exposed).
+// KeyView is a key's live status (secret never exposed). Costs are rendered in
+// cents for the operator, converted from the internal micro-USD unit.
 type KeyView struct {
 	ID           string `json:"id"`
 	Ref          string `json:"ref"`

@@ -26,7 +26,7 @@ var requestMetaWireKeys = []string{
 	"route_reason",
 	"prompt_tokens",
 	"completion_tokens",
-	"cost_cents",
+	"cost_micros",
 	"err",
 }
 
@@ -54,7 +54,7 @@ func filledRequestMeta() RequestMeta {
 		RouteReason:      "alias",
 		PromptTokens:     1500,
 		CompletionTokens: 250,
-		CostCents:        7,
+		CostMicros:       7,
 	}
 }
 
@@ -104,7 +104,7 @@ func TestRequestMetaMarshalValues(t *testing.T) {
 				"route_reason":      "alias",
 				"prompt_tokens":     float64(1500),
 				"completion_tokens": float64(250),
-				"cost_cents":        float64(7),
+				"cost_micros":       float64(7),
 				"err":               "",
 			},
 		},
@@ -136,7 +136,7 @@ func TestRequestMetaMarshalValues(t *testing.T) {
 				"route_reason":      "failover",
 				"prompt_tokens":     float64(0),
 				"completion_tokens": float64(0),
-				"cost_cents":        float64(0),
+				"cost_micros":       float64(0),
 				"err":               "upstream 503",
 			},
 		},
@@ -183,7 +183,7 @@ func TestRequestMetaZeroValueJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	const want = `{"id":"","started_at":"0001-01-01T00:00:00Z","dur_ms":0,"provider":"","key":"","model":"","upstream_model":"","stream":false,"cached":false,"status":"","route_reason":"","prompt_tokens":0,"completion_tokens":0,"cost_cents":0,"err":""}`
+	const want = `{"id":"","started_at":"0001-01-01T00:00:00Z","dur_ms":0,"provider":"","key":"","model":"","upstream_model":"","stream":false,"cached":false,"status":"","route_reason":"","prompt_tokens":0,"completion_tokens":0,"cost_micros":0,"err":""}`
 	if string(b) != want {
 		t.Errorf("zero RequestMeta JSON mismatch:\n got:  %s\n want: %s", b, want)
 	}

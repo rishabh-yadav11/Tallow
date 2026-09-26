@@ -43,7 +43,7 @@ func TestAsyncRecordRequestRoundTrip(t *testing.T) {
 		RouteReason:      "primary",
 		PromptTokens:     10,
 		CompletionTokens: 20,
-		CostCents:        5,
+		CostMicros:       5,
 		Err:              "",
 	}
 
@@ -63,7 +63,7 @@ func TestAsyncRecordRequestRoundTrip(t *testing.T) {
 	g := got[0]
 	if g.ID != meta.ID || g.Provider != meta.Provider || g.Model != meta.Model ||
 		g.DurMillis != meta.DurMillis || g.PromptTokens != meta.PromptTokens ||
-		g.CompletionTokens != meta.CompletionTokens || g.CostCents != meta.CostCents {
+		g.CompletionTokens != meta.CompletionTokens || g.CostMicros != meta.CostMicros {
 		t.Fatalf("round-trip mismatch: %+v", g)
 	}
 	if !g.Cached || g.Status != "ok" {

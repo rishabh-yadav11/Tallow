@@ -218,11 +218,12 @@ func keyLimits(providers []model.Provider) map[string]budget.KeyLimits {
 	for _, p := range providers {
 		for _, k := range p.Keys {
 			m[p.Name+"/"+k.ID] = budget.KeyLimits{
-				RPM:            k.RPM,
-				MaxRequests:    k.MaxRequests,
-				Window:         k.Window,
-				MaxConcurrent:  k.MaxConcurrent,
-				CostLimitCents: k.CostLimitCents,
+				RPM:             k.RPM,
+				MaxRequests:     k.MaxRequests,
+				Window:          k.Window,
+				MaxConcurrent:   k.MaxConcurrent,
+				CostLimitCents:  k.CostLimitCents,
+				CostLimitMicros: k.CostLimitMicros,
 			}
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/cache"
 	"github.com/rishabh-yadav11/tallow/internal/compact"
 	"github.com/rishabh-yadav11/tallow/internal/model"
+	"github.com/rishabh-yadav11/tallow/internal/money"
 )
 
 // chatCompletions is the core pipeline: auth -> queue -> parse -> compact ->
@@ -98,9 +99,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if ferr == nil {
 			meta.PromptTokens = res.prompt
 			meta.CompletionTokens = res.completion
-			meta.CostCents = costCents(sel.Target, res.prompt, res.completion)
+			meta.CostMicros = costMicros(sel.Target, res.prompt, res.completion)
 			h.deps.Router.RecordSuccess(sel)
-			h.deps.Router.Release(sel, meta.CostCents)
+			h.deps.Router.Release(sel, meta.CostMicros)
 			h.record(meta, res.respBody, body, started)
 			// Populate cache on success (non-stream, non-empty key).
 			if cacheKey != "" && h.deps.Cache != nil {
@@ -241,11 +242,13 @@ func (h *Handler) record(meta model.RequestMeta, respBody, reqBody []byte, start
 	}
 }
 
-// costCents computes cost from manually-declared per-M pricing.
-func costCents(t model.Target, prompt, completion int) int64 {
-	if t.PriceInputPerM == 0 && t.PriceOutputPerM == 0 {
-		return 0
-	}
-	usd := (float64(prompt)*t.PriceInputPerM + float64(completion)*t.PriceOutputPerM) / 1e6
-	return int64(usd * 100)
+// costMicros computes cost in micro-USD from manually-declared per-M pricing.
+//
+// Cost was previously accumulated in integer cents, which truncated toward
+// zero: a request costing $0.002 recorded 0 cents, so cost budgets could never
+// fire and every total and rollup read zero. Micro-USD (1 USD = 1,000,000)
+// keeps sub-cent spend intact; the value is converted to cents only for
+// operator-facing displays.
+func costMicros(t model.Target, prompt, completion int) int64 {
+	return money.CostMicros(t.PriceInputPerM, t.PriceOutputPerM, prompt, completion)
 }

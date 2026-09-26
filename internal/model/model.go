@@ -32,7 +32,13 @@ type Key struct {
 	MaxRequests    int           // hard cap within Window.
 	Window         time.Duration // window for MaxRequests.
 	MaxConcurrent  int           // per-key in-flight cap.
-	CostLimitCents int64         // cumulative cost cap.
+	CostLimitCents int64         // cumulative cost cap, in cents ($0.01 units).
+
+	// CostLimitMicros is CostLimitCents expressed in the internal micro-USD
+	// unit that all cost accumulation actually uses. It is the value the
+	// runtime budget tracker enforces; keeping both here lets config keep its
+	// human-friendly cent unit while the budget compares without truncation.
+	CostLimitMicros int64
 }
 
 // Alias maps a client-facing model name to an ordered list of provider
@@ -76,6 +82,10 @@ type RequestMeta struct {
 	RouteReason      string    `json:"route_reason"`
 	PromptTokens     int       `json:"prompt_tokens"`
 	CompletionTokens int       `json:"completion_tokens"`
-	CostCents        int64     `json:"cost_cents"`
-	Err              string    `json:"err"`
+	// CostMicros is the request cost in micro-USD (1 USD = 1,000,000). Integer
+	// cents were previously used here, which truncated every sub-cent request
+	// to zero; micro-USD preserves the real spend and is the unit every budget
+	// and rollup is compared in.
+	CostMicros int64 `json:"cost_micros"`
+	Err        string `json:"err"`
 }

@@ -7,14 +7,14 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/model"
 )
 
-func meta(provider, status string, prompt, completion int, cached bool, costCents int64) model.RequestMeta {
+func meta(provider, status string, prompt, completion int, cached bool, costMicros int64) model.RequestMeta {
 	return model.RequestMeta{
 		Provider:         provider,
 		Status:           status,
 		Cached:           cached,
 		PromptTokens:     prompt,
 		CompletionTokens: completion,
-		CostCents:        costCents,
+		CostMicros:       costMicros,
 	}
 }
 
@@ -38,8 +38,8 @@ func assertSnapshot(t *testing.T, got, want Snapshot) {
 	if got.CompletionTokens != want.CompletionTokens {
 		t.Errorf("CompletionTokens = %d, want %d", got.CompletionTokens, want.CompletionTokens)
 	}
-	if got.CostCents != want.CostCents {
-		t.Errorf("CostCents = %d, want %d", got.CostCents, want.CostCents)
+	if got.CostMicros != want.CostMicros {
+		t.Errorf("CostMicros = %d, want %d", got.CostMicros, want.CostMicros)
 	}
 	if got.LatencyP50Ms != want.LatencyP50Ms {
 		t.Errorf("LatencyP50Ms = %d, want %d", got.LatencyP50Ms, want.LatencyP50Ms)
@@ -104,12 +104,12 @@ func TestEnabledAggregation(t *testing.T) {
 		Cached:           1,
 		PromptTokens:     307,
 		CompletionTokens: 153,
-		CostCents:        34,
+		CostMicros:       34,
 		LatencyP50Ms:     lat[len(lat)*50/100],
 		LatencyP95Ms:     lat[len(lat)*95/100],
 		ByProvider: map[string]ProviderStat{
-			"alpha": {Requests: 3, Errors: 1, CostCents: 30},
-			"beta":  {Requests: 1, Errors: 0, CostCents: 4},
+			"alpha": {Requests: 3, Errors: 1, CostMicros: 30},
+			"beta":  {Requests: 1, Errors: 0, CostMicros: 4},
 		},
 	}
 	s := c.Snapshot()
@@ -120,11 +120,11 @@ func TestEnabledAggregation(t *testing.T) {
 }
 
 // TestLatencyReservoirBounded records more durations than the reservoir
-// capacity (512) with strictly increasing values. If the reservoir kept
-// every sample, the early tiny latencies would drag the percentiles down
-// (p50 would sit at 300 for 600 records); keeping only the last 512 puts
-// p50 at 344 and p95 at 574. The p50 window below distinguishes the two;
-// the p95 window guards against percentile drift.
+// capacity (512) with strictly increasing values. If the reservoir kept every
+// sample, the early tiny latencies would drag the percentiles down (p95 would
+// sit at 570 for 600 records); keeping only the last 512 puts p95 at 574, so
+// the assertion window below deliberately excludes the unbounded value. The
+// previous window [560,590] contained 570 and therefore could never fail.
 func TestLatencyReservoirBounded(t *testing.T) {
 	c := New(true)
 	const records = 600
@@ -139,11 +139,42 @@ func TestLatencyReservoirBounded(t *testing.T) {
 	if s.LatencyP50Ms < 330 || s.LatencyP50Ms > 360 {
 		t.Errorf("LatencyP50Ms = %d, want in [330,360] (bounded reservoir ~344; unbounded would be 300)", s.LatencyP50Ms)
 	}
-	if s.LatencyP95Ms < 560 || s.LatencyP95Ms > 590 {
-		t.Errorf("LatencyP95Ms = %d, want in [560,590] (bounded reservoir ~574; unbounded would be 570)", s.LatencyP95Ms)
+	// Unbounded p95 = 570; bounded (last 512 of 0..599, i.e. 88..599) = 574.
+	if s.LatencyP95Ms < 571 || s.LatencyP95Ms > 590 {
+		t.Errorf("LatencyP95Ms = %d, want in [571,590] (bounded reservoir ~574; unbounded would be 570)", s.LatencyP95Ms)
 	}
 	if s.LatencyP95Ms > records-1 {
 		t.Errorf("LatencyP95Ms = %d exceeds max recorded %d", s.LatencyP95Ms, records-1)
+	}
+	// The window and sample count must be reported so a reader knows these
+	// percentiles are a sliding window, not lifetime percentiles.
+	if s.LatencySamples != 512 {
+		t.Errorf("LatencySamples = %d, want 512 (bounded reservoir)", s.LatencySamples)
+	}
+	if s.LatencyWindow != "last_512_requests" {
+		t.Errorf("LatencyWindow = %q, want %q", s.LatencyWindow, "last_512_requests")
+	}
+}
+
+// TestLatencySamplesBelowCapacity covers the unfilled-reservoir case: the
+// sample count must reflect real samples rather than the capacity, and the
+// window must still be named when there is no traffic at all, so a zero
+// percentile is never ambiguous.
+func TestLatencySamplesBelowCapacity(t *testing.T) {
+	c := New(true)
+	for i := 0; i < 7; i++ {
+		c.Record(meta("p", "ok", 1, 1, false, 1), int64(i))
+	}
+	if s := c.Snapshot(); s.LatencySamples != 7 {
+		t.Errorf("LatencySamples = %d, want 7", s.LatencySamples)
+	}
+
+	empty := New(true).Snapshot()
+	if empty.LatencySamples != 0 {
+		t.Errorf("empty collector LatencySamples = %d, want 0", empty.LatencySamples)
+	}
+	if empty.LatencyWindow != "last_512_requests" {
+		t.Errorf("empty collector LatencyWindow = %q, want %q", empty.LatencyWindow, "last_512_requests")
 	}
 }
 
@@ -156,10 +187,10 @@ func TestToggleLive(t *testing.T) {
 		Total:            1,
 		PromptTokens:     10,
 		CompletionTokens: 5,
-		CostCents:        2,
+		CostMicros:       2,
 		LatencyP50Ms:     50,
 		LatencyP95Ms:     50,
-		ByProvider:       map[string]ProviderStat{"p": {Requests: 1, CostCents: 2}},
+		ByProvider:       map[string]ProviderStat{"p": {Requests: 1, CostMicros: 2}},
 	}
 	assertSnapshot(t, afterFirst, wantFirst)
 
@@ -183,10 +214,10 @@ func TestToggleLive(t *testing.T) {
 		Errors:           1,
 		PromptTokens:     20,
 		CompletionTokens: 10,
-		CostCents:        4,
+		CostMicros:       4,
 		LatencyP50Ms:     50,
 		LatencyP95Ms:     50,
-		ByProvider:       map[string]ProviderStat{"p": {Requests: 2, Errors: 1, CostCents: 4}},
+		ByProvider:       map[string]ProviderStat{"p": {Requests: 2, Errors: 1, CostMicros: 4}},
 	})
 }
 
@@ -216,12 +247,12 @@ func TestConcurrentRecord(t *testing.T) {
 		Total:            workers * perWorker,
 		PromptTokens:     workers * perWorker,
 		CompletionTokens: workers * perWorker,
-		CostCents:        workers * perWorker,
+		CostMicros:       workers * perWorker,
 		LatencyP50Ms:     10,
 		LatencyP95Ms:     10,
 		ByProvider: map[string]ProviderStat{
-			"provA": {Requests: workers / 2 * perWorker, CostCents: workers / 2 * perWorker},
-			"provB": {Requests: workers / 2 * perWorker, CostCents: workers / 2 * perWorker},
+			"provA": {Requests: workers / 2 * perWorker, CostMicros: workers / 2 * perWorker},
+			"provB": {Requests: workers / 2 * perWorker, CostMicros: workers / 2 * perWorker},
 		},
 	}
 	assertSnapshot(t, c.Snapshot(), want)
@@ -232,7 +263,7 @@ func TestSnapshotReturnsCopy(t *testing.T) {
 	c.Record(meta("p", "ok", 10, 5, false, 2), 50)
 
 	s := c.Snapshot()
-	s.ByProvider["p"] = ProviderStat{Requests: 999, Errors: 999, CostCents: 999}
+	s.ByProvider["p"] = ProviderStat{Requests: 999, Errors: 999, CostMicros: 999}
 	s.ByProvider["ghost"] = ProviderStat{Requests: 1}
 	s.Total = 42
 
@@ -242,10 +273,10 @@ func TestSnapshotReturnsCopy(t *testing.T) {
 		Total:            1,
 		PromptTokens:     10,
 		CompletionTokens: 5,
-		CostCents:        2,
+		CostMicros:       2,
 		LatencyP50Ms:     50,
 		LatencyP95Ms:     50,
-		ByProvider:       map[string]ProviderStat{"p": {Requests: 1, CostCents: 2}},
+		ByProvider:       map[string]ProviderStat{"p": {Requests: 1, CostMicros: 2}},
 	}
 	assertSnapshot(t, after, want)
 	if _, ok := after.ByProvider["ghost"]; ok {

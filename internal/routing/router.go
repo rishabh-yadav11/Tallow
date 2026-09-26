@@ -11,6 +11,7 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/budget"
 	"github.com/rishabh-yadav11/tallow/internal/health"
 	"github.com/rishabh-yadav11/tallow/internal/model"
+	"github.com/rishabh-yadav11/tallow/internal/money"
 	"github.com/rishabh-yadav11/tallow/internal/registry"
 )
 
@@ -383,7 +384,9 @@ func (s *Sticky) Forget(sessionKey string) {
 	s.mu.Unlock()
 }
 
-// BudgetStatus is a live per-key budget view for the admin API/TUI.
+// BudgetStatus is a live per-key budget view for the admin API/TUI. Costs are
+// reported to operators in cents, converted from the internal micro-USD unit
+// that the budget actually accumulates.
 type BudgetStatus struct {
 	Provider     string `json:"provider"`
 	Key          string `json:"key"`
@@ -408,8 +411,10 @@ func (r *Router) Budgets(now time.Time) []BudgetStatus {
 			RPMRemaining: s.RPMRemaining,
 			Inflight:     s.Inflight,
 			MaxInflight:  s.MaxInflight,
-			CostCents:    s.CostCents,
-			CostLimit:    s.CostLimitCents,
+			// Rounding away from zero keeps sub-cent spend visible instead of
+			// displaying as $0.00, which was how the cents truncation hid all cost.
+			CostCents: money.MicroUSDToCents(s.CostMicros),
+			CostLimit: money.MicroUSDToCents(s.CostLimitMicros),
 		})
 	}
 	return out
