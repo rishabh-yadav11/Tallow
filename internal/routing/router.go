@@ -153,6 +153,15 @@ type Selection struct {
 	Target     model.Target
 	Reason     string // routing path + why (for observability).
 
+	// admittedAt is when Select handed this request to the provider, not when
+	// it reported back. It is what makes late accounting safe: a request
+	// admitted before a burst of failures completes successfully afterwards,
+	// and its success is evidence about a request that started before the
+	// breaker opened. Accounting at completion time instead would stamp that
+	// success as the newest evidence available and let it close a breaker that
+	// is open on current failures, undoing failover.
+	admittedAt time.Time
+
 	BaseURL string
 	Secret  string
 	Timeout time.Duration
@@ -448,7 +457,7 @@ func (r *Router) acquire(provider, key, model string, target model.Target, now t
 		kb.Release(0)
 		return nil, fmt.Errorf("provider rpm exhausted")
 	}
-	sel := &Selection{Provider: provider, Key: key, Model: model, Target: target, kb: kb}
+	sel := &Selection{Provider: provider, Key: key, Model: model, Target: target, kb: kb, admittedAt: now}
 	// The provider RPM charge taken above belongs to this selection. Claiming
 	// it here means a later abandon (releaseSelection) hands the slot back,
 	// while a request that actually runs keeps the charge for the rest of the
@@ -518,7 +527,7 @@ func (r *Router) acquireKey(provider string, now time.Time, reasons *[]string, s
 			*reasons = append(*reasons, "key:"+k.ID+":"+reason)
 			continue
 		}
-		sel := &Selection{Provider: provider, Key: k.ID, kb: kb}
+		sel := &Selection{Provider: provider, Key: k.ID, kb: kb, admittedAt: now}
 		fillDest(r.reg, sel)
 		if sel.BaseURL == "" {
 			// Provider removed from the registry between the key scan and now.
@@ -583,20 +592,38 @@ func (r *Router) InFlight(provider, key string) int {
 }
 
 // RecordSuccess closes the relevant breakers and re-affirms sticky.
+//
+// The account is stamped with when Select admitted the request, not with the
+// current time. A request admitted before a burst of failures and completed
+// after it is reporting on a request that started while the breaker was still
+// closed; stamping it now would present stale evidence as the newest evidence
+// available and close a breaker that is open on current failures.
 func (r *Router) RecordSuccess(sel *Selection) {
-	now := r.now()
-	r.health.Provider(sel.Provider).RecordSuccess(now)
-	r.health.Key(sel.Provider, sel.Key).RecordSuccess(now)
+	r.health.Provider(sel.Provider).RecordSuccess(sel.accountedAt(r.now()))
+	r.health.Key(sel.Provider, sel.Key).RecordSuccess(sel.accountedAt(r.now()))
 }
 
-// RecordFailure accounts a failure toward breaker opening.
+// RecordFailure accounts a failure toward breaker opening, stamped with the
+// admission time for the same reason as RecordSuccess.
 func (r *Router) RecordFailure(sel *Selection) {
-	now := r.now()
-	r.health.Provider(sel.Provider).RecordFailure(now)
-	r.health.Key(sel.Provider, sel.Key).RecordFailure(now)
+	at := sel.accountedAt(r.now())
+	r.health.Provider(sel.Provider).RecordFailure(at)
+	r.health.Key(sel.Provider, sel.Key).RecordFailure(at)
 	if sel.SessionKey != "" {
 		r.sticky.Forget(sel.SessionKey)
 	}
+}
+
+// accountedAt returns the timestamp this selection's breaker accounts carry.
+//
+// It is the admission stamp Select recorded. A Selection built directly rather
+// than by Select carries no stamp, and falls back to the current time, so a
+// hand-built selection behaves as it did before and is never treated as stale.
+func (s *Selection) accountedAt(now time.Time) time.Time {
+	if s.admittedAt.IsZero() {
+		return now
+	}
+	return s.admittedAt
 }
 
 // ---------- Sticky ----------
