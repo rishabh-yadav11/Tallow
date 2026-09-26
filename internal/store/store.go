@@ -369,6 +369,22 @@ func (s *Store) enqueue(op writeOp) error {
 	}
 }
 
+// Flush blocks until every write enqueued so far has been written to disk.
+//
+// It enqueues a sentinel behind the pending queue and waits for the worker to
+// reach it, so on return every earlier RecordRequest, RecordRaw, RecordError,
+// and Audit call has been executed against the database. That makes a
+// read-after-write sequence meaningful for a caller that needs to observe its
+// own writes - the admin /logs endpoint, a test, or a graceful-shutdown path
+// that wants the queue drained without tearing the store down.
+//
+// It is not on the hot request path: enqueueing the sentinel and waiting for
+// the worker is a synchronisation point, and per-request callers want the
+// non-blocking enqueue that RecordRequest already does.
+func (s *Store) Flush() {
+	s.flushForTest()
+}
+
 // flushForTest blocks until every op enqueued so far has been written, by
 // enqueueing a sentinel after the pending queue. Test-only helper.
 func (s *Store) flushForTest() {

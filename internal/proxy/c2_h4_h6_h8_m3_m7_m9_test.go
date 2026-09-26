@@ -946,13 +946,30 @@ func TestM7CacheHitReportsNoTokensOrCost(t *testing.T) {
 		t.Fatalf("M7: tokens = %d/%d, want 5/3 (cache hits re-added the original request's tokens)",
 			s.PromptTokens, s.CompletionTokens)
 	}
-	// The cache provider bucket must show the two hits and no cost.
-	cached := s.ByProvider["cache"]
-	if cached.Requests != 2 {
-		t.Fatalf("cache bucket requests = %d, want 2", cached.Requests)
+	// A cache hit did not come from a provider, so it must not appear in the
+	// per-provider view at all. The old code set Provider = "cache", which
+	// invented a provider bucket that no operator configured and that grew
+	// without bound as the cache warmed - the same defect class as M9, which was
+	// fixed for routing failures and left in place for cache hits.
+	if _, ok := s.ByProvider["cache"]; ok {
+		t.Fatalf("M7: by_provider contains a synthetic %q bucket (%+v); a cache hit is not a "+
+			"provider and must not be attributed to one", "cache", s.ByProvider["cache"])
 	}
-	if cached.CostMicros != 0 {
-		t.Fatalf("M7: cache bucket cost = %d, want 0", cached.CostMicros)
+	// The real provider is credited with exactly the one upstream call it served.
+	// Its cost stays 0 here because oneAliasRegistry declares no pricing, so
+	// costMicros legitimately computes to nothing; what this asserts is that the
+	// real provider owns the ONE upstream call and not the two cache hits.
+	real := s.ByProvider["p1"]
+	if real.Requests != 1 {
+		t.Fatalf("the real provider should own the single upstream call, got %+v", real)
+	}
+	// Every provider bucket must correspond to a provider the operator actually
+	// configured. Nothing invents one.
+	for name := range s.ByProvider {
+		if name != "p1" {
+			t.Fatalf("by_provider contains a bucket for %q, which is not a configured provider; "+
+				"a request that no provider served must not be attributed to one (M9/M7)", name)
+		}
 	}
 }
 

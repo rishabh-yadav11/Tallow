@@ -69,8 +69,16 @@ type Entry struct {
 	Model            string
 	PromptTokens     int
 	CompletionTokens int
-	CreatedAt        time.Time
-	expires          time.Time
+	// Provider records WHICH route produced this response.
+	//
+	// It is provenance, not attribution. A cache hit did not call this provider,
+	// so it is not attributed to it in the per-provider metrics; recording where
+	// the cached answer came from is what lets a hit report
+	// "cache_hit_from:p1" instead of inventing a "cache" provider that no
+	// operator configured and that grows without bound as the cache warms.
+	Provider  string
+	CreatedAt time.Time
+	expires   time.Time
 }
 
 // Cache is a bounded LRU with per-entry TTL. In-process only; no external

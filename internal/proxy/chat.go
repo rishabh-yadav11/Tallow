@@ -110,7 +110,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	canon, cacheable := h.cacheKey(r, req, alias, stream)
 	if cacheable {
 		if e, hit := h.deps.Cache.Get(canon); hit {
-			h.serveCached(w, e, &meta, started)
+			// The entry remembers the route that produced it, so a cache hit can
+			// still say which provider served it without being attributed to one
+			// as though it had just been called.
+			h.serveCached(w, e, &meta, started, e.Provider)
 			return
 		}
 		f := h.fetchCached(canon, func() (any, error) {
@@ -283,6 +286,9 @@ func (f fetch) entry() cache.Entry {
 		Model:            f.sel.Model,
 		PromptTokens:     f.prompt,
 		CompletionTokens: f.completion,
+		// The route that produced this response, so a later cache hit can report
+		// where the answer came from without claiming that provider served it now.
+		Provider: f.sel.Provider,
 	}
 }
 
@@ -559,11 +565,29 @@ func (h *Handler) singleModel(alias string) (string, bool) {
 // both. The number of served-from-cache requests is still tracked, so cache
 // effectiveness is not lost, and the token counts remain available on the cache
 // entry itself for anyone who wants the served volume.
-func (h *Handler) serveCached(w http.ResponseWriter, e cache.Entry, meta *model.RequestMeta, started time.Time) {
+//
+// The route attribution is the other half of M7 and the same class of defect as
+// M9. This used to set Provider = "cache", inventing a provider that no
+// operator ever configured. It appeared in by_provider and in the TUI's
+// provider list as a peer of the real providers, and it grew without bound as the
+// cache warmed: a bucket that is neither a provider nor bounded by any provider
+// limit dilutes the provider picture exactly when it stops being a useful
+// signal.
+//
+// A cache hit genuinely did not come from a provider, so attributing it to one
+// would be a lie. Provider is left empty and Cached is set instead, which is the
+// same truthful representation M9 settled on for a routing failure: counted in
+// the global totals, absent from the per-provider view. The route a cached
+// response CAME FROM is still recorded, as RouteReason, so the cache row in the
+// log still shows which route served it.
+func (h *Handler) serveCached(w http.ResponseWriter, e cache.Entry, meta *model.RequestMeta, started time.Time, servedBy string) {
 	meta.Status = "cached"
 	meta.Cached = true
-	meta.Provider = "cache"
+	meta.Provider = ""
 	meta.RouteReason = "cache_hit"
+	if servedBy != "" {
+		meta.RouteReason = "cache_hit_from:" + servedBy
+	}
 	meta.PromptTokens = 0
 	meta.CompletionTokens = 0
 	meta.CostMicros = 0
