@@ -449,19 +449,16 @@ func (c *Config) validateCounts() error {
 }
 
 // Dur parses a duration string, returning 0 for empty.
+//
+// An empty value is a legitimate "unset" in config.toml, and applyDefaults
+// fills it in before this is ever called, so the empty case returning 0 is a
+// deliberate no-op rather than a silent parse failure. Every caller either
+// surfaces the error (Dur) or has already validated the field (validateDurations,
+// which calls Dur), so a malformed duration fails at config load rather than
+// silently becoming 0 and disabling whatever it governed.
 func Dur(s string) (time.Duration, error) {
 	if s == "" {
 		return 0, nil
 	}
 	return time.ParseDuration(s)
-}
-
-// DurOrZero is a lenient variant used where a bad duration should not abort
-// startup silently in non-validated paths (kept for symmetry).
-func DurOrZero(s string) time.Duration {
-	d, err := Dur(s)
-	if err != nil {
-		return 0
-	}
-	return d
 }
