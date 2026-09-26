@@ -268,11 +268,19 @@ func TestSuccessfulOperationsSurviveRestart(t *testing.T) {
 		t.Errorf("on-disk refs are %v, want %v", got, want)
 	}
 
+	// List returns refs in Go map iteration order, which is deliberately
+	// randomised. The CLI sorts before printing (cmd/tallowctl/key.go), and so
+	// does the on-disk helper above, so this is the one assertion that has to
+	// sort for itself. Asserting a fixed order here made the test fail
+	// intermittently, which is worse than not testing it: it turns a real
+	// regression signal into noise a maintainer learns to re-run away from.
 	reopened, err := LoadStore(path, box)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if got := reopened.List(); !equalStrings(got, want) {
+	got := reopened.List()
+	sort.Strings(got)
+	if !equalStrings(got, want) {
 		t.Errorf("List after restart is %v, want %v", got, want)
 	}
 	for ref, want := range map[string]string{"a": "one", "c": "three"} {
