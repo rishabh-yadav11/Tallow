@@ -157,13 +157,34 @@ func (s *Server) Serve(ctx context.Context) error {
 	return s.srv.Serve(ln)
 }
 
+// maxLimitParam caps the ?limit= query parameter. The parameter used to be
+// passed straight through to a SQL LIMIT, so anything able to open the admin
+// socket could ask for 100 million rows in one call and have the gateway build
+// and serialise the whole request log to answer it. The admin API is local-only
+// by design, but "local" is a weaker boundary than it looks: any process running
+// as any user who can reach the socket, including a compromised low-privilege
+// process, could turn a read endpoint into an unbounded allocation in the
+// gateway's own address space. A cap costs an operator nothing, because asking
+// for more than this many rows in one response is not a workflow, it is an
+// export, and exports should not run through a status endpoint.
+//
+// The cap is deliberately generous: far more than any dashboard or TUI view
+// renders, so no legitimate consumer notices it.
+const maxLimitParam = 1000
+
+// limitParam reads ?limit=, falling back to d for anything missing, malformed
+// or out of range, and clamping to maxLimitParam.
 func limitParam(r *http.Request, d int) int {
+	n := d
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			n = p
 		}
 	}
-	return d
+	if n > maxLimitParam {
+		return maxLimitParam
+	}
+	return n
 }
 
 // Close shuts the admin HTTP server down.

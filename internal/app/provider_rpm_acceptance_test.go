@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 
 	"github.com/rishabh-yadav11/tallow/internal/app"
+	"github.com/rishabh-yadav11/tallow/internal/routing"
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
@@ -242,18 +243,66 @@ func TestBudgetViewRemainsCoherentWhenACapIsHit(t *testing.T) {
 			t.Errorf("%s/%s reports a negative inflight cap %d", b.Provider, b.Key, b.MaxInflight)
 		}
 	}
-	// Repeated reads of an idle gateway must agree: a view that decays between
-	// polls would make an operator chase a limit that is not moving.
+	// Repeated reads of an idle gateway must agree on identity and shape: a
+	// view whose rows reordered between polls would make an operator think the
+	// wrong key was throttled, because the values would appear to move between
+	// rows.
+	//
+	// Two things are deliberately NOT asserted here. First, identity is compared
+	// by provider/key rather than by index. Second, RPM is not compared at all:
+	// the rolling window refills continuously, so two reads microseconds apart
+	// legitimately differ, and asserting they match would be asserting the
+	// clock stopped. The first version of this test compared both by index and
+	// including RPM, and failed about 40% of runs under -race purely from
+	// window refill and Go's randomised map order, neither of which is a defect.
+	// A view that reported a changing number is the design; a view that
+	// reordered its rows was the bug, and Budgets now sorts them.
 	first := a.BudgetsView()
 	second := a.BudgetsView()
 	if len(first) != len(second) {
 		t.Fatalf("repeated BudgetsView calls disagree on row count: %d then %d",
 			len(first), len(second))
 	}
-	for i := range first {
-		if first[i].RPMRemaining != second[i].RPMRemaining {
-			t.Errorf("%s/%s RPM changed between two back-to-back reads: %d then %d",
-				first[i].Provider, first[i].Key, first[i].RPMRemaining, second[i].RPMRemaining)
+	byID := func(vs []routing.BudgetStatus) map[string]routing.BudgetStatus {
+		m := make(map[string]routing.BudgetStatus, len(vs))
+		for _, v := range vs {
+			m[v.Provider+"/"+v.Key] = v
+		}
+		return m
+	}
+	f, s := byID(first), byID(second)
+	for id, a1 := range f {
+		b1, ok := s[id]
+		if !ok {
+			t.Errorf("%s present in one BudgetsView call and absent from the next", id)
+			continue
+		}
+		// Identity and the non-moving fields must be identical. RPM is excluded
+		// for the reason above; inflight and the caps are not moving.
+		if a1.Inflight != b1.Inflight {
+			t.Errorf("%s inflight changed between two back-to-back reads on an "+
+				"idle gateway: %d then %d", id, a1.Inflight, b1.Inflight)
+		}
+		if a1.MaxInflight != b1.MaxInflight {
+			t.Errorf("%s inflight cap changed between reads: %d then %d",
+				id, a1.MaxInflight, b1.MaxInflight)
+		}
+		if a1.CostCents != b1.CostCents {
+			t.Errorf("%s spend changed between two back-to-back reads on an "+
+				"idle gateway: %d then %d", id, a1.CostCents, b1.CostCents)
+		}
+	}
+
+	// The ordering itself is part of the contract, so it is asserted directly
+	// rather than inferred. A dashboard renders these rows in order, and a
+	// client that diffs two polls positionally would otherwise see a spurious
+	// change on every request.
+	for i := 1; i < len(first); i++ {
+		prev, cur := first[i-1], first[i]
+		if prev.Provider > cur.Provider ||
+			(prev.Provider == cur.Provider && prev.Key > cur.Key) {
+			t.Errorf("BudgetsView is not sorted by provider then key: %s/%s "+
+				"comes before %s/%s", prev.Provider, prev.Key, cur.Provider, cur.Key)
 		}
 	}
 }

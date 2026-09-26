@@ -5,6 +5,7 @@ package routing
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -873,7 +874,20 @@ type BudgetStatus struct {
 	CostLimit    int64  `json:"cost_limit_cents"`
 }
 
-// Budgets returns live status for every tracked key budget.
+// Budgets reports a snapshot of every configured key's budget state.
+//
+// The rows are sorted by provider then key. Iteration order over r.budgets is
+// Go's map order, which is randomised per process and deliberately varies
+// between runs, so an unsorted result would hand every caller a different
+// ordering of the same data. That matters beyond tidiness: the admin API
+// serialises this straight to JSON, a dashboard renders it as a table, and
+// anything that compares two snapshots positionally would see a spurious
+// difference on every poll. An operator watching a limit move would see the
+// rows swap places and could conclude the wrong key was throttled.
+//
+// Sorting costs a comparison per row against a list that is bounded by the
+// number of configured keys, which is small and fixed for the life of the
+// process.
 func (r *Router) Budgets(now time.Time) []BudgetStatus {
 	r.bmu.RLock()
 	defer r.bmu.RUnlock()
@@ -893,6 +907,12 @@ func (r *Router) Budgets(now time.Time) []BudgetStatus {
 			CostLimit: money.MicroUSDToCents(s.CostLimitMicros),
 		})
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider < out[j].Provider
+		}
+		return out[i].Key < out[j].Key
+	})
 	return out
 }
 

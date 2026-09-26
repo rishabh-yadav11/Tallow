@@ -291,6 +291,23 @@ only this:
 | `GET /config` | active config path + version |
 | `POST /reload` | trigger config hot-reload |
 
+Notes for API consumers:
+
+- **`?limit=N` is clamped to 1000 rows** on `/logs`, `/rollups` and `/audit`. A
+  larger value is capped rather than honoured, so a read endpoint cannot be
+  turned into an unbounded allocation in the gateway's process. A missing or
+  unparseable value falls back to the endpoint's default. Pulling more than
+  1000 rows is an export, not a status read, and should not run through a status
+  endpoint.
+- **`/budgets` rows are sorted by provider then key.** The ordering is part of
+  the contract, not incidental: a client that compares two polls positionally
+  would otherwise see a spurious diff on every request and could conclude the
+  wrong key was throttled. Other views are not ordered and should not be
+  compared positionally.
+- **`POST /reload` is POST-only.** It re-resolves every provider credential from
+  the keystore, so a `GET` that triggered it would let anything able to open the
+  socket force a credential re-read on demand. Non-POST methods get `405`.
+
 ---
 
 ## Resource discipline (cross-cutting)
