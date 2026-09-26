@@ -12,10 +12,12 @@ import (
 //
 // This exists as a direct unit test because the rounding is only observable when
 // the wait falls on a fractional second, and the end-to-end test that exercises
-// it has to sleep to produce that. Asserting an upper bound there cannot tell
-// rounding up from rounding down: a fast run lands at 59.99s, which is 59 either
-// way. So the arithmetic is checked here, exactly, and the end-to-end test only
-// has to confirm that the header is wired to a live window at all.
+// it has to sleep to produce that. Asserting a bound there cannot pin the
+// arithmetic: the ageing sleep is imprecise enough that a 2.5s ageing left a
+// nominal 57.5s wait at 57.49s, whose truncated value is 57, the same as the
+// correctly rounded one, so a rounding-down mutant passed that test. The
+// arithmetic is therefore checked here, exactly, and the end-to-end test is left
+// to confirm only that the header is wired to a live window at all.
 //
 // The direction of the rounding is the whole point. Rounding DOWN reports a wait
 // that ends before the RPM window does, so a well-behaved client returns and is
@@ -35,7 +37,11 @@ func TestWriteRetryAfterRoundsUp(t *testing.T) {
 		// The fractional cases. Each is the case that fails under floor.
 		{"one millisecond over a second", time.Second + time.Millisecond, "2"},
 		{"half a second over a minute", 60*time.Second + 500*time.Millisecond, "61"},
-		{"57.5s is the aged-window case", 57500 * time.Millisecond, "58"},
+		// The aged-window case, whose counterpart end-to-end test sleeps 3.5s
+		// and so lands here. Kept explicit because it is the only case where
+		// rounding up and rounding down differ by a whole second, which is
+		// exactly why that test needs an ageing sleep at all.
+		{"56.5s, the aged provider RPM window", 56500 * time.Millisecond, "57"},
 		{"999ms is one second, not zero", 999 * time.Millisecond, "1"},
 
 		// Unknown waits are omitted rather than guessed. A wrong Retry-After is

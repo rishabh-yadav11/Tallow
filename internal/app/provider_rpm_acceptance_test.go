@@ -479,19 +479,22 @@ func TestRetryAfterShrinksAsTheWindowAges(t *testing.T) {
 	// push the value DOWN, so an over-long sleep is caught rather than hidden.
 	//
 	// The exact match above 57 is NOT a claim that this test pins the rounding in
-	// both directions. A mutant that over-reports by a full second emits 58 here
-	// and still passes, and that is a known and accepted limit of this test:
-	// the ageing sleep would have to overshoot by over 0.5s to expose it, and
-	// widening the bound to allow that would reintroduce exactly the slack that
-	// hid the truncation bug. Over-reporting is pinned deterministically instead
-	// by TestWriteRetryAfterRoundsUp in the proxy package, which drives the
+	// both directions. Measured directly: a correct implementation emits 57, a
+	// truncating one emits 56, and an over-reporting one ALSO emits 57 here and
+	// passes. At a wait of 56.4s the two expressions are int64(57.4s) and
+	// int64(56.99s), which are both 57, so they coincide. They part company only
+	// at an exact whole number of seconds, and 56.5s is not one. That is a
+	// known and accepted limit of this test.
+	//
+	// Over-reporting is pinned deterministically instead by
+	// TestWriteRetryAfterRoundsUp in the proxy package, which drives the
 	// conversion directly with no clock in the way. What only this test can show
 	// is that the header is wired to the LIVE window rather than a constant.
 	if secs != 57 {
 		t.Errorf("Retry-After is %d seconds after ageing a 60s window by 3.5s, "+
 			"want exactly 57: the wait is at least 56.49s, so 56 means the value "+
-			"was truncated and the client returns before the window rolls, and 58 "+
-			"means the gateway is over-reporting its own window",
+			"was truncated and the client returns before the window rolls, and any "+
+			"other value means the gateway is misreporting its own window",
 			secs)
 	}
 }
