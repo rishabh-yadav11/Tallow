@@ -136,6 +136,13 @@ func (s *Store) Get(ref string) (string, error) {
 }
 
 // Set encrypts and stores plaintext under ref, persisting atomically.
+//
+// The in-memory map is only updated once the write has actually succeeded.
+// Mutating it first and saving second meant a failed save left the keystore
+// disagreeing with the operator: Set would return an error, so `tallowctl key
+// add` would report failure, yet the secret was live in memory and was written
+// out in full by the next unrelated key operation. An operator who saw the
+// error and moved on was wrong about what was stored.
 func (s *Store) Set(ref, plaintext string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,19 +150,39 @@ func (s *Store) Set(ref, plaintext string) error {
 	if err != nil {
 		return err
 	}
+	prev, hadPrev := s.entries[ref]
 	s.entries[ref] = c
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		// Roll the map back so it keeps describing what is actually on disk.
+		if hadPrev {
+			s.entries[ref] = prev
+		} else {
+			delete(s.entries, ref)
+		}
+		return err
+	}
+	return nil
 }
 
 // Delete removes ref from the keystore.
+//
+// As with Set, the entry is removed from memory only after the write succeeds.
+// Deleting first meant a failed save returned an error while having already
+// stopped the gateway from using that credential, so the caller could not tell
+// whether the key was live or gone.
 func (s *Store) Delete(ref string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.entries[ref]; !ok {
+	prev, ok := s.entries[ref]
+	if !ok {
 		return fmt.Errorf("secret: no keystore entry for %q", ref)
 	}
 	delete(s.entries, ref)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.entries[ref] = prev
+		return err
+	}
+	return nil
 }
 
 // List returns the set of stored refs.
