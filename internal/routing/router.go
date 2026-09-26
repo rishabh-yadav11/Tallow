@@ -143,6 +143,42 @@ var errStaleSelection = errors.New("selection target no longer in registry")
 // a distinct error from staleness so the routing trail says which it was.
 var errNoBudget = errors.New("no budget installed for key")
 
+// ErrNoRoute is returned when no candidate could serve the alias, and classifies
+// that failure. The class matters because a routing failure is not always an
+// upstream failure.
+//
+// A limit is not an outage. When the only reason there is no route is that a
+// budget or RPM window is spent, the upstream is perfectly healthy, so reporting
+// it as a gateway/upstream error is a lie that costs the caller twice: a client
+// reading 502 backs off as though the provider were broken, which does nothing
+// because nothing is broken, and an operator reading upstream_error goes looking
+// at provider health instead of at the limit they configured. It is also a
+// small amplification risk, since retrying a request that is rate limited is
+// exactly the wrong response to a rate limit.
+//
+// ErrNoRoute is returned when the routing failure was caused solely by exhausted
+// limits, so the caller can answer 429 and tell the client to come back later.
+var ErrNoRoute = errors.New("no route available")
+
+// RouteError wraps ErrNoRoute with the alias and the per-candidate reason trail.
+// It is a distinct type precisely so the caller can classify the failure
+// without matching on the message text, which the reason trail makes unstable.
+type RouteError struct {
+	Alias   string
+	Reasons []string
+	// Limited is true when EVERY rejection was a budget or rate limit, i.e.
+	// nothing was actually wrong with any provider. Any breaker-open, no-key or
+	// removed candidate makes this false, because then at least one provider was
+	// genuinely unusable and an upstream error is the honest answer.
+	Limited bool
+}
+
+func (e *RouteError) Error() string {
+	return fmt.Sprintf("no route for %q (reasons: %s)", e.Alias, strings.Join(e.Reasons, "; "))
+}
+
+func (e *RouteError) Unwrap() error { return ErrNoRoute }
+
 // Selection is a routed, budget-reserved destination.
 type Selection struct {
 	Alias      string
@@ -401,7 +437,55 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 		return sel, nil
 	}
 
-	return nil, fmt.Errorf("no route for %q (reasons: %s)", alias, strings.Join(reasons, "; "))
+	return nil, newRouteError(alias, reasons)
+}
+
+// limitReasons is the closed set of routing reasons that mean "a limit was
+// reached", as opposed to "something is wrong". It is derived from the reason
+// strings the selection loop and KeyBudget.Acquire actually emit, which is why
+// it is written out rather than guessed: a suffix invented from intuition will
+// not match, and a mismatch silently classifies a rate limit as an upstream
+// fault, which is the exact bug this type exists to prevent.
+//
+// The two levels use different vocabularies for the same condition. The provider
+// loop writes "provider:p1:provider_rpm" while the key loop writes
+// "key:k1:key_rpm", because one is an aggregate and the other a per-credential
+// window. Both are limits, so both are listed.
+var limitReasons = map[string]bool{
+	// Provider level.
+	"provider_rpm":      true,
+	"provider_rpm_race": true,
+	// Key level, from KeyBudget.Acquire.
+	"key_rpm":            true,
+	"key_quota":          true,
+	"key_max_concurrent": true,
+	"key_cost_limit":     true,
+	// Sticky: the pinned provider/key is out of budget, which is a limit, not a
+	// fault. The sticky entry is then forgotten and the normal candidate scan
+	// runs, so this can appear alone in the trail.
+	"exhausted": true,
+}
+
+// newRouteError classifies a routing failure from the reason trail.
+//
+// The classification is deliberately conservative. Every reason must be a
+// limit for the failure to count as limited, and anything unrecognised counts
+// against it: an unknown reason is not evidence that the providers are healthy,
+// and answering 429 when the real cause is a dead provider would send the caller
+// off to wait when the thing it needed was to fail over.
+func newRouteError(alias string, reasons []string) *RouteError {
+	limited := len(reasons) > 0
+	for _, r := range reasons {
+		// Reasons are "<scope>:<id>:<cause>"; the cause is the last segment.
+		cause := r
+		if i := strings.LastIndex(r, ":"); i >= 0 {
+			cause = r[i+1:]
+		}
+		if !limitReasons[cause] {
+			limited = false
+		}
+	}
+	return &RouteError{Alias: alias, Reasons: reasons, Limited: limited}
 }
 
 // finalReason renders the routing trail: skipped candidates, then the choice.

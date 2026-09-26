@@ -299,6 +299,13 @@ only this:
   first-token buffer).
 - In-process caching only — no Redis/vector DB.
 - Global + per-key in-flight caps, with a **bounded queue** (wait, then 429).
+- A request that cannot be routed *only* because a configured limit is spent
+  (provider RPM, key RPM/quota/cost, in-flight cap) is answered `429` with
+  `rate_limit_error`, not `502 upstream_error`. The upstream is healthy in that
+  case, so reporting it as an upstream failure sends callers and operators to
+  look at provider health instead of at the limit that was actually reached. If
+  any candidate was rejected for any other reason, the failure is a real routing
+  failure and stays a `502`.
 - Per-host connection pooling / HTTP keep-alive (one shared `http.Transport`).
 - Request bodies are capped (8 MiB by default, `server.max_request_bytes`), and the
   server sets explicit read, read-header, idle, and header-size bounds so a slow

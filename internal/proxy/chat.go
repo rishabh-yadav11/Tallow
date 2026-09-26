@@ -209,6 +209,24 @@ func (h *Handler) serveUncached(
 			meta.Status = "error"
 			meta.Err = err.Error()
 			h.record(*meta, nil, body, started)
+			// A limit is not an upstream failure. When every candidate was
+			// rejected purely for an exhausted budget or RPM window, no provider
+			// is unhealthy and the request never reached one, so 502
+			// upstream_error is the wrong answer twice over: it sends a client
+			// looking at provider health when the cause is a limit the operator
+			// set, and it invites a retry, which is the wrong response to a rate
+			// limit. 429 plus Retry-After is the status that tells the caller
+			// when to come back.
+			if errors.Is(err, routing.ErrNoRoute) {
+				var re *routing.RouteError
+				if errors.As(err, &re) && re.Limited {
+					// The reason trail names the limit that was hit. It is
+					// derived from the operator's own configuration, so it
+					// discloses nothing the caller does not already control.
+					writeErr(w, http.StatusTooManyRequests, "rate_limit_error", meta.Err)
+					return
+				}
+			}
 			writeErr(w, http.StatusBadGateway, "upstream_error", meta.Err)
 			return
 		}
@@ -415,7 +433,22 @@ func (h *Handler) routeAndBuffer(
 			// No provider was ever selected, so there is nothing to attribute
 			// the failure to. M9: this is reported without a provider rather
 			// than under a synthetic one.
-			return fetch{err: &forwardError{msg: err.Error()}}, nil
+			//
+			// The classification is carried through rather than flattened to a
+			// string. A limit-only routing failure is a 429, not a 502, and
+			// collapsing it to err.Error() here would lose the only thing that
+			// distinguishes "wait" from "the upstream is broken". This path is
+			// the one used whenever the response is cacheable, which is the
+			// common case, so dropping the type would have made the correct
+			// status appear only on the streaming path.
+			fe := &forwardError{msg: err.Error()}
+			if errors.Is(err, routing.ErrNoRoute) {
+				var re *routing.RouteError
+				if errors.As(err, &re) && re.Limited {
+					fe.status = http.StatusTooManyRequests
+				}
+			}
+			return fetch{err: fe}, nil
 		}
 		res, ferr := h.fetchBuffered(r, sel, upstreamBody(base, sel.Model))
 		if ferr == nil {
@@ -494,7 +527,15 @@ func (h *Handler) failRequest(
 	if st == 0 {
 		st = http.StatusBadGateway
 	}
-	writeErr(w, st, "upstream_error", f.err.Error())
+	// The error TYPE must agree with the status, or a client branching on the
+	// body is told the wrong story. A 429 labelled upstream_error says the
+	// provider failed when the provider is fine and a limit the operator set was
+	// reached, which is the same misdiagnosis as the wrong status, just moved.
+	kind := "upstream_error"
+	if st == http.StatusTooManyRequests {
+		kind = "rate_limit_error"
+	}
+	writeErr(w, st, kind, f.err.Error())
 }
 
 // cacheKey returns the tenant-qualified cache key for this request, and whether
