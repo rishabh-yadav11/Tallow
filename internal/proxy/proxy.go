@@ -197,18 +197,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // It is a no-op when the wait is unknown, which is the correct answer: the header
 // is advisory, and emitting a guess would be worse than omitting it.
 //
-// The value is whole seconds, rounded UP and floored at 1. Rounding down would
-// invite the client back before the window actually rolls, and 0 is not a valid
-// Retry-After and reads as "retry immediately", which is exactly wrong for a
-// rate limit.
+// The value is whole seconds, rounded UP. Rounding down would invite the client
+// back before the window actually rolls, and a client that obeys the header
+// would be rate limited again immediately, turning a limit into self-inflicted
+// retry load.
+//
+// The d <= 0 guard above already guarantees the result is at least 1, so there
+// is deliberately no separate floor here. An earlier version had both; a
+// mutation test deleting the floor survived, which is the signature of a
+// redundant guard rather than a missing test.
 func writeRetryAfter(w http.ResponseWriter, d time.Duration) {
 	if d <= 0 {
 		return
 	}
 	secs := int64((d + time.Second - 1) / time.Second)
-	if secs < 1 {
-		secs = 1
-	}
 	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
 }
 

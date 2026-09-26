@@ -200,9 +200,11 @@ func setupCredentialUpstream(t *testing.T) (*httptest.Server, *credentialUpstrea
 	return up.srv, up
 }
 
-// distinct returns the credentials that are not the empty string and appear
-// exactly once, which is what "two different credentials were used" means once
-// the header formatting has been stripped off.
+// distinct collapses recorded Authorization headers into a count per credential,
+// with the "Bearer " prefix and surrounding whitespace stripped and empty values
+// dropped. A test asks len() of the result to learn how many different
+// credentials actually reached the upstream, which is how "the traffic really
+// was split across the provider's keys" is checked rather than assumed.
 func distinct(creds []string) map[string]int {
 	m := make(map[string]int, len(creds))
 	for _, c := range creds {
@@ -249,10 +251,14 @@ func TestProviderRPMCapIsSharedAcrossKeys(t *testing.T) {
 			}
 			// The limit must be identified as the provider RPM cap, not merely
 			// as "some rate limit". A saturated admission queue answers 429 with
-			// the same type, so without this the test could be asserting against
-			// a limit it never configured.
-			if !strings.Contains(got, "provider rpm") && !strings.Contains(got, "rpm") {
-				t.Errorf("429 body does not name the provider RPM cap: %s", got)
+			// the same type but the message "over capacity", which contains
+			// neither "rpm" nor "provider", so this check tells the two limits
+			// apart rather than passing on either.
+			if !strings.Contains(got, "rpm") {
+				t.Errorf("429 body does not name the provider RPM cap: %s. A "+
+					"saturated admission queue produces a 429 with a different "+
+					"message, so this should never be the limiter under test",
+					got)
 			}
 			// Retry-After must be present and usable. A 429 without it leaves the
 			// caller to invent a backoff, and a guess that is too short walks
@@ -414,7 +420,8 @@ func TestProviderRPMCapChargesEachRequestOnce(t *testing.T) {
 // Sleeping puts the wait on a fractional second, where rounding up and rounding
 // down differ by a full second. The real HTTP path is kept for everything else;
 // only the ageing needs wall-clock time, because an injected clock is the one
-// thing that would make this test lie about the real gateway.
+// thing that would make this test lie about the real gateway. The arithmetic
+// itself is pinned without a clock by TestWriteRetryAfterRoundsUp.
 func TestRetryAfterShrinksAsTheWindowAges(t *testing.T) {
 	upSrv, _ := setup(t)
 	const cap = 1
@@ -431,9 +438,26 @@ func TestRetryAfterShrinksAsTheWindowAges(t *testing.T) {
 		t.Fatalf("first request: status %d, want 200", resp.StatusCode)
 	}
 
-	// The window is 60s. Age it by 2.5s so the correct answer is 57 or 58 and
-	// the truncating answer is 56.
-	time.Sleep(2500 * time.Millisecond)
+	// The window is 60s. Age it by 3.5s: the seeded request completes in a few
+	// milliseconds, so the wait at the next request is between 56.4s and 56.5s.
+	// A correctly rounded implementation emits 57. A truncating one emits 56.
+	//
+	// 2.5s would NOT have worked, and this test used to use it while claiming
+	// otherwise. The seeded request does not complete instantly: it goes out to
+	// the upstream, so the window is established before it returns, and the
+	// window start is therefore ALREADY a few milliseconds in the past by the
+	// time the sleep begins. That is enough to push a nominal 57.5s to 57.49s,
+	// whose truncated value is 57, not 56. Both a correct implementation and a
+	// truncating one then produce 57 and the assertion cannot tell them apart.
+	// A mutation test confirmed the truncating mutant passed this assertion.
+	//
+	// 3.5s clears the problem with real margin instead of relying on the request
+	// being fast. The wait is at least 56.49s (at most 56.5s), so the rounded
+	// value is 57 with 0.49s of slack on the rounding boundary and the
+	// truncated value is 56 with a full second of margin. Sleeping LONGER only
+	// moves the value DOWN: 4.5s gives 55.5s, which truncates to 55 and would
+	// also pass a 55-or-57 range, so the bound has to track the sleep length.
+	time.Sleep(3500 * time.Millisecond)
 
 	resp := send("after-ageing")
 	if resp.StatusCode != http.StatusTooManyRequests {
@@ -447,14 +471,27 @@ func TestRetryAfterShrinksAsTheWindowAges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Retry-After %q is not an integer: %v", ra, err)
 	}
-	// The window is 60s and the sleep above is 2.5s, so the wait is 57.5s and
-	// the only correct answer is 58: rounding up. 57 is the truncating answer
-	// and is the bug, so the bound is deliberately exact rather than a range.
-	// Measured values across runs: 58 correct, 57 truncating.
-	if secs != 58 {
-		t.Errorf("Retry-After is %d seconds after ageing a 60s window by 2.5s, "+
-			"want exactly 58: the wait is ~57.5s, so anything lower is a "+
-			"truncation that sends the client back before the window rolls",
+	// The window is 60s and the sleep above is at least 3.5s, so the wait is at
+	// least 56.49s. A correct implementation rounds that UP to 57; a truncating
+	// one produces 56. The lower bound is the load bearing part of this
+	// assertion: it rejects truncation, which is the bug this test exists to
+	// catch, and machine speed cannot break it, because sleeping longer can only
+	// push the value DOWN, so an over-long sleep is caught rather than hidden.
+	//
+	// The exact match above 57 is NOT a claim that this test pins the rounding in
+	// both directions. A mutant that over-reports by a full second emits 58 here
+	// and still passes, and that is a known and accepted limit of this test:
+	// the ageing sleep would have to overshoot by over 0.5s to expose it, and
+	// widening the bound to allow that would reintroduce exactly the slack that
+	// hid the truncation bug. Over-reporting is pinned deterministically instead
+	// by TestWriteRetryAfterRoundsUp in the proxy package, which drives the
+	// conversion directly with no clock in the way. What only this test can show
+	// is that the header is wired to the LIVE window rather than a constant.
+	if secs != 57 {
+		t.Errorf("Retry-After is %d seconds after ageing a 60s window by 3.5s, "+
+			"want exactly 57: the wait is at least 56.49s, so 56 means the value "+
+			"was truncated and the client returns before the window rolls, and 58 "+
+			"means the gateway is over-reporting its own window",
 			secs)
 	}
 }
