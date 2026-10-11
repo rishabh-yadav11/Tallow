@@ -212,3 +212,32 @@ func TestInflightUnderflowFromUnmatchedReleases(t *testing.T) {
 		t.Error("the concurrency cap was bypassed after unmatched releases")
 	}
 }
+
+// Audit item 12: the exact `now == resetAt` boundary. A window resets only
+// STRICTLY after resetAt (the code tests `now.After(w.resetAt)`), so at exactly
+// that instant the old window is still authoritative: a full window still
+// refuses, and one instant later it rolls and admits again.
+func TestFixedWindowExactResetBoundary(t *testing.T) {
+	w := &FixedWindow{Limit: 1, Window: 10 * time.Second}
+	base := time.Unix(1000, 0)
+	if !w.Allow(base) {
+		t.Fatal("first admission should succeed")
+	}
+	reset := w.ResetsAt(base)
+	if reset != base.Add(10*time.Second) {
+		t.Fatalf("ResetsAt = %v, want base+window (%v)", reset, base.Add(10*time.Second))
+	}
+	if w.Allow(reset) {
+		t.Fatal("at exactly now==resetAt a full window must still refuse: the reset " +
+			"happens strictly after resetAt, so the exact boundary is the old window")
+	}
+	if w.Peek(reset) {
+		t.Fatal("peek at exactly resetAt must still see the old full window")
+	}
+	if got := w.Remaining(reset); got != 0 {
+		t.Fatalf("Remaining at exactly resetAt = %d, want 0 (the old window)", got)
+	}
+	if !w.Allow(reset.Add(1)) {
+		t.Fatal("an instant after resetAt the window must have rolled and admit again")
+	}
+}

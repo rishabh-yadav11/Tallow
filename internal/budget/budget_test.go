@@ -76,3 +76,17 @@ func TestMaxConcurrentEnforced(t *testing.T) {
 		t.Fatal("acquire after release should succeed")
 	}
 }
+
+// Audit item 8: a MaxRequests cap with Window==0/null is ignored. Acquire
+// guards the quota with `if b.req.Window > 0 && b.req.Limit > 0`, so a cap with
+// no window cannot bind; only RPM, concurrency and cost limits do.
+func TestQuotaIgnoredWhenWindowIsZero(t *testing.T) {
+	b := NewKeyBudget(KeyLimits{MaxRequests: 2, Window: 0, RPM: 1000})
+	now := time.Now()
+	for i := range 20 {
+		if ok, reason := b.Acquire(now); !ok {
+			t.Fatalf("acquire %d failed with %q: a MaxRequests cap with Window==0 "+
+				"is ignored, so only RPM/cost/concurrency bind", i, reason)
+		}
+	}
+}
