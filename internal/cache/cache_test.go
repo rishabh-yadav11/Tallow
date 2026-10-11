@@ -142,3 +142,46 @@ func TestRefreshKeepsEntryLive(t *testing.T) {
 		t.Fatalf("expected refreshed body v2, got %q", e.Body)
 	}
 }
+
+// Audit item 7: a zero-entry cache self-evicts immediately, so a Set is never
+// observable through Get and every Get is a miss. This pins that a zero limit means
+// "cache nothing", and that a non-positive TTL makes every Set produce an
+// already-expired entry, so Get always misses without ever registering a hit.
+func TestZeroEntriesSelfEvictsImmediately(t *testing.T) {
+	c := New(0, time.Minute, 0)
+	c.Set(Entry{Key: "a", Body: []byte("1")})
+	if c.order.Len() != 0 {
+		t.Fatalf("a zero-entry cache retained %d entries: maxEntries=0 must mean "+
+			"nothing can be cached", c.order.Len())
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("a zero-entry cache served an entry it must have evicted")
+	}
+	hit, miss, _, size := c.Stats()
+	if hit != 0 || size != 0 {
+		t.Fatalf("zero-entry cache: hit=%d miss=%d size=%d, want a cache that can "+
+			"never hold or serve anything", hit, miss, size)
+	}
+}
+
+func TestNonPositiveTTLMakesEverySetExpired(t *testing.T) {
+	// TTL<=0 makes every Set produce an already-expired entry, so Get always
+	// misses. The entry is dead on arrival and never registers a hit.
+	c := New(64, -1*time.Second, 0)
+	c.Set(Entry{Key: "a", Body: []byte("1")})
+	// The first Get lazily evicts the already-expired entry (dead on arrival,
+	// not counted as a hit or a miss); the second Get is a genuine miss. Both
+	// must be served nothing.
+	c.Get("a")
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("a non-positive TTL must make Set produce an already-expired entry")
+	}
+	hit, miss, _, _ := c.Stats()
+	if hit != 0 {
+		t.Fatalf("non-positive TTL: hit=%d, want an entry that can never hit", hit)
+	}
+	if miss == 0 {
+		t.Fatalf("non-positive TTL: miss=%d after the second Get, want the "+
+			"dead-on-arrival entry to register as a miss", miss)
+	}
+}
