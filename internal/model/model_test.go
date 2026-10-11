@@ -295,3 +295,52 @@ func TestTargetPricingZeroIsUnknown(t *testing.T) {
 		}
 	})
 }
+
+// TestRequestMetaCoalescedMarshal pins the Coalesced flag through the wire:
+// it marshals as true (never omitted since there is no omitempty) and survives
+// a round trip.
+func TestRequestMetaCoalescedMarshal(t *testing.T) {
+	in := filledRequestMeta()
+	in.Coalesced = true
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal into map: %v", err)
+	}
+	if c, ok := got["coalesced"].(bool); !ok || !c {
+		t.Fatalf("coalesced field not true: %v (payload %s)", got["coalesced"], b)
+	}
+	var out RequestMeta
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !out.Coalesced {
+		t.Fatal("round trip lost Coalesced=true")
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("round trip mismatch:\n in:  %#v\n out: %#v", in, out)
+	}
+}
+
+// TestTargetPricingBoundaries pins that the full pricing range survives a JSON
+// round trip exactly: the documented sub-cent floor (0.0005), an absurdly large
+// bound (1,000,000), and fragile negative pricing all come back bit-for-bit.
+func TestTargetPricingBoundaries(t *testing.T) {
+	for _, price := range []float64{0.0005, 1000000, -1, -0.00025} {
+		in := Target{Provider: "p", PriceInputPerM: price, PriceOutputPerM: price}
+		b, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("marshal price %v: %v", price, err)
+		}
+		var out Target
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatalf("unmarshal price %v: %v", price, err)
+		}
+		if out.PriceInputPerM != price || out.PriceOutputPerM != price {
+			t.Errorf("price %v round trip mismatch: got (%v, %v)", price, out.PriceInputPerM, out.PriceOutputPerM)
+		}
+	}
+}
