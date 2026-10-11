@@ -39,6 +39,11 @@ type Registry struct {
 
 // New builds a registry from resolved providers (key secrets already filled)
 // and aliases.
+//
+// Duplicate provider names are last-wins (the map assignment in Swap keeps the
+// final entry). config.Validate rejects duplicate providers on the Load path, so
+// this only affects a caller building providers by hand (a test); the registry
+// itself does not police it.
 func New(providers []model.Provider, aliases []model.Alias) *Registry {
 	r := &Registry{
 		providers: make(map[string]*model.Provider, len(providers)),
