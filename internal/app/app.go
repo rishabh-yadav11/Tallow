@@ -111,9 +111,9 @@ func (a *App) load(path string) error {
 	st, err := store.Open(store.StoreConfig{
 		Path:          cfg.Store.Path,
 		RawBodies:     *cfg.Store.RawBodies,
-		RawBodiesDays: cfg.Retention.RawBodiesDays,
-		MetadataDays:  cfg.Retention.MetadataDays,
-		ErrorsDays:    cfg.Retention.ErrorsDays,
+		RawBodiesDays: *cfg.Retention.RawBodiesDays,
+		MetadataDays:  *cfg.Retention.MetadataDays,
+		ErrorsDays:    *cfg.Retention.ErrorsDays,
 		RollupEvery:   params.RollupEvery,
 		VacuumEvery:   params.VacuumEvery,
 	})

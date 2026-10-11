@@ -84,9 +84,13 @@ type CacheCfg struct {
 }
 
 type Retention struct {
-	RawBodiesDays int    `toml:"raw_bodies_days"`
-	MetadataDays  int    `toml:"metadata_days"`
-	ErrorsDays    int    `toml:"errors_days"`
+	// Day counts are pointers so an explicitly-written 0 ("keep forever") can be
+	// told apart from an omitted key (which defaults). 0 must be preserved: the
+	// store treats 0 as keep-forever and the example config documents it, so an
+	// unconditional default would silently destroy data.
+	RawBodiesDays *int   `toml:"raw_bodies_days"`
+	MetadataDays  *int   `toml:"metadata_days"`
+	ErrorsDays    *int   `toml:"errors_days"`
 	RollupCron    string `toml:"rollup_interval"` // how often to roll up + delete.
 	VacuumCron    string `toml:"vacuum_interval"` // how often to VACUUM.
 }
@@ -200,14 +204,19 @@ func (c *Config) applyDefaults() error {
 	if c.Server.StickyTTL == "" {
 		c.Server.StickyTTL = "15m"
 	}
-	if c.Retention.RawBodiesDays == 0 {
-		c.Retention.RawBodiesDays = 5
+	// Day counts keep their explicitly-set 0 ("keep forever") and only fall
+	// back to a default when the key was omitted entirely (nil pointer).
+	if c.Retention.RawBodiesDays == nil {
+		v := 5
+		c.Retention.RawBodiesDays = &v
 	}
-	if c.Retention.MetadataDays == 0 {
-		c.Retention.MetadataDays = 30
+	if c.Retention.MetadataDays == nil {
+		v := 30
+		c.Retention.MetadataDays = &v
 	}
-	if c.Retention.ErrorsDays == 0 {
-		c.Retention.ErrorsDays = 90
+	if c.Retention.ErrorsDays == nil {
+		v := 90
+		c.Retention.ErrorsDays = &v
 	}
 	if c.Retention.RollupCron == "" {
 		c.Retention.RollupCron = "1h"
@@ -433,19 +442,29 @@ func (c *Config) validateCounts() error {
 	if c.Cache.MaxBytes < 0 {
 		return fmt.Errorf("cache.max_bytes: must not be negative, got %d", c.Cache.MaxBytes)
 	}
-	if c.Retention.RawBodiesDays < 0 {
-		return fmt.Errorf("retention.raw_bodies_days: must not be negative, got %d", c.Retention.RawBodiesDays)
+	if dayCount(c.Retention.RawBodiesDays) < 0 {
+		return fmt.Errorf("retention.raw_bodies_days: must not be negative, got %d", dayCount(c.Retention.RawBodiesDays))
 	}
-	if c.Retention.MetadataDays < 0 {
-		return fmt.Errorf("retention.metadata_days: must not be negative, got %d", c.Retention.MetadataDays)
+	if dayCount(c.Retention.MetadataDays) < 0 {
+		return fmt.Errorf("retention.metadata_days: must not be negative, got %d", dayCount(c.Retention.MetadataDays))
 	}
-	if c.Retention.ErrorsDays < 0 {
-		return fmt.Errorf("retention.errors_days: must not be negative, got %d", c.Retention.ErrorsDays)
+	if dayCount(c.Retention.ErrorsDays) < 0 {
+		return fmt.Errorf("retention.errors_days: must not be negative, got %d", dayCount(c.Retention.ErrorsDays))
 	}
 	if c.Compaction.MaxToolOutputChars < 0 {
 		return fmt.Errorf("compaction.max_tool_output_chars: must not be negative, got %d", c.Compaction.MaxToolOutputChars)
 	}
 	return nil
+}
+
+// dayCount returns the value of a retention pointer, treating a nil (key that
+// was omitted and never defaulted, e.g. a hand-built Config) as 0 so it is not
+// flagged negative through the applyDefaults path.
+func dayCount(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 // Dur parses a duration string, returning 0 for empty.

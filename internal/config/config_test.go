@@ -155,8 +155,8 @@ model = "m-1"
 	if c.Server.Listen != "127.0.0.1:8080" {
 		t.Fatalf("default listen not applied: %q", c.Server.Listen)
 	}
-	if c.Retention.MetadataDays != 30 {
-		t.Fatalf("default metadata retention not applied: %d", c.Retention.MetadataDays)
+	if *c.Retention.MetadataDays != 30 {
+		t.Fatalf("default metadata retention not applied: %d", *c.Retention.MetadataDays)
 	}
 	if c.Cache.MaxEntries != 1024 {
 		t.Fatalf("default cache entries not applied: %d", c.Cache.MaxEntries)
@@ -177,5 +177,95 @@ func TestLoadRejectsBadVersion(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unsupported config version") {
 		t.Fatalf("expected version-guard error, got %v", err)
+	}
+}
+
+// TestLoadKeepsExplicitZeroRetention pins the "0 = KEEP FOREVER" contract: an
+// operator who explicitly writes raw_bodies_days = 0 must keep 0 through Load,
+// not see it silently replaced with the 5-day default (which would destroy
+// retained raw bodies).
+func TestLoadKeepsExplicitZeroRetention(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	doc := `
+version = 1
+
+[server]
+listen = "127.0.0.1:8080"
+
+[retention]
+raw_bodies_days = 0
+metadata_days = 0
+errors_days = 0
+
+[[provider]]
+name = "p1"
+base_url = "https://p1.example/v1"
+[[provider.key]]
+id = "k1"
+
+[[alias]]
+name = "fast"
+[[alias.target]]
+provider = "p1"
+model = "m-1"
+`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Retention.RawBodiesDays == nil || *c.Retention.RawBodiesDays != 0 {
+		t.Fatalf("raw_bodies_days explicit 0 lost: %v", c.Retention.RawBodiesDays)
+	}
+	if c.Retention.MetadataDays == nil || *c.Retention.MetadataDays != 0 {
+		t.Fatalf("metadata_days explicit 0 lost: %v", c.Retention.MetadataDays)
+	}
+	if c.Retention.ErrorsDays == nil || *c.Retention.ErrorsDays != 0 {
+		t.Fatalf("errors_days explicit 0 lost: %v", c.Retention.ErrorsDays)
+	}
+}
+
+// TestLoadDefaultsOmittedRetentionKeys pins that omitting the retention keys
+// entirely still yields the documented 5/30/90 defaults, distinct from an
+// explicit 0 (keep forever).
+func TestLoadDefaultsOmittedRetentionKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	doc := `
+version = 1
+
+[server]
+listen = "127.0.0.1:8080"
+
+[[provider]]
+name = "p1"
+base_url = "https://p1.example/v1"
+[[provider.key]]
+id = "k1"
+
+[[alias]]
+name = "fast"
+[[alias.target]]
+provider = "p1"
+model = "m-1"
+`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Retention.RawBodiesDays == nil || *c.Retention.RawBodiesDays != 5 {
+		t.Fatalf("omitted raw_bodies_days should default to 5, got %v", c.Retention.RawBodiesDays)
+	}
+	if c.Retention.MetadataDays == nil || *c.Retention.MetadataDays != 30 {
+		t.Fatalf("omitted metadata_days should default to 30, got %v", c.Retention.MetadataDays)
+	}
+	if c.Retention.ErrorsDays == nil || *c.Retention.ErrorsDays != 90 {
+		t.Fatalf("omitted errors_days should default to 90, got %v", c.Retention.ErrorsDays)
 	}
 }

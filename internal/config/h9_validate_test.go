@@ -206,9 +206,9 @@ func TestH9ValidateRejectsNegativeCounts(t *testing.T) {
 		{"negative cache max_bytes", func(c *Config) { c.Cache.MaxBytes = -1 }, "cache.max_bytes"},
 		// These are the silent-data-loss cases: a negative retention day count
 		// means "delete everything now" rather than "keep nothing".
-		{"negative raw_bodies_days", func(c *Config) { c.Retention.RawBodiesDays = -30 }, "retention.raw_bodies_days"},
-		{"negative metadata_days", func(c *Config) { c.Retention.MetadataDays = -30 }, "retention.metadata_days"},
-		{"negative errors_days", func(c *Config) { c.Retention.ErrorsDays = -1 }, "retention.errors_days"},
+		{"negative raw_bodies_days", func(c *Config) { v := -30; c.Retention.RawBodiesDays = &v }, "retention.raw_bodies_days"},
+		{"negative metadata_days", func(c *Config) { v := -30; c.Retention.MetadataDays = &v }, "retention.metadata_days"},
+		{"negative errors_days", func(c *Config) { v := -1; c.Retention.ErrorsDays = &v }, "retention.errors_days"},
 		{"negative max_tool_output_chars", func(c *Config) { c.Compaction.MaxToolOutputChars = -1 }, "compaction.max_tool_output_chars"},
 		{"negative key rpm", func(c *Config) { c.Provider[0].Key[0].RPM = -1 }, "negative limit"},
 		{"negative key max_requests", func(c *Config) { c.Provider[0].Key[0].MaxRequests = -1 }, "negative limit"},
