@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -232,6 +233,15 @@ func (a *App) resolveSecrets(providers []model.Provider, ks *secret.Store) {
 			}
 			if s, err := ks.Get(k.Ref); err == nil {
 				k.Secret = s
+			} else {
+				// A missing/unreadable entry leaves the secret empty; surface it
+				// at config load instead of a silent runtime 401, but don't
+				// abort the whole reload for one bad key.
+				slog.Error("keystore entry unavailable; key secret left empty",
+					"provider", providers[pi].Name,
+					"key", k.ID,
+					"ref", k.Ref,
+					"err", err)
 			}
 		}
 	}
@@ -505,6 +515,10 @@ func (a *App) watchConfig(ctx context.Context) error {
 		case <-t.C:
 			st, err := os.Stat(a.CfgPath)
 			if err != nil {
+				// Deleted/unreadable config file: log so the operator knows the
+				// watcher is stuck on stale state rather than silently ignoring.
+				slog.Error("config watcher: stat config failed",
+					"path", a.CfgPath, "err", err)
 				continue
 			}
 			if st.ModTime().After(last) {
