@@ -190,3 +190,42 @@ func TestLoadMasterKeyPrecedence(t *testing.T) {
 		t.Fatalf("expected empty-keyfile error, got %v", err)
 	}
 }
+
+// TestLoadStoreRejectsNilBox pins the decision that a nil box is a load-time
+// error, not a deferred nil-panic inside Get/Set (b.aead is nil on a zero Box).
+func TestLoadStoreRejectsNilBox(t *testing.T) {
+	if _, err := LoadStore(filepath.Join(t.TempDir(), "keys.json"), nil); err == nil {
+		t.Fatal("LoadStore with nil box must fail")
+	}
+}
+
+// TestLoadMasterKeyEnvVsKeyfileTrim pins the raw-semantics asymmetry between
+// the two master-key sources: the env value is returned VERBATIM (no trim),
+// while keyfile content is whitespace-trimmed. An operator who relies on the
+// trim must not silently lose a distinguishing prefix from an env key.
+func TestLoadMasterKeyEnvVsKeyfileTrim(t *testing.T) {
+	const raw = "  key-with-surrounding-space  "
+	t.Setenv(EnvMasterKey, raw)
+	got, err := LoadMasterKey("")
+	if err != nil {
+		t.Fatalf("LoadMasterKey from env: %v", err)
+	}
+	if string(got) != raw {
+		t.Fatalf("env key is trimmed: got %q want verbatim %q", got, raw)
+	}
+
+	// Same nominal content in a keyfile is trimmed: the asymmetry is pinned.
+	t.Setenv(EnvMasterKey, "")
+	dir := t.TempDir()
+	kf := filepath.Join(dir, "master.key")
+	if err := os.WriteFile(kf, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = LoadMasterKey(kf)
+	if err != nil {
+		t.Fatalf("LoadMasterKey from keyfile: %v", err)
+	}
+	if string(got) != "key-with-surrounding-space" {
+		t.Fatalf("keyfile content not trimmed: got %q", got)
+	}
+}

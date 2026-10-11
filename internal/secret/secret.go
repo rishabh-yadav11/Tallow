@@ -98,7 +98,14 @@ type Store struct {
 }
 
 // LoadStore opens (creating if absent) the keystore at path.
+//
+// A nil box is rejected rather than accepted: every later Get/Set would
+// nil-panic inside it (b.aead is nil), which is a confusing, untraceable crash
+// at the first keystore touch instead of a clear error at load.
 func LoadStore(path string, box *Box) (*Store, error) {
+	if box == nil {
+		return nil, fmt.Errorf("secret: LoadStore requires a non-nil box")
+	}
 	s := &Store{path: path, box: box, entries: map[string]string{}}
 	b, err := os.ReadFile(path)
 	if err != nil {
