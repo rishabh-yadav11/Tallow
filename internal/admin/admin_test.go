@@ -782,3 +782,36 @@ func TestServeClose(t *testing.T) {
 		t.Error("request succeeded after shutdown; want dial error")
 	}
 }
+
+// panicBackend is a fakeBackend whose Metrics method panics, to prove a backend
+// bug on one endpoint is contained and cannot take the server down.
+type panicBackend struct {
+	*fakeBackend
+}
+
+func (p *panicBackend) Metrics() observ.Snapshot { panic("metrics exploded") }
+
+// TestBackendPanicReturns500AndHealthSurvives pins the panic-recovery contract:
+// a panicking backend method yields a JSON 500 response that keeps the same
+// content type, and does not kill the server - /health still answers 200.
+func TestBackendPanicReturns500AndHealthSurvives(t *testing.T) {
+	s, c := startAdmin(t, &panicBackend{fakeBackend: populatedFake()})
+	_ = s
+
+	// The panicking endpoint delivers a JSON 500, not a crashed connection.
+	respMetrics, bodyMetrics := doJSON(t, c, http.MethodGet, "/metrics")
+	wantStatus(t, respMetrics, http.StatusInternalServerError)
+	wantJSONContentType(t, respMetrics) // assert it still writes the JSON envelope
+	if err := decodeErrBody(t, bodyMetrics); err != "internal error" {
+		t.Fatalf("panic error body = %q; want %q", err, "internal error")
+	}
+
+	// The server is still alive and /health still serves.
+	respHealth, body := doJSON(t, c, http.MethodGet, "/health")
+	wantStatus(t, respHealth, http.StatusOK)
+	var m map[string]string
+	decodeBody(t, body, &m)
+	if m["status"] != "ok" {
+		t.Fatalf("/health status after backend panic = %q; want ok", m["status"])
+	}
+}

@@ -135,6 +135,15 @@ func New(b Backend, path string) *Server {
 func (s *Server) handle(f func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		defer func() {
+			if recover() != nil {
+				// A panicking backend (a bug in a metrics/state method) must not
+				// take the whole admin server - and with it the gateway process -
+				// down. Surface a JSON 500 and let the other endpoints keep
+				// serving; the next request to /health must still succeed.
+				writeErr(w, http.StatusInternalServerError, "internal error")
+			}
+		}()
 		f(w, r)
 	}
 }
