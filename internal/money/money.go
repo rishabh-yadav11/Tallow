@@ -26,7 +26,19 @@ const MicroUSDPerUSD int64 = 1_000_000
 
 // CentsToMicroUSD converts an operator-supplied cent amount (such as
 // `cost_limit_cents`) into the internal micro-USD unit.
+//
+// An int64 can only represent ~9.2e14 cents (about $9.2 trillion) before the
+// ×10,000 product wraps. A wrapped negative value would silently flip a huge
+// cost limit into a tiny/negative one, so out-of-range inputs are clamped to
+// the nearest representable boundary (math.MaxInt64 / math.MinInt64) rather
+// than left to overflow.
 func CentsToMicroUSD(cents int64) int64 {
+	if cents > math.MaxInt64/MicroUSDPerCent {
+		return math.MaxInt64
+	}
+	if cents < math.MinInt64/MicroUSDPerCent {
+		return math.MinInt64
+	}
 	return cents * MicroUSDPerCent
 }
 

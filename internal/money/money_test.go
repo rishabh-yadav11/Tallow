@@ -1,6 +1,9 @@
 package money
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // TestCostMicrosNotTruncated reproduces the C3 defect at the unit level. The
 // audit showed that at $0.50/1M in and $1.50/1M out, 7 of 8 realistic
@@ -125,4 +128,46 @@ func TestMicroUSDToCentsRoundsAwayFromZero(t *testing.T) {
 	if got := MicroUSDToCents(0); got != 0 {
 		t.Errorf("MicroUSDToCents(0) = %d, want 0", got)
 	}
+}
+
+// TestCentsToMicroUSDOverflowBounds pins the clamp against int64 overflow: a
+// wrapped value would silently flip a huge cost limit negative (or a negative
+// limit positive), so out-of-range inputs clamp to the representable boundary.
+func TestCentsToMicroUSDOverflowBounds(t *testing.T) {
+	t.Run("max representable rounds trip", func(t *testing.T) {
+		cents := math.MaxInt64 / MicroUSDPerCent
+		if got := CentsToMicroUSD(cents); got != cents*MicroUSDPerCent {
+			t.Errorf("CentsToMicroUSD(%d) = %d, want %d", cents, got, cents*MicroUSDPerCent)
+		}
+		if got := MicroUSDToCents(CentsToMicroUSD(cents)); got != cents {
+			t.Errorf("round trip of max cents = %d, want %d", got, cents)
+		}
+	})
+	t.Run("just above overflow clamps to max", func(t *testing.T) {
+		cents := math.MaxInt64/MicroUSDPerCent + 1
+		if got := CentsToMicroUSD(cents); got != math.MaxInt64 {
+			t.Errorf("CentsToMicroUSD(%d) = %d, want math.MaxInt64 (clamped, not wrapped)", cents, got)
+		}
+		if got := CentsToMicroUSD(math.MaxInt64); got != math.MaxInt64 {
+			t.Errorf("CentsToMicroUSD(math.MaxInt64) = %d, want math.MaxInt64", got)
+		}
+	})
+	t.Run("negative clamps to min", func(t *testing.T) {
+		if got := CentsToMicroUSD(math.MinInt64); got != math.MinInt64 {
+			t.Errorf("CentsToMicroUSD(math.MinInt64) = %d, want math.MinInt64", got)
+		}
+	})
+	t.Run("negative ordinary", func(t *testing.T) {
+		if got := CentsToMicroUSD(-100); got != -1_000_000 {
+			t.Errorf("CentsToMicroUSD(-100) = %d, want -1000000", got)
+		}
+	})
+	t.Run("zero-centered round", func(t *testing.T) {
+		if got := MicroUSDToCents(-5000); got != -1 {
+			t.Errorf("MicroUSDToCents(-5000) = %d, want -1 (round away from zero)", got)
+		}
+		if got := MicroUSDToCents(5000); got != 1 {
+			t.Errorf("MicroUSDToCents(5000) = %d, want 1", got)
+		}
+	})
 }
