@@ -232,6 +232,28 @@ func (e *PrivateAddrError) Error() string {
 		e.Addr, e.Network)
 }
 
+// CheckTargetPublic resolves host and enforces the M14 address policy against
+// every address it resolves to, returning a *PrivateAddrError if any is
+// non-public. It is the half of the guard applied to a provider host reached
+// THROUGH an HTTP proxy, where DialControl never sees the real destination
+// (it only sees the proxy's address) and therefore cannot protect the target
+// the proxy CONNECTs to.
+//
+// When AllowPrivateBaseURL is set it returns nil, matching DialControl so the
+// proxy path stays consistent with the direct-dial policy (a private upstream is
+// a legitimate deployment in both cases). Callers skip it entirely on the
+// direct path, where DialControl is authoritative.
+func CheckTargetPublic(host string) error {
+	if allowPrivateBaseURL.Load() {
+		return nil
+	}
+	ips, err := resolveGuardAddrs(host)
+	if err != nil {
+		return err
+	}
+	return checkAllPublic(ips, "tcp")
+}
+
 // resolveGuardAddrs resolves host to the set of addresses a dial could use.
 //
 // A literal address is returned as-is. A name is resolved through the system

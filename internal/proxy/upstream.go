@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rishabh-yadav11/tallow/internal/config"
 	"github.com/rishabh-yadav11/tallow/internal/routing"
 )
 
@@ -85,6 +86,9 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 	if sel.Secret != "" {
 		req.Header.Set("Authorization", "Bearer "+sel.Secret)
 	}
+	if ferr := proxyTargetGuard(h.deps.Client, req); ferr != nil {
+		return nil, ferr
+	}
 	resp, err := h.deps.Client.Do(req)
 	if err != nil {
 		return nil, &forwardError{
@@ -102,6 +106,42 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 		}
 	}
 	return resp, nil
+}
+
+// proxyTargetGuard applies the M14 address policy to the request's destination
+// when that destination is reached THROUGH an HTTP proxy.
+//
+// The app's transport dialer runs config.DialControl, but under a proxy the
+// dialer only ever dials the proxy's address - the provider host the proxy
+// CONNECTs to is chosen from the request URL and never reaches DialControl. An
+// attacker who can write base_url would otherwise escape the SSRF guard by
+// setting a public proxy and a private target. So when a proxy is in effect for
+// the URL, the target is resolved and judged. When no proxy is configured it
+// returns nil and lets DialControl do its job on the direct path - this helper
+// proves the proxy does not bypass M14, at the cost of one resolution only when
+// a proxy is actually configured.
+func proxyTargetGuard(client *http.Client, req *http.Request) *forwardError {
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok || tr.Proxy == nil {
+		return nil
+	}
+	proxyURL, err := tr.Proxy(req)
+	if err != nil {
+		return &forwardError{transport: true, msg: "connection failed", private: "proxy lookup: " + err.Error()}
+	}
+	if proxyURL == nil {
+		return nil
+	}
+	if err := config.CheckTargetPublic(req.URL.Hostname()); err != nil {
+		return &forwardError{
+			transport: true,
+			// Same client-safe category as a dial failure; the detail goes to the
+			// log, never to the client.
+			msg:     "connection failed",
+			private: "upstream proxy target: " + err.Error(),
+		}
+	}
+	return nil
 }
 
 // readUpstreamBody reads a non-streaming upstream response and applies the
