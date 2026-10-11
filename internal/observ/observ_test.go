@@ -283,3 +283,66 @@ func TestSnapshotReturnsCopy(t *testing.T) {
 		t.Error("mutating a returned Snapshot leaked the \"ghost\" provider into the collector")
 	}
 }
+
+// TestPercentileIndexPinsActualBehavior fixes what the percentile index formula
+// actually reports for tiny reservoirs, which is NOT a mathematically faithful
+// p50/p95. The index is sorted[n*50/100] / sorted[n*95/100] (integer index),
+// so for n=2 it reports p50 == p95 == max, and for n=3 p50 is the second
+// element while p95 is the third. These are pinned as the CURRENT behavior,
+// with the expected values written out independently (the second element, the
+// third element) rather than re-deriving the index formula, so a future change
+// to the formula forces an intentional update to this assertion.
+func TestPercentileIndexPinsActualBehavior(t *testing.T) {
+	// Distinct latencies so every element is observable in the snapshot.
+	t.Run("n=2 raises p50 and p95 to the max", func(t *testing.T) {
+		c := New(true)
+		c.Record(meta("p", "ok", 1, 1, false, 0), 10)
+		c.Record(meta("p", "ok", 1, 1, false, 0), 20)
+		s := c.Snapshot()
+		// n*50/100 = 1, n*95/100 = 1 -> both index 1, the second (max) element.
+		if s.LatencyP50Ms != 20 {
+			t.Errorf("p50 with n=2 = %d, want 20 (the second element, not a real median)", s.LatencyP50Ms)
+		}
+		if s.LatencyP95Ms != 20 {
+			t.Errorf("p95 with n=2 = %d, want 20", s.LatencyP95Ms)
+		}
+	})
+	t.Run("n=3 index 1 and 2", func(t *testing.T) {
+		c := New(true)
+		c.Record(meta("p", "ok", 1, 1, false, 0), 10)
+		c.Record(meta("p", "ok", 1, 1, false, 0), 20)
+		c.Record(meta("p", "ok", 1, 1, false, 0), 30)
+		s := c.Snapshot()
+		// n*50/100 = 1 (second element = 20), n*95/100 = 2 (third element = 30).
+		if s.LatencyP50Ms != 20 {
+			t.Errorf("p50 with n=3 = %d, want 20 (the second element)", s.LatencyP50Ms)
+		}
+		if s.LatencyP95Ms != 30 {
+			t.Errorf("p95 with n=3 = %d, want 30 (the third element)", s.LatencyP95Ms)
+		}
+	})
+}
+
+// TestSnapshotInvariants pins that the error and cached counts never exceed the
+// total. This catches double-counting regressions: an error sneaking into the
+// total twice, or a cached request counted beyond its intersections.
+func TestSnapshotInvariants(t *testing.T) {
+	c := New(true)
+	// Mix of ok/error and cached/not, so the invariants have real work to do.
+	c.Record(meta("p", "ok", 1, 1, false, 1), 10)
+	c.Record(meta("p", "error", 1, 1, false, 1), 10)
+	c.Record(meta("p", "ok", 1, 1, true, 1), 10)
+	c.Record(meta("", "error", 1, 1, false, 1), 5) // gateway-level error, no provider
+	s := c.Snapshot()
+	if s.Errors > s.Total {
+		t.Errorf("Errors (%d) > Total (%d): double-counting regression", s.Errors, s.Total)
+	}
+	if s.Cached > s.Total {
+		t.Errorf("Cached (%d) > Total (%d): double-counting regression", s.Cached, s.Total)
+	}
+	for p, ps := range s.ByProvider {
+		if ps.Errors > ps.Requests {
+			t.Errorf("provider %q Errors (%d) > Requests (%d)", p, ps.Errors, ps.Requests)
+		}
+	}
+}

@@ -7,7 +7,7 @@ import (
 )
 
 // The audit's Test Quality section said it precisely: "Observ tests never feed
-// the two RequestMeta shapes the proxy actually emits ("" and "cache") -
+// the two RequestMeta shapes the proxy actually emits ("" and "cached") -
 // precisely why M7 and M9 shipped green."
 //
 // That is the systemic root cause #5 again, in a new costume. Every fixture in
