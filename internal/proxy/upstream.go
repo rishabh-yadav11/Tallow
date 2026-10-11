@@ -69,16 +69,46 @@ type result struct {
 // Split out from forward so the buffered cacheable path can issue the same
 // request WITHOUT writing to a client ResponseWriter, which is what makes an
 // upstream response safe to share between coalesced callers (H8).
+// cancelOnClose wraps an upstream response body so that the request context's
+// cancel runs only when the body has been fully read (or abandoned) and closed.
+//
+// It exists because the provider timeout must cover the whole body read, not
+// just the request round trip. A naive `defer cancel()` in send fires when send
+// RETURNS - immediately after the response headers arrive and before the caller
+// reads resp.Body - cancelling the context and killing the body read. That is
+// the live-found bug this wrapper fixes: with a provider timeout configured, a
+// streaming response relaying only the first SSE chunk then failed
+// "stream interrupted: context canceled". Arbitrating cancel on Close means a
+// stalled or slow-dripping stream remains bounded by the provider timeout (the
+// documented per-provider timeout contract), and cancel runs as cleanup once
+// the body is exhausted.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
 func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*http.Response, *forwardError) {
 	url := strings.TrimRight(sel.BaseURL, "/") + "/chat/completions"
 	ctx := r.Context()
 	var cancel context.CancelFunc
 	if sel.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, sel.Timeout)
-		defer cancel()
+		// NOT deferred here: cancel must outlive send's return and fire only
+		// when the body is closed, see cancelOnClose. Below, every error path
+		// (request build, guard, Do) cancels explicitly so the context never
+		// leaks when no response body exists to carry the cancel.
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, &forwardError{msg: "build upstream request: " + err.Error()}
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -87,10 +117,16 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 		req.Header.Set("Authorization", "Bearer "+sel.Secret)
 	}
 	if ferr := proxyTargetGuard(h.deps.Client, req); ferr != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, ferr
 	}
 	resp, err := h.deps.Client.Do(req)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, &forwardError{
 			retryable: true,
 			transport: true,
@@ -104,6 +140,9 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 			msg:     "connection failed",
 			private: "upstream: " + err.Error(),
 		}
+	}
+	if cancel != nil {
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 	}
 	return resp, nil
 }
