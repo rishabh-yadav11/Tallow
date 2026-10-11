@@ -275,26 +275,42 @@ func migrateCostUnits(db *sql.DB) error {
 		return fmt.Errorf("store: read cost units: %w", err)
 	}
 
+	// The conversion, renames, and the unit stamp are written as a single
+	// transaction. Previously they ran as independent statements: a crash
+	// between the UPDATE and the ALTER left cost_cents still named cost_cents
+	// but already scaled ×10000 with no stamp, so the next open re-ran the
+	// migration and scaled every legacy value a second time, corrupting cost
+	// rollups. SQLite DDL is transactional, so wrapping everything guarantees a
+	// crash can never leave that partial half-converted state.
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("store: begin cost units: %w", err)
+	}
+	defer tx.Rollback()
+
 	for _, table := range []string{"requests", "rollups"} {
 		var n int
 		// Only a pre-existing table carries the old cost_cents column.
-		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name='cost_cents'`, table).Scan(&n); err != nil {
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name='cost_cents'`, table).Scan(&n); err != nil {
 			return fmt.Errorf("store: inspect %s: %w", table, err)
 		}
 		if n == 0 {
 			continue
 		}
 		// 10,000 micro-USD per cent, preserving the stored magnitude.
-		if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET cost_cents = cost_cents * 10000`, table)); err != nil {
+		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET cost_cents = cost_cents * 10000`, table)); err != nil {
 			return fmt.Errorf("store: convert %s cost: %w", table, err)
 		}
-		if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s RENAME COLUMN cost_cents TO cost_micros`, table)); err != nil {
+		if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %s RENAME COLUMN cost_cents TO cost_micros`, table)); err != nil {
 			return fmt.Errorf("store: rename %s cost column: %w", table, err)
 		}
 	}
-	if _, err := db.Exec(`INSERT INTO meta (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
+	if _, err := tx.Exec(`INSERT INTO meta (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
 		costUnitsKey, "micros"); err != nil {
 		return fmt.Errorf("store: record cost units: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit cost units: %w", err)
 	}
 	return nil
 }

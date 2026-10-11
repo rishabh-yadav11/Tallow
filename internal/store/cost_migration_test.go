@@ -97,6 +97,68 @@ func TestMigrateCostUnitsFromCents(t *testing.T) {
 	}
 }
 
+// TestMigrateCostUnitsAtomicOnFailure proves the conversion is one transaction:
+// a step failing partway must leave the database in its original state, with
+// requests scaled/renamed rolled back, no stamp recorded, and no half-converted
+// cost_cents column that a later open would scale a second time. It uses a CHECK
+// constraint that the scaled value violates so the UPDATE fails mid-migration.
+func TestMigrateCostUnitsAtomicOnFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "atomic.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Same old schema, but rollups carries a CHECK the scaled value violates
+	// (10 cents × 10000 > 5000), forcing the UPDATE to fail inside the txn.
+	const withCheck = `
+CREATE TABLE IF NOT EXISTS requests (
+	id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, cost_cents INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS rollups (
+	bucket TEXT NOT NULL, bucket_start INTEGER NOT NULL, provider TEXT NOT NULL,
+	key TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+	prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0,
+	cost_cents INTEGER NOT NULL DEFAULT 0 CHECK (cost_cents < 5000),
+	PRIMARY KEY (bucket, bucket_start, provider, key)
+);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+`
+	if _, err := db.Exec(withCheck); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO requests (id, started_at, cost_cents) VALUES ('a', 1, 7), ('b', 2, 3)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO rollups (bucket, bucket_start, provider, key, cost_cents) VALUES ('day', 1, 'p', 'k', 10)`); err != nil {
+		t.Fatalf("seed rollup: %v", err)
+	}
+	if err := migrateCostUnits(db); err == nil {
+		t.Fatal("migration should have failed against the CHECK constraint")
+	}
+	// Everything rolled back: requests unscaled, column still cost_cents, no stamp.
+	var reqCents []int64
+	rows, err := db.Query(`SELECT cost_cents FROM requests ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query requests: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		reqCents = append(reqCents, v)
+	}
+	if len(reqCents) != 2 || reqCents[0] != 7 || reqCents[1] != 3 {
+		t.Fatalf("requests not rolled back to original cents: %v", reqCents)
+	}
+	var stamp string
+	if err := db.QueryRow(`SELECT v FROM meta WHERE k=?`, costUnitsKey).Scan(&stamp); err != sql.ErrNoRows {
+		t.Fatalf("stamp written despite failure: %q err=%v", stamp, err)
+	}
+	db.Close()
+}
+
 // TestMigrateCostUnitsFreshDatabase covers a brand new database: it already has
 // cost_micros, so the migration only stamps the unit.
 func TestMigrateCostUnitsFreshDatabase(t *testing.T) {
