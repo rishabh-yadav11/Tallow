@@ -64,6 +64,53 @@ func TestRollupCountsARecordedLateWithAnEarlierTimestamp(t *testing.T) {
 	}
 }
 
+// TestRollupAggregatesErrorsAndTokensAcrossRequests asserts the non-Requests
+// rollup columns that operators actually read: the errors count (requests whose
+// status is "error") and the prompt/completion token sums, folded together from
+// multiple requests in one day bucket. The existing tests only asserted
+// Requests, so a rollup that dropped errors or tokens would have stayed green.
+func TestRollupAggregatesErrorsAndTokensAcrossRequests(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	s.RecordRequest(model.RequestMeta{ID: "ok1", StartedAt: now, Provider: "p1", Key: "k1", PromptTokens: 100, CompletionTokens: 200, CostMicros: 1000})
+	s.RecordRequest(model.RequestMeta{ID: "ok2", StartedAt: now, Provider: "p1", Key: "k1", PromptTokens: 300, CompletionTokens: 500, CostMicros: 50})
+	s.RecordRequest(model.RequestMeta{ID: "err1", StartedAt: now.Add(-time.Second), Provider: "p1", Key: "k1", Status: "error", PromptTokens: 10, CompletionTokens: 20, CostMicros: 7})
+	s.Flush()
+	if err := s.Maintain(ctx); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	rolls, err := s.RecentRollups(200)
+	if err != nil {
+		t.Fatalf("RecentRollups: %v", err)
+	}
+	var day *Rollup
+	for i := range rolls {
+		if rolls[i].Bucket == "day" {
+			day = &rolls[i]
+		}
+	}
+	if day == nil {
+		t.Fatal("Maintain produced no day rollup")
+	}
+	if day.Requests != 3 {
+		t.Errorf("day requests = %d, want 3", day.Requests)
+	}
+	if day.Errors != 1 {
+		t.Errorf("day errors = %d, want 1 (the err1 row)", day.Errors)
+	}
+	if day.Prompt != 100+300+10 {
+		t.Errorf("day prompt_tokens = %d, want %d", day.Prompt, 100+300+10)
+	}
+	if day.Completion != 200+500+20 {
+		t.Errorf("day completion_tokens = %d, want %d", day.Completion, 200+500+20)
+	}
+	if day.CostMicros != 1000+50+7 {
+		t.Errorf("day cost_micros = %d, want %d", day.CostMicros, 1000+50+7)
+	}
+}
+
 // TestRollupIsIdempotentAcrossRepeatedRuns guards the other property the
 // sequence-based watermark has to preserve. A naive fix - dropping the
 // watermark entirely and re-scanning all rows - would fold every row on every

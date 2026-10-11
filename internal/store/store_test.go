@@ -198,7 +198,7 @@ func TestMaintainVacuum(t *testing.T) {
 		MetadataDays:  30,
 		ErrorsDays:    90,
 		RollupEvery:   time.Hour,
-		VacuumEvery:   0, // force a VACUUM on first Maintain
+		VacuumEvery:   0, // <=0 means never vacuum; a tiny value is set below to force one
 	}
 	s, err := Open(cfg)
 	if err != nil {
@@ -299,6 +299,15 @@ func TestRetentionZeroKeepsForever(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("retention 0 must keep rows forever: got %d rows, want 1", len(rows))
 	}
+	// The errors table must also survive 0 (it was previously unasserted, so
+	// 0-retention only protected metadata rows, not error rows).
+	var errCount int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM errors`).Scan(&errCount); err != nil {
+		t.Fatalf("query error rows: %v", err)
+	}
+	if errCount != 1 {
+		t.Fatalf("retention 0 must keep error rows forever: got %d error rows, want 1", errCount)
+	}
 }
 
 // TestRetentionPositiveDeletesAgedRows verifies positive windows still delete
@@ -350,5 +359,120 @@ func TestWriteStatsCountsDrops(t *testing.T) {
 	fails, drops := s.WriteStats()
 	if fails != 0 || drops != 1 {
 		t.Fatalf("WriteStats after closed-store write: failures=%d drops=%d, want 0/1", fails, drops)
+	}
+}
+
+// TestRecentRequestsDefaultsZeroLimit pins that a non-positive limit falls back
+// to the documented default (100 for requests) rather than returning everything
+// or nothing.
+func TestRecentRequestsDefaultsZeroLimit(t *testing.T) {
+	s := newTestStore(t)
+	for i := range 120 {
+		if err := s.RecordRequest(model.RequestMeta{ID: fmt.Sprintf("r-%d", i), DurMillis: int64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.flushForTest()
+
+	got, err := s.RecentRequests(0)
+	if err != nil {
+		t.Fatalf("RecentRequests(0): %v", err)
+	}
+	if len(got) != 100 {
+		t.Fatalf("RecentRequests(0) default = %d rows, want 100", len(got))
+	}
+	got, err = s.RecentRequests(120)
+	if err != nil {
+		t.Fatalf("RecentRequests(120): %v", err)
+	}
+	if len(got) != 120 {
+		t.Fatalf("RecentRequests(120) = %d rows, want 120", len(got))
+	}
+}
+
+// TestAuditAndRollupDefaultZeroLimit pins the same non-positive->default fallback
+// for the two other read helpers whose defaults are 100 and 200 respectively.
+func TestAuditAndRollupDefaultZeroLimit(t *testing.T) {
+	s := newTestStore(t)
+	for i := range 5 {
+		if err := s.Audit("set", "cfg", fmt.Sprintf("detail-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.flushForTest()
+	audits, err := s.RecentAudit(0)
+	if err != nil {
+		t.Fatalf("RecentAudit(0): %v", err)
+	}
+	if len(audits) != 5 {
+		t.Fatalf("RecentAudit(0) = %d rows, want 5", len(audits))
+	}
+	if audits[0].Detail != "detail-4" {
+		t.Errorf("RecentAudit(0) newest-first ordering broke: first detail = %q", audits[0].Detail)
+	}
+
+	// Rollup default is 200. Record requests too (audits do not become rollups)
+	// so Maintain produces a day bucket to read back through the default path.
+	for i := range 5 {
+		if err := s.RecordRequest(model.RequestMeta{ID: fmt.Sprintf("req-%d", i), PromptTokens: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.flushForTest()
+	if err := s.Maintain(context.Background()); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	rolls, err := s.RecentRollups(0)
+	if err != nil {
+		t.Fatalf("RecentRollups(0): %v", err)
+	}
+	if len(rolls) == 0 {
+		t.Fatal("RecentRollups(0) returned no rollups after Maintain")
+	}
+	for _, r := range rolls {
+		if r.Bucket == "day" && r.Requests == 5 {
+			return // found the 5-request day rollup: default path works.
+		}
+	}
+	t.Errorf("no day rollup with 5 requests found: %+v", rolls)
+}
+
+// TestQueueFullDropsPins the write-queue capacity (1024) and the drop path when
+// it overflows: enqueuing into a full queue must not block, must increment the
+// drop counter, and must return errQueueFull. It builds a Store with a full
+// channel and no worker on purpose so the overflow is deterministic.
+func TestQueueFullDrops(t *testing.T) {
+	st := &Store{queue: make(chan writeOp, 1024)}
+	for range 1024 {
+		st.queue <- writeOp{}
+	}
+	err := st.enqueue(writeOp{kind: opRequest, req: model.RequestMeta{ID: "overflow"}})
+	if err != errQueueFull {
+		t.Fatalf("enqueue into full queue returned %v, want errQueueFull", err)
+	}
+	fails, drops := st.WriteStats()
+	if fails != 0 || drops != 1 {
+		t.Fatalf("WriteStats after queue-full drop: failures=%d drops=%d, want 0/1", fails, drops)
+	}
+}
+
+// TestWorkerExecFailureCountsFailures pins that a deferred write failing at the
+// database layer is surfaced through WriteStats rather than silently lost. A
+// dropped requests table makes the worker's INSERT fail.
+func TestWorkerExecFailureCountsFailures(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.db.Exec(`DROP TABLE requests`); err != nil {
+		t.Fatalf("drop requests table: %v", err)
+	}
+	if err := s.RecordRequest(model.RequestMeta{ID: "doomed"}); err != nil {
+		t.Fatalf("RecordRequest: %v", err)
+	}
+	s.flushForTest()
+	fails, drops := s.WriteStats()
+	if fails != 1 {
+		t.Fatalf("WriteStats after failed worker insert: failures=%d, want 1", fails)
+	}
+	if drops != 0 {
+		t.Fatalf("WriteStats after failed worker insert: drops=%d, want 0", drops)
 	}
 }
