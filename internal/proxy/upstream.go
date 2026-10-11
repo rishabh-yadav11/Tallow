@@ -153,6 +153,17 @@ func (h *Handler) plainForward(w http.ResponseWriter, resp *http.Response) (resu
 	return result{prompt: prompt, completion: completion, respBody: b}, nil
 }
 
+// streamPreHeaderLimit bounds the first-token pre-buffer in streamForward.
+//
+// An upstream that answers 200 and then sends only non-data lines (`: keep-alive`
+// comments) without ever producing a data line would otherwise make `pre` grow
+// without bound and keep the handler from ever returning. Capping it makes a
+// hostile or broken upstream terminate the stream instead of pinning the
+// connection open. The bound is reached before any token is seen, so the failure
+// stays on the retryable-first-token path and the client never observes a
+// partial stream.
+const streamPreHeaderLimit = 256 << 10
+
 // streamForward buffers only until the first token (first SSE data line),
 // then passes through. Failure before the first token is a retryable error the
 // client never sees; failure after is surfaced as an interruption.
@@ -191,6 +202,15 @@ func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response) (res
 		}
 
 		if !started {
+			if pre.Len()+len(line) > streamPreHeaderLimit {
+				// No data line within the bound: terminate, and report it as the
+				// retryable first-token failure so the caller can try another
+				// route rather than leaving the client on a silent open stream.
+				return result{}, &forwardError{
+					retryable: true,
+					msg:       "stream failed before first token: no data line within " + strconv.Itoa(streamPreHeaderLimit/1024) + "KiB of preamble",
+				}
+			}
 			pre.Write(line)
 			if isDataLine(line) {
 				started = true
