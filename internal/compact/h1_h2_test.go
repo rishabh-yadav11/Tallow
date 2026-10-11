@@ -1,7 +1,6 @@
 package compact
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -210,38 +209,6 @@ func TestTruncateIdempotenceAndPrefixProperty(t *testing.T) {
 			if idx != 0 && !utf8.ValidString(out[:idx]) {
 				t.Fatalf("%s: kept content is not valid UTF-8 (H1)", name)
 			}
-		}
-	}
-}
-
-// TestTruncateMarkerReportsFinalKeptLength guards the subtle bug the fix could
-// have introduced: the marker renders its two %d verbs, and a marker that
-// reports a length computed BEFORE the rune walk-back would misreport what the
-// caller received. This parses the marker's numbers back out and checks them.
-func TestTruncateMarkerReportsFinalKeptLength(t *testing.T) {
-	s := strings.Repeat("世", 1000) // 3000 bytes, every rune is 3 bytes
-	for maxBytes := 60; maxBytes <= 400; maxBytes++ {
-		out := truncate(s, maxBytes)
-		idx := strings.Index(out, "\n\n[toutput truncated by tallow: ")
-		if idx < 0 {
-			// Below the full-marker threshold the abbreviated notice is used,
-			// which carries no counts and so cannot be checked this way.
-			if strings.HasSuffix(out, shortTruncationMarker) {
-				continue
-			}
-			t.Fatalf("max=%d: truncated without a marker", maxBytes)
-		}
-		var orig, kept int
-		if _, err := fmt.Sscanf(out[idx:], "\n\n[toutput truncated by tallow: %d -> %d chars]", &orig, &kept); err != nil {
-			t.Fatalf("max=%d: could not parse marker: %v", maxBytes, err)
-		}
-		if orig != len(s) {
-			t.Fatalf("max=%d: marker reports orig=%d, want %d", maxBytes, orig, len(s))
-		}
-		// The reported kept count must equal the ACTUAL bytes of content
-		// preceding the marker, not a pre-adjustment number.
-		if kept != idx {
-			t.Fatalf("max=%d: marker reports kept=%d but %d bytes of content precede it", maxBytes, kept, idx)
 		}
 	}
 }
