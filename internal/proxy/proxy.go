@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/rishabh-yadav11/tallow/internal/cache"
+	"github.com/rishabh-yadav11/tallow/internal/catalog"
 	"github.com/rishabh-yadav11/tallow/internal/compact"
 	"github.com/rishabh-yadav11/tallow/internal/observ"
 	"github.com/rishabh-yadav11/tallow/internal/registry"
@@ -43,6 +44,9 @@ type Deps struct {
 	// StreamKeepalive is the interval for SSE `: keepalive` comment lines on
 	// streaming responses, sent only AFTER the first data line. Zero disables.
 	StreamKeepalive time.Duration
+	// Catalog feeds /v1/models with catalog-derived entries. When nil, the
+	// handler behaves exactly as before: manual aliases only, no fetched models.
+	Catalog *catalog.Manager
 }
 
 // Handler implements the OpenAI-compatible surface.
@@ -113,32 +117,104 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
+	// The set of client-facing model IDs is the union of manual aliases and
+	// catalog-derived entries. Manual aliases always win: a model the operator
+	// declared by hand is never shadowed or duplicated by a fetched catalog.
+	seen := map[string]bool{}
+
+	// Manual aliases first.
 	names := h.deps.Registry.AliasNames()
 	data := make([]map[string]any, 0, len(names))
 	for _, n := range names {
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
 		data = append(data, map[string]any{"id": n, "object": "model", "owned_by": "tallow"})
 	}
+
+	// Catalog-derived entries only for providers that opted in AND whose models
+	// are NOT manually declared (a manual alias target for a provider makes its
+	// model list authoritative; see managedProviders below).
+	if h.deps.Catalog != nil {
+		manual := h.manualProviders()
+		for _, p := range h.deps.Registry.Providers() {
+			if p.Catalog == nil || !p.Catalog.Enabled {
+				continue
+			}
+			if manual[p.Name] {
+				// Manual model list wins: catalog fills nothing for this provider.
+				continue
+			}
+			models, ok := h.deps.Catalog.Models(p.Name)
+			if !ok {
+				continue
+			}
+			for _, m := range models {
+				if seen[m] {
+					continue
+				}
+				seen[m] = true
+				data = append(data, map[string]any{"id": m, "object": "model", "owned_by": "tallow"})
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// manualProviders returns the set of provider names that have at least one
+// manually declared alias target. Their model lists are authoritative, so the
+// catalog must not fill them in /v1/models.
+func (h *Handler) manualProviders() map[string]bool {
+	manual := map[string]bool{}
+	for _, a := range h.deps.Registry.Aliases() {
+		for _, t := range a.Targets {
+			if t.Model != "" {
+				manual[t.Provider] = true
+			}
+		}
+	}
+	return manual
 }
 
 func (h *Handler) getModel(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
-	a, ok := h.deps.Registry.Alias(id)
-	if !ok {
-		writeErr(w, http.StatusNotFound, "invalid_request_error", "model not found")
+	if a, ok := h.deps.Registry.Alias(id); ok {
+		ctxWin, tools := 0, false
+		for _, t := range a.Targets {
+			if t.ContextWindow > ctxWin {
+				ctxWin = t.ContextWindow
+			}
+			tools = tools || t.SupportsTools
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": id, "object": "model", "created": 0, "owned_by": "tallow",
+			"context_window": ctxWin, "supports_tools": tools,
+		})
 		return
 	}
-	ctxWin, tools := 0, false
-	for _, t := range a.Targets {
-		if t.ContextWindow > ctxWin {
-			ctxWin = t.ContextWindow
+
+	// Catalog-derived entry: the catalog may expose models that are not aliases.
+	if h.deps.Catalog != nil {
+		for _, p := range h.deps.Registry.Providers() {
+			if p.Catalog == nil || !p.Catalog.Enabled {
+				continue
+			}
+			if models, ok := h.deps.Catalog.Models(p.Name); ok {
+				for _, m := range models {
+					if m == id {
+						writeJSON(w, http.StatusOK, map[string]any{
+							"id": id, "object": "model", "created": 0, "owned_by": "tallow",
+						})
+						return
+					}
+				}
+			}
 		}
-		tools = tools || t.SupportsTools
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id": id, "object": "model", "created": 0, "owned_by": "tallow",
-		"context_window": ctxWin, "supports_tools": tools,
-	})
+
+	writeErr(w, http.StatusNotFound, "invalid_request_error", "model not found")
 }
 
 // auth validates the request's bearer token against the allow-list. A nil

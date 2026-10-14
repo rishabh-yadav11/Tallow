@@ -20,6 +20,7 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/admin"
 	"github.com/rishabh-yadav11/tallow/internal/budget"
 	"github.com/rishabh-yadav11/tallow/internal/cache"
+	"github.com/rishabh-yadav11/tallow/internal/catalog"
 	"github.com/rishabh-yadav11/tallow/internal/compact"
 	"github.com/rishabh-yadav11/tallow/internal/config"
 	"github.com/rishabh-yadav11/tallow/internal/health"
@@ -53,6 +54,7 @@ type App struct {
 	proxyHandler *proxy.Handler
 	adminSrv     *admin.Server
 	proxySrv     *http.Server
+	catalog      *catalog.Manager
 
 	authMu sync.RWMutex
 	auth   map[string]bool
@@ -125,6 +127,7 @@ func (a *App) load(path string) error {
 	c := cache.New(cfg.Cache.MaxEntries, params.CacheTTL, maxBytesForCache(cfg))
 	obs := observ.New(cfg.Observability.Enabled)
 	client := newHTTPClient()
+	cat := catalog.NewManager(client)
 
 	sk, _ := config.Dur(cfg.Server.StreamKeepalive)
 	tlsCfg, err := serverTLS(cfg.Server)
@@ -149,6 +152,7 @@ func (a *App) load(path string) error {
 		// here and enforced by the handler with http.MaxBytesReader.
 		MaxRequestBytes: params.MaxBodyBytes,
 		StreamKeepalive: sk,
+		Catalog:         cat,
 	})
 
 	a.mu.Lock()
@@ -161,6 +165,7 @@ func (a *App) load(path string) error {
 	a.observ = obs
 	a.store = st
 	a.client = client
+	a.catalog = cat
 	a.Keystore = keystore
 	a.proxyHandler = ph
 	a.mu.Unlock()
@@ -503,6 +508,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	go func() { errc <- a.store.RunRetention(ctx) }()
 	go func() { errc <- a.healthLoop(ctx) }()
+	go func() { errc <- a.catalogLoop(ctx) }()
 	go func() { errc <- a.watchConfig(ctx) }()
 	go func() { errc <- a.adminSrv.Serve(ctx) }()
 	go func() {
@@ -660,6 +666,50 @@ func (a *App) probe(reg *registry.Registry, client *http.Client, p model.Provide
 		pb.RecordFailure(now)
 		kb.RecordFailure(now)
 	}
+}
+
+// catalogTick is how often catalogLoop refreshes opted-in providers' catalogs.
+// It is a var so tests can drive the loop without waiting out a real interval,
+// matching the healthTick pattern. Production value is once per minute.
+var catalogTick = time.Minute
+
+// catalogRefreshInterval bounds each individual catalog fetch.
+const catalogRefreshInterval = 30 * time.Second
+
+// catalogLoop periodically fetches the catalog for each enabled provider.
+// With no providers opted in, it is a no-op. Errors are logged inside Refresh
+// and never abort the loop, so Refresh always returns nil.
+func (a *App) catalogLoop(ctx context.Context) error {
+	t := time.NewTicker(catalogTick)
+	defer t.Stop()
+
+	// Fetch once at startup so /v1/models is immediately populated rather than
+	// waiting for the first tick.
+	a.mu.RLock()
+	reg := a.reg
+	a.mu.RUnlock()
+	providers := reg.Providers()
+	a.refreshCatalogs(ctx, providers)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			a.mu.RLock()
+			reg = a.reg
+			a.mu.RUnlock()
+			a.refreshCatalogs(ctx, reg.Providers())
+		}
+	}
+}
+
+// refreshCatalogs runs one catalog refresh over the given providers, applying a
+// per-fetch timeout so the loop can never hang on a slow upstream.
+func (a *App) refreshCatalogs(ctx context.Context, providers []model.Provider) {
+	fctx, cancel := context.WithTimeout(ctx, catalogRefreshInterval)
+	defer cancel()
+	a.catalog.Refresh(fctx, providers)
 }
 
 func (a *App) aliasModelByProvider() map[string]string {
