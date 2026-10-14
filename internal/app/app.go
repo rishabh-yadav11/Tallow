@@ -8,11 +8,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -30,6 +32,8 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/routing"
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 	"github.com/rishabh-yadav11/tallow/internal/store"
+
+	"github.com/BurntSushi/toml"
 )
 
 // App is the gateway instance.
@@ -780,6 +784,261 @@ func (a *App) Version() string { return a.BuildVersion }
 
 // ConfigPath returns the loaded config path.
 func (a *App) ConfigPath() string { return a.CfgPath }
+
+// configMap renders the live Config as a generic JSON-shaped map. The struct is
+// serialized through a TOML round-trip so the TOML field names survive and every
+// knob is navigable by name; the map form is what both ConfigRead (read) and
+// ConfigWrite (mutate) operate on generically. Pointers are dereferenced by the
+// round-trip, which is fine: defaults re-apply on the next Load.
+func (a *App) configMap() (map[string]any, error) {
+	a.mu.RLock()
+	cfg := a.cfg
+	a.mu.RUnlock()
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(cfg); err != nil {
+		return nil, fmt.Errorf("config: serialize: %w", err)
+	}
+	var m map[string]any
+	if _, err := tomlUnmarshal(buf.String(), &m); err != nil {
+		return nil, fmt.Errorf("config: deserialize: %w", err)
+	}
+	return m, nil
+}
+
+// ConfigRead returns the live config at scope as JSON: nil scope = the full
+// document, ["server"] = the server section, ["server","listen"] = one field.
+func (a *App) ConfigRead(scope []string) (json.RawMessage, error) {
+	m, err := a.configMap()
+	if err != nil {
+		return nil, err
+	}
+	v, ok := configNavigate(m, scope)
+	if !ok {
+		return nil, admin.ErrConfigNotFound
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("config: marshal: %w", err)
+	}
+	return json.RawMessage(b), nil
+}
+
+// ConfigWrite persists and hot-reloads a config mutation (PUT replace, PATCH
+// merge, DELETE remove) at scope. It validates before touching runtime and
+// refuses invalid changes without altering the running gateway.
+func (a *App) ConfigWrite(method string, scope []string, body json.RawMessage) error {
+	if method == http.MethodDelete {
+		if len(scope) == 0 {
+			return errors.New("cannot delete the whole config document")
+		}
+		return a.mutateConfig(func(m map[string]any) error { return configDeletePath(m, scope) })
+	}
+	if !json.Valid(body) {
+		return errors.New("config: request body is not valid JSON")
+	}
+	var value any
+	if err := json.Unmarshal(body, &value); err != nil {
+		return fmt.Errorf("config: decode body: %w", err)
+	}
+	return a.mutateConfig(func(m map[string]any) error {
+		return configApplyPath(m, method, scope, value)
+	})
+}
+
+// mutateConfig applies a mutation to the live config, persists the result to
+// the on-disk file, validates it via config.Load, and only swaps the runtime
+// (via Reload) if it is valid. An invalid change is refused and never touches
+// the live file.
+func (a *App) mutateConfig(mut func(map[string]any) error) error {
+	m, err := a.configMap()
+	if err != nil {
+		return err
+	}
+	if err := mut(m); err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(m); err != nil {
+		return fmt.Errorf("config: serialize change: %w", err)
+	}
+
+	// Write to a temp file in the same directory, run config.Load on it (Load
+	// parses + applies defaults + validates), and only atomically rename it into
+	// place once it is valid. This keeps an invalid write from ever corrupting
+	// the live file or, on reload failure, from being half-applied.
+	dir := filepath.Dir(a.CfgPath)
+	tmp, err := os.CreateTemp(dir, ".tallow-config-*.toml")
+	if err != nil {
+		return fmt.Errorf("config: create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
+		return fmt.Errorf("config: write temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("config: close temp: %w", err)
+	}
+	if _, err := config.Load(tmpName); err != nil {
+		return fmt.Errorf("config: validation failed, change refused: %w", err)
+	}
+	if err := os.Rename(tmpName, a.CfgPath); err != nil {
+		return fmt.Errorf("config: replace file: %w", err)
+	}
+	if err := a.Reload(); err != nil {
+		return fmt.Errorf("config: hot-reload failed: %w", err)
+	}
+	return nil
+}
+
+// ReplayRequest re-runs a stored request through the current proxy pipeline and
+// writes the response to w.
+func (a *App) ReplayRequest(w http.ResponseWriter, id string) error {
+	a.mu.RLock()
+	st := a.store
+	ph := a.proxyHandler
+	a.mu.RUnlock()
+	if st == nil {
+		return errors.New("replay: store unavailable")
+	}
+	if ph == nil {
+		return errors.New("replay: proxy handler unavailable")
+	}
+	rec, err := st.RawBody(id)
+	if err != nil {
+		return err
+	}
+	// Only the chat-completions route records raw bodies, so that is the route
+	// path a replay is re-dispatched through; the body is the stored original.
+	req, err := http.NewRequest(http.MethodPost, "http://internal/replay", bytes.NewReader(rec.ReqBody))
+	if err != nil {
+		return fmt.Errorf("replay: construct request: %w", err)
+	}
+	req.URL.Path = "/v1/chat/completions"
+	req.Header.Set("Content-Type", "application/json")
+	ph.Routes().ServeHTTP(w, req)
+	return nil
+}
+
+// KeyRefs returns the keystore refs (never plaintext).
+func (a *App) KeyRefs() []string {
+	if a.Keystore == nil {
+		return nil
+	}
+	return a.Keystore.List()
+}
+
+// UploadKey encrypts and persists a raw secret under ref.
+func (a *App) UploadKey(ref string, plaintext []byte) error {
+	if a.Keystore == nil {
+		return errors.New("keystore unavailable")
+	}
+	if err := a.Keystore.Set(ref, string(plaintext)); err != nil {
+		return fmt.Errorf("upload key: %w", err)
+	}
+	return nil
+}
+
+// DeleteKey removes a credential by ref.
+func (a *App) DeleteKey(ref string) error {
+	if a.Keystore == nil {
+		return errors.New("keystore unavailable")
+	}
+	if err := a.Keystore.Delete(ref); err != nil {
+		return fmt.Errorf("delete key: %w", err)
+	}
+	return nil
+}
+
+// configNavigate walks scope through a JSON-shaped map, returning the value and
+// whether the path exists.
+func configNavigate(m map[string]any, scope []string) (any, bool) {
+	cur := any(m)
+	for _, key := range scope {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cur, ok = obj[key]
+		if !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+// configApplyPath applies a PUT (replace) or PATCH (merge) value at scope.
+func configApplyPath(m map[string]any, method string, scope []string, value any) error {
+	obj, isObj := value.(map[string]any)
+	if len(scope) == 0 {
+		if !isObj {
+			return errors.New("full-document config must be a JSON object")
+		}
+		if method == "PUT" {
+			for k := range m {
+				delete(m, k)
+			}
+		}
+		deepMergeConfig(m, obj)
+		return nil
+	}
+	parent := m
+	for _, key := range scope[:len(scope)-1] {
+		pm, ok := parent[key].(map[string]any)
+		if !ok {
+			return fmt.Errorf("config: section %q does not exist", key)
+		}
+		parent = pm
+	}
+	last := scope[len(scope)-1]
+	if method == "PATCH" {
+		if cur, ok := parent[last].(map[string]any); ok && isObj {
+			deepMergeConfig(cur, obj)
+			return nil
+		}
+	}
+	parent[last] = value
+	return nil
+}
+
+// deepMergeConfig recursively merges src into dst, overwriting scalars and
+// recursing into nested objects.
+func deepMergeConfig(dst, src map[string]any) {
+	for k, v := range src {
+		sm, ok := v.(map[string]any)
+		if !ok {
+			dst[k] = v
+			continue
+		}
+		if dm, ok2 := dst[k].(map[string]any); ok2 {
+			deepMergeConfig(dm, sm)
+			continue
+		}
+		dst[k] = v
+	}
+}
+
+// configDeletePath removes the value at scope.
+func configDeletePath(m map[string]any, scope []string) error {
+	if len(scope) == 0 {
+		return errors.New("cannot delete the whole config document")
+	}
+	parent := m
+	for _, key := range scope[:len(scope)-1] {
+		pm, ok := parent[key].(map[string]any)
+		if !ok {
+			return fmt.Errorf("config: section %q does not exist", key)
+		}
+		parent = pm
+	}
+	delete(parent, scope[len(scope)-1])
+	return nil
+}
+
+func tomlUnmarshal(text string, v any) (toml.MetaData, error) {
+	return toml.Decode(text, v)
+}
 
 func keyBudgetSnapshot(r *routing.Router, provider, key string, now time.Time) routing.BudgetStatus {
 	for _, b := range r.Budgets(now) {

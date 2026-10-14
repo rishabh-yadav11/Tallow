@@ -858,3 +858,38 @@ type AuditEntry struct {
 	Entity string    `json:"entity"`
 	Detail string    `json:"detail"`
 }
+
+// ErrNotFound is returned by lookups (RawBody and friends) when no row exists
+// for the requested key. Callers can use errors.Is to distinguish "absent"
+// from a real database failure and map it to a 404.
+var ErrNotFound = errors.New("store: record not found")
+
+// RawRecord is one stored raw request/response body pair, used to support
+// point-in-time replay of a prior request through the proxy pipeline.
+type RawRecord struct {
+	ID       string `json:"id"`
+	ReqBody  []byte `json:"req_body"`
+	RespBody []byte `json:"resp_body"`
+}
+
+// RawBody returns the stored raw request body for the given request id.
+//
+// It is the replay seam: the admin /replay endpoint reconstructs the original
+// HTTP request from ReqBody and re-runs it through the proxy handler, returning
+// the original response shape. The route path is deliberately not stored as a
+// full URL because only the chat-completions route records raw bodies, so the
+// caller knows the route path is /v1/chat/completions. This returns
+// ErrNotFound when the id was never captured (or has aged out of retention),
+// which maps to a 404 on the admin endpoint.
+func (s *Store) RawBody(id string) (RawRecord, error) {
+	var rec RawRecord
+	err := s.db.QueryRow(`SELECT id, req_body, resp_body FROM raw_bodies WHERE id=?`, id).
+		Scan(&rec.ID, &rec.ReqBody, &rec.RespBody)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RawRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return RawRecord{}, err
+	}
+	return rec, nil
+}

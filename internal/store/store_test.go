@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -88,6 +89,41 @@ func TestAsyncRecordRawAndAudit(t *testing.T) {
 	}
 	if len(aud) != 1 || aud[0].Action != "reload" || aud[0].Entity != "config" {
 		t.Fatalf("unexpected audit rows: %+v", aud)
+	}
+}
+
+// TestRawBodyLookupRoundTrip pins the replay seam: a raw request body recorded
+// for an id is returned verbatim by RawBody, an unknown id yields ErrNotFound
+// (so the admin endpoint can map it to a 404), and the stored response body is
+// preserved alongside it.
+func TestRawBodyLookupRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	const id = "req-replay-1"
+	reqBody := []byte(`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	respBody := []byte(`{"id":"x","object":"chat.completion"}`)
+	if err := s.RecordRaw(id, time.Now(), reqBody, respBody); err != nil {
+		t.Fatalf("RecordRaw: %v", err)
+	}
+	s.flushForTest()
+
+	rec, err := s.RawBody(id)
+	if err != nil {
+		t.Fatalf("RawBody: %v", err)
+	}
+	if rec.ID != id {
+		t.Errorf("id = %q; want %q", rec.ID, id)
+	}
+	if string(rec.ReqBody) != string(reqBody) {
+		t.Errorf("req_body = %s; want %s", rec.ReqBody, reqBody)
+	}
+	if string(rec.RespBody) != string(respBody) {
+		t.Errorf("resp_body = %s; want %s", rec.RespBody, respBody)
+	}
+
+	// A request id that was never captured must report ErrNotFound, not a bare
+	// database error, so the admin layer can distinguish absent from broken.
+	if _, err := s.RawBody("no-such-request"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RawBody(missing) err = %v; want ErrNotFound", err)
 	}
 }
 

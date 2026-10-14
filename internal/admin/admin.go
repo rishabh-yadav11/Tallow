@@ -7,11 +7,14 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/rishabh-yadav11/tallow/internal/model"
 	"github.com/rishabh-yadav11/tallow/internal/observ"
@@ -34,7 +37,30 @@ type Backend interface {
 	Reload() error
 	Version() string
 	ConfigPath() string
+
+	// ConfigRead returns the live config at the given scope (empty = the full
+	// document, otherwise section and optional field) serialized as JSON.
+	ConfigRead(scope []string) (json.RawMessage, error)
+	// ConfigWrite applies a config mutation at scope. method is PUT (replace),
+	// PATCH (merge), or DELETE (remove). The value is persisted to disk and
+	// hot-reloaded only when it passes config.Load/Validate; an invalid change
+	// is refused without touching the running gateway.
+	ConfigWrite(method string, scope []string, body json.RawMessage) error
+	// ReplayRequest re-runs the stored request identified by id through the
+	// proxy pipeline, writing the original response shape to w.
+	ReplayRequest(w http.ResponseWriter, id string) error
+	// KeyRefs lists the refs in the encrypted keystore. Only refs are returned,
+	// never plaintext secrets.
+	KeyRefs() []string
+	// UploadKey encrypts plaintext under ref and persists it in the keystore.
+	UploadKey(ref string, plaintext []byte) error
+	// DeleteKey removes the credential referenced by ref.
+	DeleteKey(ref string) error
 }
+
+// ErrConfigNotFound is returned by ConfigRead when no section/field exists at the
+// requested scope. The admin layer maps it to a 404 instead of a generic error.
+var ErrConfigNotFound = errors.New("config: section/field not found")
 
 // ProviderView is the admin/tool view of a provider + its keys.
 type ProviderView struct {
@@ -113,9 +139,11 @@ func New(b Backend, path string) *Server {
 		hit, miss, evict, size := b.CacheStats()
 		writeJSON(w, map[string]any{"hit": hit, "miss": miss, "evict": evict, "size": size})
 	}))
-	mux.HandleFunc("/config", s.handle(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"path": b.ConfigPath(), "version": b.Version()})
-	}))
+	mux.HandleFunc("/config", s.handle(s.config))
+	mux.HandleFunc("/config/", s.handle(s.config))
+	mux.HandleFunc("/keys", s.handle(s.keysCollection))
+	mux.HandleFunc("/keys/", s.handle(s.keysElement))
+	mux.HandleFunc("/replay/", s.handle(s.replay))
 	mux.HandleFunc("/reload", s.handle(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeErr(w, http.StatusMethodNotAllowed, "POST required")
@@ -129,6 +157,148 @@ func New(b Backend, path string) *Server {
 	}))
 	s.srv = &http.Server{Handler: mux}
 	return s
+}
+
+// configScope extracts the section/field path components from a /config URL,
+// returning ["server"] for /config/server and ["server", "listen"] for
+// /config/server/listen. It is nil for the bare /config document.
+func configScope(p string) []string {
+	s := strings.TrimPrefix(p, "/config")
+	s = strings.Trim(s, "/")
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "/")
+}
+
+// config serves GET/PUT/PATCH/DELETE on /config[/section][/field].
+//
+// GET reads the live config at the requested scope.
+// PUT replaces the value at the scope (full document, section, or field).
+// PATCH merges the value at the scope.
+// DELETE removes a field/section (refused for the full document).
+// All writes are validated and hot-reloaded by the backend before answering.
+func (s *Server) config(w http.ResponseWriter, r *http.Request) {
+	scope := configScope(r.URL.Path)
+	switch r.Method {
+	case http.MethodGet:
+		value, err := s.b.ConfigRead(scope)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrConfigNotFound):
+				writeErr(w, http.StatusNotFound, "config section/field not found")
+			default:
+				writeErr(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		writeJSON(w, json.RawMessage(value))
+	case http.MethodPut, http.MethodPatch:
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
+			return
+		}
+		if len(scope) == 0 && len(raw) == 0 {
+			writeErr(w, http.StatusBadRequest, "empty request body")
+			return
+		}
+		if !json.Valid(raw) {
+			writeErr(w, http.StatusBadRequest, "request body is not valid JSON")
+			return
+		}
+		if err := s.b.ConfigWrite(r.Method, scope, raw); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	case http.MethodDelete:
+		if len(scope) == 0 {
+			writeErr(w, http.StatusBadRequest, "cannot delete the whole config document")
+			return
+		}
+		if err := s.b.ConfigWrite(r.Method, scope, nil); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// keysCollection serves GET (list refs) and POST (upload a secret).
+func (s *Server) keysCollection(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]any{"refs": s.b.KeyRefs()})
+	case http.MethodPost:
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
+			return
+		}
+		var p struct {
+			Ref    string `json:"ref"`
+			Secret string `json:"secret"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			writeErr(w, http.StatusBadRequest, "request body must be JSON {ref, secret}")
+			return
+		}
+		if p.Ref == "" || p.Secret == "" {
+			writeErr(w, http.StatusBadRequest, "both ref and secret are required")
+			return
+		}
+		if err := s.b.UploadKey(p.Ref, []byte(p.Secret)); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "ref": p.Ref})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// keysElement serves DELETE /keys/{ref}.
+func (s *Server) keysElement(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ref := strings.TrimPrefix(r.URL.Path, "/keys/")
+	if ref == "" {
+		writeErr(w, http.StatusBadRequest, "missing key ref")
+		return
+	}
+	if err := s.b.DeleteKey(ref); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// replay serves POST /replay/{id}, re-running a stored request through the
+// proxy pipeline and writing the original response shape back to the caller.
+func (s *Server) replay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/replay/")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "missing request id")
+		return
+	}
+	if err := s.b.ReplayRequest(w, id); err != nil {
+		// The backend has written a real response on success, so only write an
+		// error envelope on the failure paths.
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "request not found: "+id)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 // handle injects CORS-free JSON content type and a read timeout.

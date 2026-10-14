@@ -50,6 +50,25 @@ type fakeBackend struct {
 	lastRequestsN int
 	lastRollupsN  int
 	lastAuditN    int
+
+	// Config read/write surface.
+	configDoc             map[string]any
+	configWriteErr        error
+	lastConfigWriteMethod string
+	lastConfigWriteScope  []string
+	lastConfigWriteBody   []byte
+
+	// Keys surface.
+	keyRefs            []string
+	lastUploadedRef    string
+	lastUploadedSecret []byte
+	uploadErr          error
+	lastDeletedRef     string
+	deleteErr          error
+
+	// Replay surface.
+	replayErr    error
+	lastReplayID string
 }
 
 func (f *fakeBackend) Metrics() observ.Snapshot {
@@ -126,6 +145,96 @@ func (f *fakeBackend) ConfigPath() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return testConfigPath
+}
+
+// configWriteErr lets a test force a config-write failure.
+func (f *fakeBackend) ConfigRead(scope []string) (json.RawMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.configRead(scope)
+}
+
+func (f *fakeBackend) configRead(scope []string) (json.RawMessage, error) {
+	var cur any = map[string]any(f.configDoc)
+	for _, key := range scope {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return nil, ErrConfigNotFound
+		}
+		cur, ok = obj[key]
+		if !ok {
+			return nil, ErrConfigNotFound
+		}
+	}
+	b, err := json.Marshal(cur)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(b), nil
+}
+
+func (f *fakeBackend) ConfigWrite(method string, scope []string, body json.RawMessage) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastConfigWriteMethod = method
+	f.lastConfigWriteScope = append([]string(nil), scope...)
+	if f.configWriteErr != nil {
+		return f.configWriteErr
+	}
+	// Record the raw body so a test can assert what the admin forwarded.
+	f.lastConfigWriteBody = append(f.lastConfigWriteBody, body...)
+	return nil
+}
+
+// configDoc is a small canned JSON document the fake config endpoints read.
+func (f *fakeBackend) configDocInit() map[string]any {
+	return map[string]any{
+		"version": float64(1),
+		"server": map[string]any{
+			"listen":  "127.0.0.1:8080",
+			"timeout": "30s",
+		},
+		"auth": map[string]any{"open": true},
+	}
+}
+
+func (f *fakeBackend) ReplayRequest(w http.ResponseWriter, id string) error {
+	f.mu.Lock()
+	f.lastReplayID = id
+	f.mu.Unlock()
+	if f.replayErr != nil {
+		return f.replayErr
+	}
+	// The admin layer does not produce the response here; a real backend writes
+	// the proxy response. The fake synthesizes a minimal one so the test can
+	// assert the response shape is pass-through.
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"id":"replayed","object":"chat.completion"}`))
+	return nil
+}
+
+func (f *fakeBackend) KeyRefs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.keyRefs...)
+}
+
+func (f *fakeBackend) UploadKey(ref string, plaintext []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastUploadedRef = ref
+	f.lastUploadedSecret = append(f.lastUploadedSecret, plaintext...)
+	return f.uploadErr
+}
+
+func (f *fakeBackend) DeleteKey(ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastDeletedRef = ref
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	return nil
 }
 
 func (f *fakeBackend) reloadCount() int {
@@ -238,6 +347,15 @@ func populatedFake() *fakeBackend {
 			Detail: "ok",
 		}},
 		hit: 10, miss: 4, evict: 1, size: 7,
+		configDoc: map[string]any{
+			"version": float64(1),
+			"server": map[string]any{
+				"listen":  "127.0.0.1:8080",
+				"timeout": "30s",
+			},
+			"auth": map[string]any{"open": true},
+		},
+		keyRefs: []string{"keystore:key-1"},
 	}
 }
 
@@ -539,17 +657,47 @@ func TestAdminEndpoints(t *testing.T) {
 			name: "config", method: http.MethodGet, path: "/config",
 			want: func(t *testing.T, resp *http.Response, body []byte) {
 				wantStatus(t, resp, http.StatusOK)
-				var m struct {
-					Path    string `json:"path"`
-					Version string `json:"version"`
-				}
+				wantJSONContentType(t, resp)
+				var m map[string]any
 				decodeBody(t, body, &m)
-				if m.Path != testConfigPath {
-					t.Errorf("path = %q; want %q", m.Path, testConfigPath)
+				if m["version"] != float64(1) {
+					t.Errorf("version = %v; want 1", m["version"])
 				}
-				if m.Version != testVersion {
-					t.Errorf("version = %q; want %q", m.Version, testVersion)
+				serv, ok := m["server"].(map[string]any)
+				if !ok {
+					t.Fatalf("server section missing: %v", m)
 				}
+				if serv["listen"] != "127.0.0.1:8080" {
+					t.Errorf("listen = %v; want 127.0.0.1:8080", serv["listen"])
+				}
+			},
+		},
+		{
+			name: "config section", method: http.MethodGet, path: "/config/server",
+			want: func(t *testing.T, resp *http.Response, body []byte) {
+				wantStatus(t, resp, http.StatusOK)
+				var m map[string]any
+				decodeBody(t, body, &m)
+				if m["listen"] != "127.0.0.1:8080" {
+					t.Errorf("listen = %v; want 127.0.0.1:8080", m["listen"])
+				}
+			},
+		},
+		{
+			name: "config field", method: http.MethodGet, path: "/config/server/listen",
+			want: func(t *testing.T, resp *http.Response, body []byte) {
+				wantStatus(t, resp, http.StatusOK)
+				var s string
+				decodeBody(t, body, &s)
+				if s != "127.0.0.1:8080" {
+					t.Errorf("listen = %q; want 127.0.0.1:8080", s)
+				}
+			},
+		},
+		{
+			name: "config unknown section", method: http.MethodGet, path: "/config/nope",
+			want: func(t *testing.T, resp *http.Response, body []byte) {
+				wantStatus(t, resp, http.StatusNotFound)
 			},
 		},
 	}
