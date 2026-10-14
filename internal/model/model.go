@@ -18,7 +18,37 @@ type Provider struct {
 	HealthInterval time.Duration
 	RPM            int // optional aggregate provider-level RPM cap.
 	Timeout        time.Duration
-	Keys           []Key
+	// Disabled is excluded from routing but kept in config.
+	Disabled bool
+	// Headers is the per-provider upstream header default, inherited by keys
+	// that do not set their own.
+	Headers map[string]string
+	// ProxyURL overrides the transport proxy for this provider; "direct"
+	// bypasses the global and environment proxies. A key's own overrides it.
+	ProxyURL string
+	// Catalog carries the opt-in model catalog fetcher config, if any.
+	Catalog *ConfigCatalog
+	// ExcludedModels is a wildcard list hiding provider models from routing.
+	ExcludedModels []string
+	// RequestRetry is the provider-level retry-rounds override (nil = inherit).
+	RequestRetry *int
+	// ErrorRules is the provider-level request-scoped error rule list.
+	ErrorRules []ErrorRule
+	Keys       []Key
+}
+
+// ConfigCatalog is the runtime form of the opt-in catalog fetcher config.
+type ConfigCatalog struct {
+	Enabled bool
+	URL     string
+}
+
+// ErrorRule is the runtime form of a request-scoped upstream error rule.
+type ErrorRule struct {
+	Status      int
+	Match       []string
+	MatchRegexp []string
+	Action      string
 }
 
 // Key is a single account/credential within a provider, plus its hard limits.
@@ -39,18 +69,38 @@ type Key struct {
 	// runtime budget tracker enforces; keeping both here lets config keep its
 	// human-friendly cent unit while the budget compares without truncation.
 	CostLimitMicros int64
+
+	// Weight is the key's selection share under weighted-round-robin (default 1).
+	Weight int
+	// Priority orders keys under fill-first; larger wins placement in the pool.
+	Priority int
+	// Headers is the per-key upstream header override. Values starting with `$`
+	// copy the named downstream request header at runtime (omitted when the
+	// client did not send it); plain values are sent verbatim. Nil merges onto
+	// the provider default.
+	Headers map[string]string
+	// ProxyURL overrides the transport proxy for this key.
+	ProxyURL string
+	// RequestRetry overrides the retry-rounds for this key (nil = inherit).
+	RequestRetry *int
+	// DisableCooling overrides cooldowns for this single credential.
+	DisableCooling *bool
+	// ErrorRules overrides the provider-level request-scoped error rules.
+	ErrorRules []ErrorRule
 }
 
 // Alias maps a client-facing model name to an ordered list of provider
 // targets. The order is the fallback order for failover.
 type Alias struct {
-	Name    string
-	Targets []Target
+	Name string
+	// ExcludedModels is a wildcard list hiding upstream models from this alias.
+	ExcludedModels []string
+	Targets        []Target
 }
 
 // Target binds an alias to a specific provider + upstream model string, with
 // manually-declared capabilities and pricing. Auto-detection is explicitly out
-// of scope.
+// of scope (except through the optional catalog fetcher).
 type Target struct {
 	Provider       string
 	Model          string // the upstream model string to actually send.
@@ -62,6 +112,12 @@ type Target struct {
 	// Pricing, USD per 1M tokens. 0 = unknown, reported as $0.
 	PriceInputPerM  float64
 	PriceOutputPerM float64
+
+	// ForceMapping rewrites the upstream response `model` field back to the
+	// alias name.
+	ForceMapping bool
+	// DisplayName is an alias-facing label shown in /v1/models and the admin UI.
+	DisplayName string
 }
 
 // RequestMeta is the per-request record: what routed where, cost, tokens,

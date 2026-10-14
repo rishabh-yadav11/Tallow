@@ -29,11 +29,24 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 			HealthInterval: hi,
 			RPM:            p.RPM,
 			Timeout:        to,
+			Disabled:       p.Disabled,
+			Headers:        cloneHeaders(p.Headers),
+			ProxyURL:       p.ProxyURL,
+			ExcludedModels: p.ExcludedModels,
+			RequestRetry:   copyIntPtr(p.RequestRetry),
+			ErrorRules:     copyErrorRules(p.ErrorRules),
+		}
+		if p.Catalog != nil {
+			mp.Catalog = &model.ConfigCatalog{Enabled: p.Catalog.Enabled, URL: p.Catalog.URL}
 		}
 		for _, k := range p.Key {
 			w, err := Dur(k.Window)
 			if err != nil {
 				return nil, nil, fmt.Errorf("provider %q key %q: window: %w", p.Name, k.ID, err)
+			}
+			weight := k.Weight
+			if weight <= 0 {
+				weight = 1
 			}
 			mp.Keys = append(mp.Keys, model.Key{
 				ID:             k.ID,
@@ -47,6 +60,13 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 				// budget enforces it in micro-USD so sub-cent spend is
 				// accounted instead of truncated away.
 				CostLimitMicros: money.CentsToMicroUSD(k.CostLimitCents),
+				Weight:          weight,
+				Priority:        k.Priority,
+				Headers:         cloneHeaders(k.Headers),
+				ProxyURL:        k.ProxyURL,
+				RequestRetry:    copyIntPtr(k.RequestRetry),
+				DisableCooling:  k.DisableCooling,
+				ErrorRules:      copyErrorRules(k.ErrorRules),
 			})
 		}
 		provs = append(provs, mp)
@@ -54,22 +74,63 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 
 	aliases := make([]model.Alias, 0, len(c.Alias))
 	for _, a := range c.Alias {
-		ma := model.Alias{Name: a.Name}
+		ma := model.Alias{Name: a.Name, ExcludedModels: a.ExcludedModels}
 		for _, t := range a.Target {
+			ctxWin := t.ContextWindow
+			if ctxWin == 0 && t.MaxContextLength != 0 {
+				ctxWin = t.MaxContextLength
+			}
 			ma.Targets = append(ma.Targets, model.Target{
 				Provider:        t.Provider,
 				Model:           t.Model,
-				ContextWindow:   t.ContextWindow,
+				ContextWindow:   ctxWin,
 				SupportsTools:   t.SupportsTools,
 				SupportsVision:  t.SupportsVision,
 				SupportsStream:  t.SupportsStream,
 				PriceInputPerM:  t.PriceInputPerM,
 				PriceOutputPerM: t.PriceOutputPerM,
+				ForceMapping:    t.ForceMapping,
+				DisplayName:     t.DisplayName,
 			})
 		}
 		aliases = append(aliases, ma)
 	}
 	return provs, aliases, nil
+}
+
+func cloneHeaders(h map[string]string) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		out[k] = v
+	}
+	return out
+}
+
+func copyIntPtr(p *int) *int {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func copyErrorRules(in []ErrorRule) []model.ErrorRule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]model.ErrorRule, 0, len(in))
+	for _, r := range in {
+		out = append(out, model.ErrorRule{
+			Status:      r.Status,
+			Match:       append([]string(nil), r.Match...),
+			MatchRegexp: append([]string(nil), r.MatchRegexp...),
+			Action:      r.Action,
+		})
+	}
+	return out
 }
 
 // Params bundles the parsed runtime knobs derived from config durations.

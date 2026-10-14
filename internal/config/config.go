@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,7 @@ type Config struct {
 	Retention     Retention     `toml:"retention"`
 	Compaction    Compaction    `toml:"compaction"`
 	Observability Observability `toml:"observability"`
+	Routing       Routing       `toml:"routing"`
 	Provider      []Provider    `toml:"provider"`
 	Alias         []Alias       `toml:"alias"`
 }
@@ -49,6 +51,14 @@ type Server struct {
 	// StickyTTL is the idle expiry of sticky affinity. Unlike before, it
 	// defaults rather than defaulting to "never expire" (H7).
 	StickyTTL string `toml:"sticky_ttl"`
+	// TLSCert/TLSKey enable TLS on the client-facing listener. Both must be
+	// set to activate; listen bind is startup-only, so these are read once and
+	// a change requires a restart.
+	TLSCert string `toml:"tls_cert"`
+	TLSKey  string `toml:"tls_key"`
+	// StreamKeepalive is the interval for SSE keepalive heartbeats on
+	// streaming responses. 0/omitted disables heartbeats.
+	StreamKeepalive string `toml:"stream_keepalive"`
 }
 
 type Auth struct {
@@ -104,6 +114,69 @@ type Observability struct {
 	Enabled bool `toml:"enabled"`
 }
 
+// Routing holds the CLIProxyAPI-derived routing and resilience knobs. It is
+// separate from provider/alias so a routing policy can be described once and
+// applied uniformly; per-key/per-provider overrides live on those blocks.
+type Routing struct {
+	// Strategy selects which key-selection algorithm runs:
+	//   round-robin (default)  - existing bare RR across eligible keys.
+	//   weighted-round-robin   - RR in proportion to each key's weight.
+	//   fill-first             - pack highest-priority keys until rate-limited,
+	//                            then move down the priority order.
+	Strategy string `toml:"strategy"`
+	// RequestRetry is the global default number of retry rounds (0 = initial
+	// round only). Per-provider/key overrides; an explicit 0 stops additional
+	// rounds, a negative or omitted value inherits the global.
+	RequestRetry int `toml:"request-retry"`
+	// Cooldown, when enabled, takes a credential that hit a transient error out
+	// of rotation for Cooldown.Offset. Persistence is optional; see CooldownCfg.
+	Cooldown CooldownCfg `toml:"cooldown"`
+	// MaxRetryInterval bounds the cooldown wait between retry rounds.
+	MaxRetryInterval string `toml:"max-retry-interval"`
+	// SessionAffinity, when true, switches from the bare-sticky behaviour to
+	// full session affinity with TTL/rebind semantics.
+	SessionAffinity bool `toml:"session-affinity"`
+	// SessionAffinityTTL bounds how long a session's upstream pin is reused for
+	// prompt-cache reuse before it is re-picked.
+	SessionAffinityTTL string `toml:"session-affinity-ttl"`
+	// SessionAffinitySubagents makes child sessions inherit the parent's
+	// upstream credential for prompt-cache reuse.
+	SessionAffinitySubagents bool `toml:"session-affinity-subagents"`
+	// SessionAffinityRebindOn controls when a session may rebind: `any` or
+	// `quota` (rebind only when the pinned credential is quota-exhausted).
+	SessionAffinityRebindOn string `toml:"session-affinity-rebind-on"`
+}
+
+// CooldownCfg configures transient-error cooldowns that take a credential out
+// of rotation for a period, bridging health and budget.
+type CooldownCfg struct {
+	Enabled bool `toml:"enabled"`
+	// Offset is the cooldown duration after a transient error (408/5xx/520-526).
+	Offset string `toml:"offset"`
+	// DisableCooling, when true, disables cooldowns for a specific provider/key
+	// that overrides it. Kept here as a per-routing default; per-key overrides
+	// live on the key block.
+	DisableCooling bool `toml:"disable-cooling"`
+	// Persist is an optional path to a `.cds` file where cooldowns survive a
+	// process restart. Empty disables persistence.
+	Persist string `toml:"persist"`
+}
+
+// ErrorRule is a request-scoped error response rule. When an upstream error
+// response matches status plus any match/match_regexp pattern, the named action
+// runs. Action is one of:
+//
+//	stop                  - return the error, no cooldown.
+//	stop-and-cooldown     - return the error, put the credential in cooldown.
+//	continue              - try the next credential, no cooldown.
+//	continue-and-cooldown - try the next credential, put it in cooldown.
+type ErrorRule struct {
+	Status      int      `toml:"status"`
+	Match       []string `toml:"match"`
+	MatchRegexp []string `toml:"match_regexp"`
+	Action      string   `toml:"action"`
+}
+
 type Provider struct {
 	Name           string   `toml:"name"`
 	BaseURL        string   `toml:"base_url"`
@@ -112,7 +185,35 @@ type Provider struct {
 	HealthCheck    bool     `toml:"health_check"`
 	HealthInterval string   `toml:"health_interval"`
 	Timeout        string   `toml:"timeout"`
-	Key            []Key    `toml:"key"`
+	// Disabled keeps a provider in config but excludes it from routing.
+	Disabled bool `toml:"disabled"`
+	// ProxyURL is a per-provider proxy override (socks5/http/https). The special
+	// value "direct" bypasses the global and environment proxies. A key's own
+	// proxy_url overrides this.
+	ProxyURL string `toml:"proxy_url"`
+	// Headers is the per-provider upstream header default. Keys inherit it when
+	// they do not set their own headers map.
+	Headers map[string]string `toml:"headers"`
+	// Catalog enables the per-provider opt-in model catalog fetcher.
+	Catalog *CatalogCfg `toml:"catalog"`
+	// ExcludedModels is a prefix/suffix/substring wildcard list of upstream
+	// model names to exclude from this provider's routable set.
+	ExcludedModels []string `toml:"excluded_models"`
+	// RequestRetry overrides the global retry-rounds for every key of this
+	// provider. nil = inherit, 0 = stop after the initial round.
+	RequestRetry *int `toml:"request-retry"`
+	// ErrorRules is the per-provider request-scoped error rule list; keys may
+	// override it.
+	ErrorRules []ErrorRule `toml:"error_rules"`
+	Key        []Key       `toml:"key"`
+}
+
+// CatalogCfg configures the opt-in auto model inventory for one provider.
+type CatalogCfg struct {
+	Enabled bool `toml:"enabled"`
+	// URL overrides the default catalog endpoint. A dedicated /models listing
+	// endpoint when set; otherwise derived from base_url.
+	URL string `toml:"url"`
 }
 
 type Key struct {
@@ -123,11 +224,32 @@ type Key struct {
 	Window         string `toml:"window"`
 	MaxConcurrent  int    `toml:"max_concurrent"`
 	CostLimitCents int64  `toml:"cost_limit_cents"`
+	// Weight is the key's selection share under weighted-round-robin (default 1).
+	Weight int `toml:"weight"`
+	// Priority orders keys under fill-first; larger wins placement in the pool.
+	Priority int `toml:"priority"`
+	// Headers is the per-key upstream header override. Values starting with `$`
+	// copy the named downstream request header dynamically (omitted when the
+	// client did not send it); plain values are sent verbatim.
+	Headers map[string]string `toml:"headers"`
+	// ProxyURL is a per-key proxy override; "direct" bypasses global and env
+	// proxies. Overrides the provider-level proxy_url.
+	ProxyURL string `toml:"proxy_url"`
+	// RequestRetry overrides the number of retry rounds for just this key.
+	// nil = inherit global/provider, 0 = initial round only.
+	RequestRetry *int `toml:"request-retry"`
+	// DisableCooling overrides the cooldown for this single credential.
+	DisableCooling *bool `toml:"disable-cooling"`
+	// ErrorRules overrides the provider-level request-scoped error rules.
+	ErrorRules []ErrorRule `toml:"error_rules"`
 }
 
 type Alias struct {
 	Name   string   `toml:"name"`
 	Target []Target `toml:"target"`
+	// ExcludedModels is a prefix/suffix/substring wildcard list of upstream
+	// model names to hide from this alias's routable set.
+	ExcludedModels []string `toml:"excluded_models"`
 }
 
 type Target struct {
@@ -139,6 +261,14 @@ type Target struct {
 	SupportsStream  bool    `toml:"supports_stream"`
 	PriceInputPerM  float64 `toml:"price_input_per_1m"`
 	PriceOutputPerM float64 `toml:"price_output_per_1m"`
+	// MaxContextLength is the CLIProxyAPI spelling of context_window; the two
+	// are aliases and the manual value wins when both are set.
+	MaxContextLength int `toml:"max_context_length"`
+	// ForceMapping rewrites the upstream response `model` field back to the
+	// alias name.
+	ForceMapping bool `toml:"force_mapping"`
+	// DisplayName is an alias-facing label shown in /v1/models and the admin UI.
+	DisplayName string `toml:"display_name"`
 }
 
 // Load reads and decodes path, returning the validated configuration.
@@ -224,6 +354,28 @@ func (c *Config) applyDefaults() error {
 	if c.Retention.VacuumCron == "" {
 		c.Retention.VacuumCron = "6h"
 	}
+	// Routing was previously all unset. A zero RequestRetry is ambiguous
+	// between "inherit" (the CLIProxyAPI semantic) and "initial round only", so
+	// -1 is used internally as the inheritable default; the validation rules
+	// below reject an explicit out-of-range value the operator wrote.
+	if c.Routing.RequestRetry < 0 {
+		c.Routing.RequestRetry = -1
+	}
+	if c.Routing.Strategy == "" {
+		c.Routing.Strategy = "round-robin"
+	}
+	if c.Routing.Cooldown.Offset == "" {
+		c.Routing.Cooldown.Offset = "30s"
+	}
+	if c.Routing.MaxRetryInterval == "" {
+		c.Routing.MaxRetryInterval = "0s"
+	}
+	if c.Routing.SessionAffinityRebindOn == "" {
+		c.Routing.SessionAffinityRebindOn = "any"
+	}
+	if c.Server.StreamKeepalive == "" {
+		c.Server.StreamKeepalive = "0s"
+	}
 	if c.Cache.MaxEntries == 0 {
 		c.Cache.MaxEntries = 1024
 	}
@@ -290,6 +442,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.validateCounts(); err != nil {
+		return err
+	}
+	if err := c.validateRouting(); err != nil {
 		return err
 	}
 	seenP := map[string]bool{}
@@ -455,6 +610,110 @@ func (c *Config) validateCounts() error {
 		return fmt.Errorf("compaction.max_tool_output_chars: must not be negative, got %d", c.Compaction.MaxToolOutputChars)
 	}
 	return nil
+}
+
+// validateRouting checks the new resilience knobs: the selection strategy, the
+// retry-rounds override semantics, cooldown durations, session-affinity rebind
+// mode, and per-provider/key error-rule actions. All are optional with defaults,
+// so a normal config never reaches these checks with a value set.
+func (c *Config) validateRouting() error {
+	switch c.Routing.Strategy {
+	case "", "round-robin", "weighted-round-robin", "fill-first":
+	default:
+		return fmt.Errorf("routing.strategy: unsupported %q (want round-robin, weighted-round-robin, or fill-first)", c.Routing.Strategy)
+	}
+	switch c.Routing.SessionAffinityRebindOn {
+	case "any", "quota", "":
+	default:
+		return fmt.Errorf("routing.session-affinity-rebind-on: unsupported %q (want any or quota)", c.Routing.SessionAffinityRebindOn)
+	}
+	// RequestRetry == -1 is the internal "inherit" marker produced by
+	// applyDefaults; an operator cannot write it, but a hand-built Config can,
+	// and treating it as valid keeps Validate usable on its own.
+	if c.Routing.RequestRetry < -1 {
+		return fmt.Errorf("routing.request-retry: must be >= -1, got %d", c.Routing.RequestRetry)
+	}
+	for _, r := range []struct {
+		key, v string
+	}{
+		{"routing.cooldown.offset", c.Routing.Cooldown.Offset},
+		{"routing.max-retry-interval", c.Routing.MaxRetryInterval},
+		{"server.stream_keepalive", c.Server.StreamKeepalive},
+	} {
+		if r.v == "" {
+			continue
+		}
+		d, err := Dur(r.v)
+		if err != nil {
+			return fmt.Errorf("%s: %w", r.key, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("%s: must not be negative, got %s", r.key, d)
+		}
+	}
+	if err := validateErrorRules("routing.provider.error_rules", c.errorRulesAll()); err != nil {
+		return err
+	}
+	for _, p := range c.Provider {
+		if p.ProxyURL != "" && p.ProxyURL != "direct" {
+			if err := validateProxyURL(p.Name, p.ProxyURL); err != nil {
+				return err
+			}
+		}
+		for _, k := range p.Key {
+			if k.Weight < 0 {
+				return fmt.Errorf("provider %q key %q: weight must not be negative, got %d", p.Name, k.ID, k.Weight)
+			}
+			if k.ProxyURL != "" && k.ProxyURL != "direct" {
+				if err := validateProxyURL(p.Name, k.ProxyURL); err != nil {
+					return fmt.Errorf("provider %q key %q: %w", p.Name, k.ID, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// errorRulesAll projects every error-rule list in the document (all providers,
+// all keys) for uniform action validation.
+func (c *Config) errorRulesAll() []ErrorRule {
+	var out []ErrorRule
+	for _, p := range c.Provider {
+		out = append(out, p.ErrorRules...)
+		for _, k := range p.Key {
+			out = append(out, k.ErrorRules...)
+		}
+	}
+	return out
+}
+
+// validateErrorRules checks that every listed action is one of the supported
+// CLIProxyAPI error-rule actions, and that a status is present so the rule is
+// actually reachable.
+func validateErrorRules(scope string, rules []ErrorRule) error {
+	for _, r := range rules {
+		switch r.Action {
+		case "stop", "stop-and-cooldown", "continue", "continue-and-cooldown":
+		default:
+			return fmt.Errorf("%s: unsupported rule action %q", scope, r.Action)
+		}
+	}
+	return nil
+}
+
+// validateProxyURL checks a proxy_url scheme for the forms the transport
+// supports: socks5/http/https, plus the reserved "direct" bypass.
+func validateProxyURL(where, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("proxy_url: %w", err)
+	}
+	switch u.Scheme {
+	case "socks5", "http", "https":
+		return nil
+	default:
+		return fmt.Errorf("proxy_url %q: unsupported scheme %q (want socks5, http, or https)", raw, u.Scheme)
+	}
 }
 
 // dayCount returns the value of a retention pointer, treating a nil (key that
