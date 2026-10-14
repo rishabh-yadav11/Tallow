@@ -10,8 +10,10 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rishabh-yadav11/tallow/internal/config"
@@ -116,13 +118,15 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 	if sel.Secret != "" {
 		req.Header.Set("Authorization", "Bearer "+sel.Secret)
 	}
-	if ferr := proxyTargetGuard(h.deps.Client, req); ferr != nil {
+	applySelectedHeaders(req, r.Header, sel.Headers)
+	client := h.clientFor(sel)
+	if ferr := proxyTargetGuard(client, req); ferr != nil {
 		if cancel != nil {
 			cancel()
 		}
 		return nil, ferr
 	}
-	resp, err := h.deps.Client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		if cancel != nil {
 			cancel()
@@ -145,6 +149,52 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 	}
 	return resp, nil
+}
+
+// applySelectedHeaders copies a selection's configured upstream headers onto
+// the outbound request. A value starting with `$` names a downstream request
+// header to copy dynamically; it is omitted when the client did not send it.
+func applySelectedHeaders(req *http.Request, downstream http.Header, headers map[string]string) {
+	for k, v := range headers {
+		if strings.HasPrefix(v, "$") {
+			if dv, ok := downstream[strings.TrimPrefix(v, "$")]; ok && len(dv) > 0 {
+				req.Header.Set(k, dv[0])
+			}
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+}
+
+// clientFor returns the HTTP client for a selection. Most selections share the
+// handler's single client. A selection carrying a per-key/provider proxy_url gets
+// a memoized clone whose transport Proxy is swapped so the override applies
+// without a fresh transport per request.
+func (h *Handler) clientFor(sel *routing.Selection) *http.Client {
+	if sel == nil || sel.ProxyURL == "" {
+		return h.deps.Client
+	}
+	h.tmu.Lock()
+	defer h.tmu.Unlock()
+	if c, ok := h.proxyClients[sel.ProxyURL]; ok {
+		return c
+	}
+	base, ok := h.deps.Client.Transport.(*http.Transport)
+	if !ok {
+		return h.deps.Client
+	}
+	tr := base.Clone()
+	if sel.ProxyURL != "direct" {
+		if u, err := url.Parse(sel.ProxyURL); err == nil {
+			tr.Proxy = http.ProxyURL(u)
+		}
+	} else {
+		// "direct" bypasses the global and environment proxies.
+		tr.Proxy = nil
+	}
+	c := &http.Client{Transport: tr, CheckRedirect: h.deps.Client.CheckRedirect}
+	h.proxyClients[sel.ProxyURL] = c
+	return c
 }
 
 // proxyTargetGuard applies the M14 address policy to the request's destination
@@ -246,6 +296,12 @@ const streamPreHeaderLimit = 256 << 10
 // streamForward buffers only until the first token (first SSE data line),
 // then passes through. Failure before the first token is a retryable error the
 // client never sees; failure after is surfaced as an interruption.
+//
+// When StreamKeepalive is set, an idle stream gets `: keepalive\n\n` comment
+// lines so a fronting proxy does not time out an in-progress completion. The
+// heartbeat runs only AFTER the first data line (before it, the buffered
+// preamble is short enough that no timeout warrants a comment) and stops when
+// the stream ends.
 func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response) (result, *forwardError) {
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
@@ -257,7 +313,21 @@ func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response) (res
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	var mu sync.Mutex
 	flusher, _ := w.(http.Flusher)
+	// All writes + flushes go through write, which serializes the read loop and
+	// the heartbeat goroutine so a keepalive comment can never land mid-line.
+	write := func(b []byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		_, _ = w.Write(b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	start, stop := startKeepalive(write, h.deps.StreamKeepalive)
+	defer stop()
 
 	br := bufio.NewReaderSize(resp.Body, 64*1024)
 	var pre bytes.Buffer
@@ -294,23 +364,49 @@ func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response) (res
 			if isDataLine(line) {
 				started = true
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write(pre.Bytes())
+				write(pre.Bytes())
 				pre.Reset()
-				if flusher != nil {
-					flusher.Flush()
-				}
+				start()
 			}
 			continue
 		}
 
-		_, _ = w.Write(line)
-		if flusher != nil {
-			flusher.Flush()
-		}
+		write(line)
 		if p, c, ok := dataUsage(line); ok {
 			prompt, completion = p, c
 		}
 	}
+}
+
+// startKeepalive launches the SSE heartbeat pump. The returned start must be called
+// once the stream has seen a first data line; stop must be called when the stream
+// ends (deferred by streamForward). If stop arrives before start, the goroutine
+// exits without ever writing.
+func startKeepalive(write func([]byte), interval time.Duration) (start, stop func()) {
+	noop := func() {}
+	if interval <= 0 {
+		return noop, noop
+	}
+	startCh := make(chan struct{})
+	stopCh := make(chan struct{})
+	go func() {
+		select {
+		case <-startCh:
+		case <-stopCh:
+			return
+		}
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				write([]byte(": keepalive\n\n"))
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+	return func() { close(startCh) }, func() { close(stopCh) }
 }
 
 func isDataLine(line []byte) bool {

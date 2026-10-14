@@ -49,7 +49,7 @@ func TestH6ServerTimeoutsAreAlwaysBounded(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := newProxyServer("127.0.0.1:0", http.NotFoundHandler(), tc.params)
+			srv := newProxyServer("127.0.0.1:0", http.NotFoundHandler(), tc.params, nil)
 			if srv.ReadHeaderTimeout <= 0 {
 				t.Fatalf("H6: ReadHeaderTimeout = %s, which net/http reads as NO LIMIT", srv.ReadHeaderTimeout)
 			}
@@ -76,7 +76,7 @@ func TestH6DefaultsProduceBoundedServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildParams: %v", err)
 	}
-	srv := newProxyServer("127.0.0.1:0", http.NotFoundHandler(), p)
+	srv := newProxyServer("127.0.0.1:0", http.NotFoundHandler(), p, nil)
 	if srv.ReadHeaderTimeout <= 0 {
 		t.Fatalf("the default config left ReadHeaderTimeout unbounded (%s)", srv.ReadHeaderTimeout)
 	}

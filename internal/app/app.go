@@ -6,6 +6,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -125,6 +126,12 @@ func (a *App) load(path string) error {
 	obs := observ.New(cfg.Observability.Enabled)
 	client := newHTTPClient()
 
+	sk, _ := config.Dur(cfg.Server.StreamKeepalive)
+	tlsCfg, err := serverTLS(cfg.Server)
+	if err != nil {
+		return err
+	}
+
 	ph := proxy.NewHandler(proxy.Deps{
 		Router:        router,
 		Registry:      reg,
@@ -141,6 +148,7 @@ func (a *App) load(path string) error {
 		// H6: the body cap is a server-level concern, so it is resolved once
 		// here and enforced by the handler with http.MaxBytesReader.
 		MaxRequestBytes: params.MaxBodyBytes,
+		StreamKeepalive: sk,
 	})
 
 	a.mu.Lock()
@@ -159,7 +167,7 @@ func (a *App) load(path string) error {
 
 	a.setAuth(cfg.Auth.APIKeys, cfg.Auth.Open)
 	a.adminSrv = admin.New(a, cfg.Server.AdminSocket)
-	a.proxySrv = newProxyServer(cfg.Server.Listen, ph.Routes(), params)
+	a.proxySrv = newProxyServer(cfg.Server.Listen, ph.Routes(), params, tlsCfg)
 	return nil
 }
 
@@ -181,7 +189,7 @@ const maxHeaderBytes = 1 << 20
 // upper bound of its own and the per-provider upstream timeout already governs
 // how long a request may take. IdleTimeout bounds the keep-alive pool so idle
 // connections do not accumulate.
-func newProxyServer(addr string, handler http.Handler, params config.Params) *http.Server {
+func newProxyServer(addr string, handler http.Handler, params config.Params, tlsCfg *tls.Config) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -189,12 +197,23 @@ func newProxyServer(addr string, handler http.Handler, params config.Params) *ht
 		ReadHeaderTimeout: readHeaderTimeout(params),
 		WriteTimeout:      params.WriteTimeout,
 		IdleTimeout:       params.IdleTimeout,
-		// Stated explicitly rather than inherited. net/http's default is 1 MiB,
-		// which is already a bound, but a limit that is only implicit in another
-		// package's default is a limit nobody can audit. 1 MiB is generous for
-		// OpenAI-compatible requests, whose bodies are JSON, not file uploads.
-		MaxHeaderBytes: maxHeaderBytes,
+		MaxHeaderBytes:    maxHeaderBytes,
+		TLSConfig:         tlsCfg,
 	}
+}
+
+// loadTLSConfig builds the HTTPS server config from the configured cert and
+// key file. It fails fast (before any socket is bound) on a partially-declared
+// TLS, or when the cert cannot be loaded.
+func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load tls cert/key: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 // readHeaderTimeout derives the header-read bound.
@@ -464,6 +483,20 @@ func (a *App) Reload() error {
 	return nil
 }
 
+// serverTLS returns the HTTPS listener config when TLS is enabled, or nil when
+// neither tls_cert nor tls_key is set. Setting exactly one is a config error:
+// the listener would otherwise promise TLS it cannot serve.
+func serverTLS(s config.Server) (*tls.Config, error) {
+	cert, key := s.TLSCert, s.TLSKey
+	if cert == "" && key == "" {
+		return nil, nil
+	}
+	if cert == "" || key == "" {
+		return nil, fmt.Errorf("tls requires both server.tls_cert and server.tls_key; got only one")
+	}
+	return loadTLSConfig(cert, key)
+}
+
 // Run starts all servers and background workers, blocking until ctx cancels.
 func (a *App) Run(ctx context.Context) error {
 	errc := make(chan error, 4)
@@ -473,7 +506,8 @@ func (a *App) Run(ctx context.Context) error {
 	go func() { errc <- a.watchConfig(ctx) }()
 	go func() { errc <- a.adminSrv.Serve(ctx) }()
 	go func() {
-		if err := a.proxySrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		err := a.serveProxy()
+		if err != nil && err != http.ErrServerClosed {
 			errc <- err
 		}
 	}()
@@ -486,6 +520,18 @@ func (a *App) Run(ctx context.Context) error {
 		a.shutdown()
 		return nil
 	}
+}
+
+// serveProxy starts the client-facing listener, TLS when configured, plain
+// HTTP otherwise. The server's TLSConfig is set at build time in newProxyServer.
+func (a *App) serveProxy() error {
+	// TLSConfig set means TLS was configured and the cert already loaded; pass
+	// empty paths so net/http uses the server's own TLSConfig rather than
+	// re-reading the files (which would also defeat the fail-fast startup load).
+	if a.proxySrv.TLSConfig != nil {
+		return a.proxySrv.ListenAndServeTLS("", "")
+	}
+	return a.proxySrv.ListenAndServe()
 }
 
 // shutdown gracefully stops the proxy and admin servers within a bounded deadline

@@ -212,6 +212,14 @@ type Selection struct {
 	Secret  string
 	Timeout time.Duration
 
+	// ProxyURL is the per-key/provider proxy override resolved at selection
+	// time; "direct" bypasses the global and environment proxies. Consumed by
+	// the proxy sender (internal/proxy/upstream.go).
+	ProxyURL string
+	// Headers is the merged per-key/provider upstream header map. Values
+	// starting with `$` copy the named downstream request header at send time.
+	Headers map[string]string
+
 	kb *budget.KeyBudget
 	// pb records a provider-level RPM charge this selection consumed but that
 	// Select then ABANDONED, so it must be handed back.
@@ -606,18 +614,40 @@ func (r *Router) acquire(provider, key, model string, target model.Target, now t
 	return sel, nil
 }
 
-// fillDest resolves base URL, key secret, and timeout onto a selection.
+// fillDest resolves base URL, key secret, timeout, proxy override, and headers onto a
+// selection. Headers merge the provider default under the key's own override.
 func fillDest(reg *registry.Registry, sel *Selection) {
 	if p, ok := reg.Provider(sel.Provider); ok {
 		sel.BaseURL = p.BaseURL
 		sel.Timeout = p.Timeout
-		for _, k := range p.Keys {
-			if k.ID == sel.Key {
-				sel.Secret = k.Secret
+		for i := range p.Keys {
+			if p.Keys[i].ID == sel.Key {
+				sel.Secret = p.Keys[i].Secret
+				sel.ProxyURL = p.Keys[i].ProxyURL
+				sel.Headers = mergeHeaders(p.Headers, p.Keys[i].Headers)
 				break
 			}
 		}
 	}
+}
+
+// mergeHeaders overlays the key's header override onto the provider default. A nil
+// key map or empty key override inherits the provider's defaults.
+func mergeHeaders(provider, key map[string]string) map[string]string {
+	if len(provider) == 0 {
+		return key
+	}
+	if len(key) == 0 {
+		return provider
+	}
+	out := make(map[string]string, len(provider)+len(key))
+	for k, v := range provider {
+		out[k] = v
+	}
+	for k, v := range key {
+		out[k] = v
+	}
+	return out
 }
 
 // acquireKey selects a key within a provider (round-robin), consuming its

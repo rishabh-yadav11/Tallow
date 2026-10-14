@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -39,6 +40,9 @@ type Deps struct {
 	// MaxRequestBytes caps the buffered request body. Zero or negative means
 	// unbounded, which is the pre-H6 behaviour and is never the default.
 	MaxRequestBytes int64
+	// StreamKeepalive is the interval for SSE `: keepalive` comment lines on
+	// streaming responses, sent only AFTER the first data line. Zero disables.
+	StreamKeepalive time.Duration
 }
 
 // Handler implements the OpenAI-compatible surface.
@@ -47,6 +51,13 @@ type Handler struct {
 	slots chan struct{}
 	// inflight coalesces concurrent cache misses on the same key (H8).
 	inflight singleflight.Group
+	// tmu guards proxyClients, a cache of per-selection proxy transports.
+	// Selections carry a per-key/provider proxy_url override, which must be
+	// applied by swapping the transport's Proxy, so each distinct override
+	// value gets its own memoized client rather than a fresh transport per
+	// request (which would leak pooled connections).
+	tmu          sync.Mutex
+	proxyClients map[string]*http.Client
 }
 
 // NewHandler constructs the HTTP handler with a bounded concurrency queue.
@@ -57,7 +68,7 @@ func NewHandler(d Deps) *Handler {
 	if d.QueueTimeout <= 0 {
 		d.QueueTimeout = 30 * time.Second
 	}
-	return &Handler{deps: d, slots: make(chan struct{}, d.MaxConcurrent)}
+	return &Handler{deps: d, slots: make(chan struct{}, d.MaxConcurrent), proxyClients: map[string]*http.Client{}}
 }
 
 // Routes returns the mux for the client-facing API.
