@@ -42,21 +42,20 @@ make release
 CGO_ENABLED=0 go build -ldflags "-X main.version=$(git describe --tags --always)" -o tallow ./cmd/tallow
 CGO_ENABLED=0 go build -o tallowctl ./cmd/tallowctl
 
-# 1. Set a master key (env, or a 0600 keyfile). It encrypts provider keys at rest.
-export TALLOW_MASTER_KEY="$(openssl rand -hex 32)"
+# 1. Run the gateway. With no config.toml present, tallow starts an interactive
+#    first-run wizard that writes config.toml and, if you give it a provider key,
+#    stores that key encrypted at rest. TALLOW_MASTER_KEY still wins at first run,
+#    so when it is set no keyfile is created. A manual
+#       cp examples/config.toml ./config.toml
+#    is only needed to customize the generated defaults.
+./tallow
 
-# 2. Copy + edit the config
-cp examples/config.toml ./config.toml
+# 2. Point any OpenAI-compatible client at it
+#    base_url = http://127.0.0.1:8080, api_key = one of `auth.api_keys`
 
-# 3. Register a provider key (encrypted, never plaintext on disk)
+# 3. Add provider keys later (encrypted, never plaintext on disk)
 TALLOW_PROVIDER_KEY="sk-..." tallowctl key add myprovider:account-1 --config ./config.toml \
   --secret-env TALLOW_PROVIDER_KEY
-
-# 4. Run the gateway
-./tallow --config ./config.toml
-
-# 5. Point any OpenAI-compatible client at it
-#    base_url = http://127.0.0.1:8080, api_key = one of `auth.api_keys`
 ```
 
 Open the dashboard in another terminal: `tallowctl dashboard`.
@@ -262,11 +261,12 @@ name pointing at both a public and a private address is refused rather than
 connecting to whichever one the dialer picked.
 
 A private upstream (vLLM on `10.0.0.5`, Ollama on `localhost`, a vPC) is a
-legitimate deployment. Opt out deliberately with
-`config.SetAllowPrivateBaseURL(true)` before `app.New`, and read
-[SECURITY.md](SECURITY.md#network-egress-the-base_url-ssrf-guard) for what that
-acceptance means. It is intentionally not a `config.toml` key, so a writer who
-can edit the config cannot opt one provider entry out of the policy.
+legitimate deployment. Opt out deliberately with `config.SetAllowPrivateBaseURL(true)` before
+`app.New`, and read [SECURITY.md](SECURITY.md#network-egress-the-base_url-ssrf-guard)
+for what that acceptance means. `tallow -allow-private-upstream` repeats that
+call from the CLI, so a private upstream needs no code change. It is
+intentionally not a `config.toml` key, so a writer who can edit the config
+cannot opt one provider entry out of the policy.
 
 Independently, the upstream client refuses to follow redirects at all, so a
 307/308 can never re-send the credential to another host.
