@@ -11,11 +11,8 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
-// keyCmd manages the encrypted side-storage keystore. Provider keys are never
-// written plaintext: `key add` encrypts under the master key and stores it.
 func keyCmd(args []string) {
-	// Manual flag scan (Go's flag pkg stops at the first positional arg, so it
-	// cannot handle "key add <ref> --secret-env X").
+
 	var cfgPath, keyfile, keystore, secretFile, secretEnv string
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -49,7 +46,6 @@ func keyCmd(args []string) {
 	}
 	action := rest[0]
 
-	// Resolve master-key + keystore paths (config supplies defaults).
 	masterKeyfile, ksPath := keyfile, keystore
 	if masterKeyfile == "" || ksPath == "" {
 		cfg, err := config.Load(resolveConfigPath(cfgPath))
@@ -125,7 +121,6 @@ func keyCmd(args []string) {
 	}
 }
 
-// readSecret obtains the key bytes from a file, stdin, or an env var.
 func readSecret(file, env string) (string, error) {
 	if env != "" {
 		if v := os.Getenv(env); v != "" {

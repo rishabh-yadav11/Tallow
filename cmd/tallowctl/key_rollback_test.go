@@ -7,26 +7,6 @@ import (
 	"testing"
 )
 
-// The rollback contract in internal/secret is proven at the Store level in
-// internal/secret, including across a reload. What it is not proven through is
-// the command an operator actually runs.
-//
-// Set and Delete roll back on a failed save precisely so that an error printed
-// by `tallowctl key add` or `key rm` is trustworthy: the operator is told the
-// operation failed, and the keystore really is unchanged. That promise belongs
-// to the CLI's output, not only to the library underneath it, and the CLI is
-// where a misreading turns into a broken deployment: a key the operator
-// believes was rotated still being the old one, or a credential that was
-// reported as removed still being live.
-//
-// So these tests drive keyCmd end to end with a real read-only keystore
-// directory, and check the two things an operator can observe: what the command
-// printed, and what a fresh process would load from disk afterwards.
-
-// lockedKeystoreDir makes the keystore's directory read-only, which makes the
-// atomic save fail with a real EACCES from the OS rather than an injected
-// error. It is the same injection the internal/secret suites use, so the CLI
-// path fails for the genuine reason rather than a simulated one.
 func lockedKeystoreDir(t *testing.T) (keyfile, keystore string) {
 	t.Helper()
 	keyfile, keystore = e2ePaths(t)
@@ -34,8 +14,7 @@ func lockedKeystoreDir(t *testing.T) (keyfile, keystore string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(filepath.Dir(keystore), 0o700) })
-	// Guard against a filesystem that ignores the mode: a test that cannot fail
-	// the save is not testing rollback, it is testing nothing.
+
 	probe := filepath.Join(filepath.Dir(keystore), ".probe")
 	if err := os.WriteFile(probe, []byte("x"), 0o600); err == nil {
 		_ = os.Remove(probe)
@@ -44,9 +23,6 @@ func lockedKeystoreDir(t *testing.T) (keyfile, keystore string) {
 	return keyfile, keystore
 }
 
-// unlock repairs the filesystem so a later command can succeed. This is what
-// makes the tests able to observe a failed command's effect: without it there
-// is no way to distinguish "the rollback worked" from "everything fails".
 func unlock(t *testing.T, keystore string) {
 	t.Helper()
 	if err := os.Chmod(filepath.Dir(keystore), 0o700); err != nil {
@@ -54,16 +30,10 @@ func unlock(t *testing.T, keystore string) {
 	}
 }
 
-// TestFailedKeyAddLeavesNothingOnDiskForTheNextProcess is the add half, at the
-// level the operator experiences it. The add reports an error, so the operator
-// believes no key was stored. A later `key list` and a fresh LoadStore must
-// agree, or the operator is wrong about which credentials the gateway will use.
 func TestFailedKeyAddLeavesNothingOnDiskForTheNextProcess(t *testing.T) {
 	keyfile, keystore := lockedKeystoreDir(t)
 	t.Setenv("TALLOWCTL_TEST_SECRET_GHOST", "sk-ghost-should-not-persist")
 
-	// The add must fail, and keyCmd exits the process on that path, so it is
-	// driven in a child process where the exit code is observable.
 	out, code := runKeyCmd(t, []string{
 		"add", "provider/ghost",
 		"--secret-env", "TALLOWCTL_TEST_SECRET_GHOST",
@@ -79,10 +49,6 @@ func TestFailedKeyAddLeavesNothingOnDiskForTheNextProcess(t *testing.T) {
 			"operator would not know it failed: %q", out)
 	}
 
-	// A later, unrelated key operation must not resurrect the ghost. This is
-	// the specific way the old bug was dangerous: the entry sat in the map and
-	// the next key add wrote the whole map out, persisting a credential that
-	// was reported as never stored.
 	unlock(t, keystore)
 	t.Setenv("TALLOWCTL_TEST_SECRET_REAL", "sk-real-secret-1234567890")
 	if out, code := runKeyCmd(t, []string{
@@ -112,16 +78,12 @@ func TestFailedKeyAddLeavesNothingOnDiskForTheNextProcess(t *testing.T) {
 		got != "sk-real-secret-1234567890" {
 		t.Errorf("the key that was actually stored did not survive: %q, %v", got, err)
 	}
-	// The failed secret must not be anywhere on disk in any form.
+
 	assertNoPlaintext(t, keystore, "provider/real", "sk-ghost-should-not-persist")
 }
 
-// TestFailedKeyRmKeepsTheOldCredentialLive is the rm half, and it is the more
-// dangerous direction. A delete that reports an error while having already
-// removed the key stops the gateway from using a working credential, so the
-// operator rotates or re-issues against a key that is still live.
 func TestFailedKeyRmKeepsTheOldCredentialLive(t *testing.T) {
-	// Seed while the directory is still writable.
+
 	keyfile, keystore := e2ePaths(t)
 	t.Setenv("TALLOWCTL_TEST_SECRET_LIVE", "sk-live-secret-abcdef1234")
 	if out := captureStdout(t, func() {
@@ -146,8 +108,6 @@ func TestFailedKeyRmKeepsTheOldCredentialLive(t *testing.T) {
 			"keystore directory: %q", out)
 	}
 
-	// The credential must still be usable by a fresh process, which is what
-	// "the remove failed" has to mean for the gateway.
 	got, err := openStore(t, keyfile, keystore).Get("provider/live")
 	if err != nil {
 		t.Fatalf("the remove reported failure but provider/live is gone: %v", err)
@@ -163,10 +123,6 @@ func TestFailedKeyRmKeepsTheOldCredentialLive(t *testing.T) {
 	}
 }
 
-// TestFailedKeyOverwriteKeepsTheOldSecret is the third direction, and the one
-// with no library-level counterpart: a failed overwrite of an EXISTING key.
-// This is the rotation path, so a failure that loses the new value or clobbers
-// the old one either breaks rotation or silently keeps a revoked credential.
 func TestFailedKeyOverwriteKeepsTheOldSecret(t *testing.T) {
 	keyfile, keystore := e2ePaths(t)
 	const oldSecret = "sk-old-secret-1234567890"
@@ -205,12 +161,11 @@ func TestFailedKeyOverwriteKeepsTheOldSecret(t *testing.T) {
 		t.Errorf("provider/rotating now holds %q, want the ORIGINAL %q: a failed "+
 			"rotation must leave the live credential untouched", got, oldSecret)
 	}
-	// The value that was supposed to replace it must not have landed.
+
 	if got == "sk-new-secret-0987654321" {
 		t.Error("the new secret was persisted even though the rotation reported failure")
 	}
-	// And once the filesystem is repaired, the rotation must actually work, or
-	// the rollback has merely blocked rotation permanently.
+
 	unlock(t, keystore)
 	if out, code := runKeyCmd(t, []string{
 		"add", "provider/rotating",
@@ -226,17 +181,6 @@ func TestFailedKeyOverwriteKeepsTheOldSecret(t *testing.T) {
 	}
 }
 
-// TestKeyCmdAddOverExistingDoesNotCorruptOtherKeys is the corruption case, and
-// it is why the add path is not just two isolated commands. Each `tallowctl key`
-// invocation loads its own Store and writes the whole map, so an add that
-// carries a stale in-memory view can drop every other ref from the keystore.
-//
-// The stale view is reachable the same way the ghost was: a failed add leaves
-// its entry in the map, and a successful one overwrites before the write. In
-// production that is one process handling several operator actions in sequence,
-// and tallowctl is documented as reloadable without a restart, so this asserts
-// what the keystore holds after such a sequence rather than assuming each
-// command is a clean slate.
 func TestKeyCmdAddOverExistingDoesNotCorruptOtherKeys(t *testing.T) {
 	keyfile, keystore := e2ePaths(t)
 	t.Setenv("TALLOWCTL_TEST_SECRET_A", "sk-a-secret-1234567890")
@@ -252,7 +196,6 @@ func TestKeyCmdAddOverExistingDoesNotCorruptOtherKeys(t *testing.T) {
 		t.Fatalf("seeding provider/a failed: %q", out)
 	}
 
-	// Lock the keystore directory so the next add's save fails.
 	if err := os.Chmod(filepath.Dir(keystore), 0o500); err != nil {
 		t.Fatal(err)
 	}
@@ -269,9 +212,6 @@ func TestKeyCmdAddOverExistingDoesNotCorruptOtherKeys(t *testing.T) {
 			"keystore: %q", out)
 	}
 
-	// Repair the filesystem, then perform a further add through the public
-	// command. If the failed one left a stale entry in a map that is still
-	// live, that entry is written out now.
 	unlock(t, keystore)
 	t.Setenv("TALLOWCTL_TEST_SECRET_D", "sk-d-secret-2233445566")
 	if out, code := runKeyCmd(t, []string{
@@ -282,8 +222,6 @@ func TestKeyCmdAddOverExistingDoesNotCorruptOtherKeys(t *testing.T) {
 		t.Fatalf("the follow-up add should have succeeded: exit %d, %q", code, out)
 	}
 
-	// Whatever the mechanism, the two keys the operator definitely stored must
-	// still be there and must still decrypt.
 	for _, ref := range []string{"provider/a", "provider/d"} {
 		if _, err := openStore(t, keyfile, keystore).Get(ref); err != nil {
 			t.Errorf("%s is missing after a failed add followed by a "+
@@ -299,10 +237,6 @@ func TestKeyCmdAddOverExistingDoesNotCorruptOtherKeys(t *testing.T) {
 	}
 }
 
-// TestKeyAddRefusesAnEmptySecret is the input-validation edge on the same
-// public path. A blank key would be stored and would then be selected by the
-// router as a credential that can never authenticate, so the CLI has to refuse
-// it before the keystore is touched.
 func TestKeyAddRefusesAnEmptySecret(t *testing.T) {
 	keyfile, keystore := e2ePaths(t)
 	t.Setenv("TALLOWCTL_TEST_SECRET_BLANK", "   \n")
@@ -319,7 +253,7 @@ func TestKeyAddRefusesAnEmptySecret(t *testing.T) {
 		t.Error("a whitespace-only secret was stored: it would be selected as a " +
 			"live credential that can never authenticate")
 	}
-	// A rejected add must not leave a keystore file behind claiming entries.
+
 	if data, err := os.ReadFile(keystore); err == nil {
 		if strings.Contains(string(data), "provider/blank") {
 			t.Errorf("the rejected ref reached the keystore file: %s", data)

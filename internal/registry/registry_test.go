@@ -10,9 +10,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/model"
 )
 
-// Fixture builders return fresh values on every call so tests never share
-// mutable backing arrays with each other or with the registry.
-
 func providerA1() model.Provider {
 	return model.Provider{
 		Name:           "alpha1",
@@ -252,7 +249,6 @@ func TestNewAndLookups(t *testing.T) {
 func TestSwapReplacesSnapshot(t *testing.T) {
 	r := New(providerSetA(), aliasSetA())
 
-	// Pre-state sanity: the incoming names must not resolve before the swap.
 	if p, ok := r.Provider("beta1"); ok || p != nil {
 		t.Fatalf("beta1 resolved before Swap: %+v, %v", p, ok)
 	}
@@ -363,7 +359,6 @@ func TestProvidersCopySemantics(t *testing.T) {
 		t.Fatal("Providers() did not contain alpha1; fixture broken")
 	}
 
-	// The registry's stored value must be untouched by the mutation above.
 	p, ok := r.Provider("alpha1")
 	if !ok || p == nil {
 		t.Fatalf("Provider(alpha1) not found after mutating returned copy")
@@ -411,8 +406,7 @@ func TestAliasesCopySemantics(t *testing.T) {
 }
 
 func TestSwapCopiesCallerSlices(t *testing.T) {
-	// New path: mutating the caller's slice after construction must not
-	// change what the registry serves. Fails if New/Swap stored &providers[i].
+
 	callers := providerSetA()
 	r := New(callers, aliasSetA())
 	callers[0].BaseURL = "https://tampered.example/v1"
@@ -425,7 +419,6 @@ func TestSwapCopiesCallerSlices(t *testing.T) {
 		t.Fatalf("New leaked caller slice mutation into registry: %+v", *p)
 	}
 
-	// Swap path: same guarantee for the slice handed to Swap.
 	r2 := New(providerSetA(), aliasSetA())
 	incoming := providerSetB()
 	r2.Swap(incoming, aliasSetB())
@@ -438,7 +431,6 @@ func TestSwapCopiesCallerSlices(t *testing.T) {
 		t.Fatalf("Swap leaked caller slice mutation into registry: %+v", *p2)
 	}
 
-	// Alias input slices get the same treatment.
 	aliasCallers := aliasSetA()
 	r3 := New(providerSetA(), aliasCallers)
 	aliasCallers[0].Name = "tampered-alias"
@@ -500,9 +492,7 @@ func TestConcurrentSwapAndReads(t *testing.T) {
 		}
 		return true
 	}
-	// A single read of the full snapshot must never mix the two swapped-in
-	// sets: Swap replaces both maps under one lock, so one atomic read sees
-	// exactly one partition.
+
 	onePartition := func(names []string, a, b map[string]bool) bool {
 		return allIn(names, a) || allIn(names, b)
 	}
@@ -576,8 +566,7 @@ func TestConcurrentSwapAndReads(t *testing.T) {
 	if n := violations.Load(); n != 0 {
 		t.Fatalf("%d invariant violations during concurrent Swap/reads", n)
 	}
-	// Soft check that the run genuinely interleaved both snapshots; not a
-	// correctness requirement, so only logged.
+
 	if !sawSetA.Load() || !sawSetB.Load() {
 		t.Logf("warning: readers only observed one snapshot set (A=%v B=%v)", sawSetA.Load(), sawSetB.Load())
 	}

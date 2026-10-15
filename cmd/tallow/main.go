@@ -1,5 +1,3 @@
-// Command tallow is the LLM gateway core: a self-hosted, OpenAI-compatible
-// proxy that routes requests across the user's providers and keys.
 package main
 
 import (
@@ -15,7 +13,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/setup"
 )
 
-// version is overridden at build time via -ldflags "-X main.version=…".
 var version = "dev"
 
 func main() {

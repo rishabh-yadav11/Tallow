@@ -16,7 +16,7 @@ func TestFixedWindowRPM(t *testing.T) {
 	if w.Allow(now) {
 		t.Fatal("expected deny after limit")
 	}
-	// Rollover resets the counter.
+
 	if !w.Allow(now.Add(2 * time.Minute)) {
 		t.Fatal("expected allow after window rollover")
 	}
@@ -25,11 +25,11 @@ func TestFixedWindowRPM(t *testing.T) {
 func TestPeekIsPure(t *testing.T) {
 	w := FixedWindow{Limit: 1, Window: time.Minute}
 	now := time.Now()
-	// Fill the window.
+
 	if !w.Allow(now) {
 		t.Fatal("expected first allow")
 	}
-	// Peek must not mutate: still denied while full.
+
 	if w.Peek(now) {
 		t.Fatal("peek should deny a full window")
 	}
@@ -38,8 +38,6 @@ func TestPeekIsPure(t *testing.T) {
 	}
 }
 
-// TestQuotaFailureDoesNotBurnRPM guards a regression where a request blocked by
-// the quota limit still consumed an RPM unit, making the RPM counter lie.
 func TestQuotaFailureDoesNotBurnRPM(t *testing.T) {
 	b := NewKeyBudget(KeyLimits{RPM: 100, MaxRequests: 2, Window: time.Hour})
 	now := time.Now()
@@ -77,9 +75,6 @@ func TestMaxConcurrentEnforced(t *testing.T) {
 	}
 }
 
-// Audit item 8: a MaxRequests cap with Window==0/null is ignored. Acquire
-// guards the quota with `if b.req.Window > 0 && b.req.Limit > 0`, so a cap with
-// no window cannot bind; only RPM, concurrency and cost limits do.
 func TestQuotaIgnoredWhenWindowIsZero(t *testing.T) {
 	b := NewKeyBudget(KeyLimits{MaxRequests: 2, Window: 0, RPM: 1000})
 	now := time.Now()

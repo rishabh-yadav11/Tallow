@@ -13,7 +13,6 @@ func TestPruneRemovesStaleBreakers(t *testing.T) {
 	_ = r.Key("p1", "k1")
 	_ = r.Key("p2", "k2")
 
-	// After pruning to only p1/k1, p2 (and its key) breakers must be gone.
 	r.Prune([]model.Provider{
 		{Name: "p1", Keys: []model.Key{{ID: "k1"}}},
 	})

@@ -1,5 +1,3 @@
-// Command tallowctl is the TUI dashboard and management CLI for Tallow. It
-// talks to the gateway strictly over the admin Unix-socket HTTP interface.
 package main
 
 import (
@@ -52,7 +50,6 @@ Key management flags (key add/rm/list):
 `)
 }
 
-// resolveConfigPath returns the config path from flags/env/default.
 func resolveConfigPath(over string) string {
 	if over != "" {
 		return over
@@ -63,7 +60,6 @@ func resolveConfigPath(over string) string {
 	return "config.toml"
 }
 
-// unixHTTPClient builds an HTTP client that dials a Unix socket.
 func unixHTTPClient(socket string) *http.Client {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

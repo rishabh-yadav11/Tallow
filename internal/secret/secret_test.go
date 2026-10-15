@@ -16,9 +16,6 @@ func testBox(t *testing.T) *Box {
 	return b
 }
 
-// TestBoxSealOpenRoundTrip verifies the AES-256-GCM seal/open cycle and that
-// distinct Seal calls produce distinct ciphertexts (fresh random nonce each
-// time, so ciphertext equality cannot leak plaintext equality).
 func TestBoxSealOpenRoundTrip(t *testing.T) {
 	box := testBox(t)
 	plain := "sk-provider-secret-123"
@@ -47,8 +44,6 @@ func TestBoxSealOpenRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBoxOpenRejectsTampering verifies GCM authentication rejects modified
-// ciphertext and malformed inputs.
 func TestBoxOpenRejectsTampering(t *testing.T) {
 	box := testBox(t)
 	enc, err := box.Seal([]byte("secret"))
@@ -66,7 +61,6 @@ func TestBoxOpenRejectsTampering(t *testing.T) {
 		t.Fatal("expected error for empty ciphertext")
 	}
 
-	// Cross-box open must fail: different master key = different derived key.
 	other, err := NewBox([]byte("another-master-key"))
 	if err != nil {
 		t.Fatal(err)
@@ -76,9 +70,6 @@ func TestBoxOpenRejectsTampering(t *testing.T) {
 	}
 }
 
-// TestKeystoreRoundTripAndPersistence covers Set/Get/List/Delete plus the
-// on-disk format: ciphertext only (no plaintext on disk), 0600 permissions,
-// and durability across a reopen.
 func TestKeystoreRoundTripAndPersistence(t *testing.T) {
 	dir := t.TempDir()
 	ksPath := filepath.Join(dir, "keys.json")
@@ -103,7 +94,6 @@ func TestKeystoreRoundTripAndPersistence(t *testing.T) {
 		t.Fatalf("List: got %d refs, want 2", len(refs))
 	}
 
-	// On disk: no plaintext anywhere in the raw file, and 0600 perms.
 	raw, err := os.ReadFile(ksPath)
 	if err != nil {
 		t.Fatalf("read keystore: %v", err)
@@ -122,7 +112,6 @@ func TestKeystoreRoundTripAndPersistence(t *testing.T) {
 		t.Fatalf("keystore file mode = %o, want 600", got)
 	}
 
-	// Delete removes the entry and persists.
 	if err := s.Delete("p1:k1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -130,7 +119,6 @@ func TestKeystoreRoundTripAndPersistence(t *testing.T) {
 		t.Fatal("expected error after Delete")
 	}
 
-	// Durability: reopen from disk and confirm the remaining entry decrypts.
 	s2, err := LoadStore(ksPath, box)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -141,8 +129,6 @@ func TestKeystoreRoundTripAndPersistence(t *testing.T) {
 	}
 }
 
-// TestKeystoreRejectsWrongVersion verifies version guarding on the keystore
-// file so a future format change cannot be silently misread.
 func TestKeystoreRejectsWrongVersion(t *testing.T) {
 	dir := t.TempDir()
 	ksPath := filepath.Join(dir, "keys.json")
@@ -154,8 +140,6 @@ func TestKeystoreRejectsWrongVersion(t *testing.T) {
 	}
 }
 
-// TestLoadMasterKeyPrecedence verifies env wins over keyfile, keyfile content
-// is trimmed, and missing sources produce a hard error.
 func TestLoadMasterKeyPrecedence(t *testing.T) {
 	t.Setenv(EnvMasterKey, "env-key-wins")
 	got, err := LoadMasterKey("no/such/file")
@@ -163,7 +147,6 @@ func TestLoadMasterKeyPrecedence(t *testing.T) {
 		t.Fatalf("env must win over keyfile: got %q, %v", got, err)
 	}
 
-	// Empty env falls back to the keyfile; content must be trimmed.
 	t.Setenv(EnvMasterKey, "")
 	dir := t.TempDir()
 	kf := filepath.Join(dir, "master.key")
@@ -175,12 +158,10 @@ func TestLoadMasterKeyPrecedence(t *testing.T) {
 		t.Fatalf("keyfile fallback: got %q, %v", got, err)
 	}
 
-	// Neither source: hard error.
 	if _, err := LoadMasterKey(""); err == nil {
 		t.Fatal("expected error when no master key source is available")
 	}
 
-	// Empty keyfile is rejected.
 	t.Setenv(EnvMasterKey, "")
 	empty := filepath.Join(dir, "empty.key")
 	if err := os.WriteFile(empty, nil, 0o600); err != nil {
@@ -191,18 +172,12 @@ func TestLoadMasterKeyPrecedence(t *testing.T) {
 	}
 }
 
-// TestLoadStoreRejectsNilBox pins the decision that a nil box is a load-time
-// error, not a deferred nil-panic inside Get/Set (b.aead is nil on a zero Box).
 func TestLoadStoreRejectsNilBox(t *testing.T) {
 	if _, err := LoadStore(filepath.Join(t.TempDir(), "keys.json"), nil); err == nil {
 		t.Fatal("LoadStore with nil box must fail")
 	}
 }
 
-// TestLoadMasterKeyEnvVsKeyfileTrim pins the raw-semantics asymmetry between
-// the two master-key sources: the env value is returned VERBATIM (no trim),
-// while keyfile content is whitespace-trimmed. An operator who relies on the
-// trim must not silently lose a distinguishing prefix from an env key.
 func TestLoadMasterKeyEnvVsKeyfileTrim(t *testing.T) {
 	const raw = "  key-with-surrounding-space  "
 	t.Setenv(EnvMasterKey, raw)
@@ -214,7 +189,6 @@ func TestLoadMasterKeyEnvVsKeyfileTrim(t *testing.T) {
 		t.Fatalf("env key is trimmed: got %q want verbatim %q", got, raw)
 	}
 
-	// Same nominal content in a keyfile is trimmed: the asymmetry is pinned.
 	t.Setenv(EnvMasterKey, "")
 	dir := t.TempDir()
 	kf := filepath.Join(dir, "master.key")

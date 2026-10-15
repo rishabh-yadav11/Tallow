@@ -12,10 +12,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
-// captureStdout runs fn while capturing everything it writes to os.Stdout.
-// keyCmd reports success only through stdout and hard-exits (os.Exit) on
-// failure, so captured text is the in-process observable for its success
-// paths. The exit paths themselves cannot be exercised in-process.
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -38,10 +34,6 @@ func captureStdout(t *testing.T, fn func()) string {
 	return <-out
 }
 
-// e2ePaths sets up an isolated master-key file + keystore path and neutralizes
-// any ambient TALLOW_MASTER_KEY so keyCmd resolves the key from the keyfile.
-// Both CLI flags are always passed, so keyCmd never falls back to config.Load
-// and ~/.tallow is never touched.
 func e2ePaths(t *testing.T) (keyfile, keystore string) {
 	t.Helper()
 	t.Setenv(secret.EnvMasterKey, "")
@@ -53,8 +45,6 @@ func e2ePaths(t *testing.T) (keyfile, keystore string) {
 	return keyfile, filepath.Join(dir, "keystore.json")
 }
 
-// openStore reopens the keystore through internal/secret — the same path the
-// gateway uses to read provider keys.
 func openStore(t *testing.T, keyfile, keystore string) *secret.Store {
 	t.Helper()
 	mk, err := secret.LoadMasterKey(keyfile)
@@ -72,9 +62,6 @@ func openStore(t *testing.T, keyfile, keystore string) *secret.Store {
 	return st
 }
 
-// assertNoPlaintext is the encryption contract: the keystore file must contain
-// the ref (so the check cannot pass vacuously on an empty or ref-less file)
-// but never the secrets, neither raw nor base64-obfuscated.
 func assertNoPlaintext(t *testing.T, keystore, ref string, secrets ...string) {
 	t.Helper()
 	data, err := os.ReadFile(keystore)
@@ -94,8 +81,6 @@ func assertNoPlaintext(t *testing.T, keystore, ref string, secrets ...string) {
 	}
 }
 
-// TestReadSecret covers readSecret's three sources and its error paths.
-// It returns raw bytes — trimming is the add path's job, not readSecret's.
 func TestReadSecret(t *testing.T) {
 	t.Run("from env", func(t *testing.T) {
 		t.Setenv("TALLOWCTL_TEST_SECRET_ENV", "sk-env-value")
@@ -180,9 +165,6 @@ func TestReadSecret(t *testing.T) {
 	})
 }
 
-// TestKeyCmdAddListRoundTrip drives the real flag scan + add + list path with
-// post-positional flags ("key add <ref> --secret-env X"), an isolated master
-// keyfile and keystore, and the secret sourced from an env var.
 func TestKeyCmdAddListRoundTrip(t *testing.T) {
 	keyfile, keystore := e2ePaths(t)
 	t.Setenv("TALLOWCTL_TEST_SECRET_MAIN", "sk-main-secret-1234567890")
@@ -205,7 +187,6 @@ func TestKeyCmdAddListRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected list output: %q", listOut)
 	}
 
-	// Round trip: decrypt what the CLI stored, exactly as the gateway would.
 	got, err := openStore(t, keyfile, keystore).Get("provider/main")
 	if err != nil {
 		t.Fatalf("Get after add: %v", err)
@@ -217,8 +198,6 @@ func TestKeyCmdAddListRoundTrip(t *testing.T) {
 	assertNoPlaintext(t, keystore, "provider/main", "sk-main-secret-1234567890")
 }
 
-// TestKeyCmdSecretFileAndRemove covers --secret-file (trailing newline,
-// trimmed by the add path), sorted list output, and rm's persistence.
 func TestKeyCmdSecretFileAndRemove(t *testing.T) {
 	keyfile, keystore := e2ePaths(t)
 
@@ -262,7 +241,7 @@ func TestKeyCmdSecretFileAndRemove(t *testing.T) {
 	captureStdout(t, func() {
 		keyCmd([]string{"rm", "provider/backup", "--keyfile", keyfile, "--keystore", keystore})
 	})
-	// Store caches entries in memory at load; reopen from disk to observe the rm.
+
 	got, err = openStore(t, keyfile, keystore).Get("provider/backup")
 	if err == nil {
 		t.Fatalf("Get succeeded for removed ref: %q", got)

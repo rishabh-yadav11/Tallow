@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// readOnlyDir returns a directory that cannot be written to, and restores its
-// permissions on cleanup. It skips the test if the filesystem ignores the mode.
 func readOnlyDir(t *testing.T, parent string) string {
 	t.Helper()
 	dir := filepath.Join(parent, "locked")
@@ -32,14 +30,6 @@ func isWritable(t *testing.T, dir string) bool {
 	return true
 }
 
-// Set and Delete both mutated the in-memory map before attempting the write, so a
-// failed write left the keystore describing something that was not on disk.
-//
-// The Set half is the sharper one. `tallowctl key add` would print an error, so
-// the operator reasonably believed nothing had been stored - but the secret was
-// live in memory, and the next unrelated key operation wrote the whole map out,
-// silently persisting a credential the operator had been told did not exist. A
-// failed add must leave no trace that a later save can resurrect.
 func TestFailedSetDoesNotResurrectOnLaterSave(t *testing.T) {
 	dir := readOnlyDir(t, t.TempDir())
 	if isWritable(t, dir) {
@@ -60,8 +50,6 @@ func TestFailedSetDoesNotResurrectOnLaterSave(t *testing.T) {
 		t.Fatal("expected the first Set to fail while the directory is read-only")
 	}
 
-	// Repair the filesystem, then add an unrelated key. If the failed Set left
-	// its entry in the map, the ghost is written out in full here.
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -83,11 +71,6 @@ func TestFailedSetDoesNotResurrectOnLaterSave(t *testing.T) {
 	}
 }
 
-// The Delete half runs the other way: the entry was removed from memory before
-// the write, so a failed delete reported an error while having already stopped
-// the gateway from using that credential. The caller cannot tell from the
-// return value whether the key is live or gone, so on failure the key has to
-// stay exactly as it was.
 func TestFailedDeleteKeepsTheKeyInMemory(t *testing.T) {
 	dir := readOnlyDir(t, t.TempDir())
 	if isWritable(t, dir) {
@@ -98,7 +81,7 @@ func TestFailedDeleteKeepsTheKeyInMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Seed the entry while the directory is still writable.
+
 	seed, err := LoadStore(filepath.Join(dir, "ks.json"), box)
 	if err != nil {
 		t.Fatal(err)

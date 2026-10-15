@@ -53,13 +53,13 @@ func TestNormalizeDistinguishesSemanticFields(t *testing.T) {
 }
 
 func TestLRUAndTTL(t *testing.T) {
-	c := New(2, 10*time.Millisecond, 0) // 0 = unbounded bytes; only count bound.
+	c := New(2, 10*time.Millisecond, 0)
 	c.Set(Entry{Key: "a", Body: []byte("1")})
 	c.Set(Entry{Key: "b", Body: []byte("2")})
 	if _, ok := c.Get("a"); !ok {
 		t.Fatal("a should be cached")
 	}
-	// Insert a third; "b" (LRU) evicted.
+
 	c.Set(Entry{Key: "c", Body: []byte("3")})
 	if _, ok := c.Get("b"); ok {
 		t.Fatal("b should be evicted (LRU)")
@@ -67,7 +67,7 @@ func TestLRUAndTTL(t *testing.T) {
 	if _, ok := c.Get("a"); !ok {
 		t.Fatal("a should survive as most-recent")
 	}
-	// TTL expiry.
+
 	time.Sleep(15 * time.Millisecond)
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("a should be expired by TTL")
@@ -75,14 +75,12 @@ func TestLRUAndTTL(t *testing.T) {
 }
 
 func TestByteBudgetEvictsLRU(t *testing.T) {
-	// Each entry costs len(Body) + 256. Make the budget small enough that only
-	// a couple of entries fit.
-	c := New(100, time.Minute, 600) // unbounded count, small byte budget.
-	// a: 100-byte body -> 356 bytes. b: 200-byte body -> 456 bytes. Sum 812 > 600.
+
+	c := New(100, time.Minute, 600)
+
 	c.Set(Entry{Key: "a", Body: make([]byte, 100)})
 	c.Set(Entry{Key: "b", Body: make([]byte, 200)})
 
-	// b is most-recent, so a (older/LRU) must be evicted to stay under budget.
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("a (oldest) should be evicted by byte budget")
 	}
@@ -93,9 +91,7 @@ func TestByteBudgetEvictsLRU(t *testing.T) {
 		t.Fatalf("bytes %d exceeded budget %d", c.bytes, c.maxBytes)
 	}
 
-	// Insert an entry that alone exceeds the budget; it cannot fit and evicts
-	// everything (including itself) to keep total bytes within budget.
-	c.Set(Entry{Key: "big", Body: make([]byte, 1000)}) // 1256 > 600
+	c.Set(Entry{Key: "big", Body: make([]byte, 1000)})
 	if c.bytes != 0 {
 		t.Fatalf("expected empty cache after oversized insert, bytes=%d", c.bytes)
 	}
@@ -105,8 +101,7 @@ func TestByteBudgetEvictsLRU(t *testing.T) {
 }
 
 func TestByteBudgetCountBoundBothApply(t *testing.T) {
-	// Both count and byte bounds can hold simultaneously: max count 1 and a
-	// byte budget that holds ~2 entries.
+
 	c := New(1, time.Minute, 5000)
 	c.Set(Entry{Key: "a", Body: make([]byte, 50)})
 	c.Set(Entry{Key: "b", Body: make([]byte, 50)})
@@ -120,17 +115,16 @@ func TestByteBudgetCountBoundBothApply(t *testing.T) {
 
 func TestRefreshUpdatesBytes(t *testing.T) {
 	c := New(100, time.Minute, 400)
-	c.Set(Entry{Key: "a", Body: make([]byte, 50)}) // 306 bytes
-	// Refresh the same key with a larger body, pushing it over budget.
-	c.Set(Entry{Key: "a", Body: make([]byte, 200)}) // 456 > 400 -> evicted
+	c.Set(Entry{Key: "a", Body: make([]byte, 50)})
+
+	c.Set(Entry{Key: "a", Body: make([]byte, 200)})
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("refreshed oversized entry should be evicted under byte budget")
 	}
 }
 
 func TestRefreshKeepsEntryLive(t *testing.T) {
-	// Regression: refreshing an existing entry must reset its expiry; a set
-	// twice key used to be immediately treated as expired (dead) on Get.
+
 	c := New(10, time.Minute, 0)
 	c.Set(Entry{Key: "a", Body: []byte("v1")})
 	c.Set(Entry{Key: "a", Body: []byte("v2")})
@@ -143,10 +137,6 @@ func TestRefreshKeepsEntryLive(t *testing.T) {
 	}
 }
 
-// Audit item 7: a zero-entry cache self-evicts immediately, so a Set is never
-// observable through Get and every Get is a miss. This pins that a zero limit means
-// "cache nothing", and that a non-positive TTL makes every Set produce an
-// already-expired entry, so Get always misses without ever registering a hit.
 func TestZeroEntriesSelfEvictsImmediately(t *testing.T) {
 	c := New(0, time.Minute, 0)
 	c.Set(Entry{Key: "a", Body: []byte("1")})
@@ -165,13 +155,10 @@ func TestZeroEntriesSelfEvictsImmediately(t *testing.T) {
 }
 
 func TestNonPositiveTTLMakesEverySetExpired(t *testing.T) {
-	// TTL<=0 makes every Set produce an already-expired entry, so Get always
-	// misses. The entry is dead on arrival and never registers a hit.
+
 	c := New(64, -1*time.Second, 0)
 	c.Set(Entry{Key: "a", Body: []byte("1")})
-	// The first Get lazily evicts the already-expired entry (dead on arrival,
-	// not counted as a hit or a miss); the second Get is a genuine miss. Both
-	// must be served nothing.
+
 	c.Get("a")
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("a non-positive TTL must make Set produce an already-expired entry")

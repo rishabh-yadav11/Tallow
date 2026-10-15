@@ -3,8 +3,7 @@ package compact
 import "testing"
 
 func TestTruncateRespectsMaxBound(t *testing.T) {
-	// Regression: truncate used to append the marker on top of a max-length
-	// head, so the result exceeded MaxToolOutputChars. It must stay within max.
+
 	long := make([]byte, 5000)
 	for i := range long {
 		long[i] = 'a'

@@ -1,6 +1,3 @@
-// Package secret handles the master key and encrypted side-storage keystore.
-// Provider API keys are never written to disk in plaintext: they are AES-GCM
-// sealed under a key derived (SHA-256) from the master key.
 package secret
 
 import (
@@ -19,15 +16,12 @@ import (
 )
 
 const (
-	// EnvMasterKey is the environment variable holding the master key.
 	EnvMasterKey    = "TALLOW_MASTER_KEY"
 	keystoreVersion = 1
 )
 
-// Box encrypts/decrypts opaque byte payloads under the master key.
 type Box struct{ aead cipher.AEAD }
 
-// NewBox derives an AES-256-GCM key from the master key bytes.
 func NewBox(masterKey []byte) (*Box, error) {
 	h := sha256.Sum256(masterKey)
 	block, err := aes.NewCipher(h[:])
@@ -41,7 +35,6 @@ func NewBox(masterKey []byte) (*Box, error) {
 	return &Box{aead: g}, nil
 }
 
-// Seal encrypts plaintext, returning base64(nonce || ciphertext).
 func (b *Box) Seal(plaintext []byte) (string, error) {
 	nonce := make([]byte, b.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
@@ -51,7 +44,6 @@ func (b *Box) Seal(plaintext []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(append(nonce, ct...)), nil
 }
 
-// Open decrypts a Seal result.
 func (b *Box) Open(enc string) ([]byte, error) {
 	raw, err := base64.StdEncoding.DecodeString(enc)
 	if err != nil {
@@ -63,8 +55,6 @@ func (b *Box) Open(enc string) ([]byte, error) {
 	return b.aead.Open(nil, raw[:b.aead.NonceSize()], raw[b.aead.NonceSize():], nil)
 }
 
-// LoadMasterKey resolves the master key: TALLOW_MASTER_KEY env first, then the
-// keyfile path (trimmed). Hard-fails if neither is available.
 func LoadMasterKey(keyfile string) ([]byte, error) {
 	if v := os.Getenv(EnvMasterKey); v != "" {
 		return []byte(v), nil
@@ -88,8 +78,6 @@ type keystoreFile struct {
 	Entries map[string]string `json:"entries"`
 }
 
-// Store is a small encrypted side-storage file mapping ref -> ciphertext.
-// Managed by tallowctl (key add/rm); the gateway only reads it.
 type Store struct {
 	path    string
 	box     *Box
@@ -97,11 +85,6 @@ type Store struct {
 	entries map[string]string
 }
 
-// LoadStore opens (creating if absent) the keystore at path.
-//
-// A nil box is rejected rather than accepted: every later Get/Set would
-// nil-panic inside it (b.aead is nil), which is a confusing, untraceable crash
-// at the first keystore touch instead of a clear error at load.
 func LoadStore(path string, box *Box) (*Store, error) {
 	if box == nil {
 		return nil, fmt.Errorf("secret: LoadStore requires a non-nil box")
@@ -127,7 +110,6 @@ func LoadStore(path string, box *Box) (*Store, error) {
 	return s, nil
 }
 
-// Get decrypts the plaintext secret for ref.
 func (s *Store) Get(ref string) (string, error) {
 	s.mu.Lock()
 	c, ok := s.entries[ref]
@@ -142,14 +124,6 @@ func (s *Store) Get(ref string) (string, error) {
 	return string(b), nil
 }
 
-// Set encrypts and stores plaintext under ref, persisting atomically.
-//
-// The in-memory map is only updated once the write has actually succeeded.
-// Mutating it first and saving second meant a failed save left the keystore
-// disagreeing with the operator: Set would return an error, so `tallowctl key
-// add` would report failure, yet the secret was live in memory and was written
-// out in full by the next unrelated key operation. An operator who saw the
-// error and moved on was wrong about what was stored.
 func (s *Store) Set(ref, plaintext string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -160,7 +134,7 @@ func (s *Store) Set(ref, plaintext string) error {
 	prev, hadPrev := s.entries[ref]
 	s.entries[ref] = c
 	if err := s.saveLocked(); err != nil {
-		// Roll the map back so it keeps describing what is actually on disk.
+
 		if hadPrev {
 			s.entries[ref] = prev
 		} else {
@@ -171,12 +145,6 @@ func (s *Store) Set(ref, plaintext string) error {
 	return nil
 }
 
-// Delete removes ref from the keystore.
-//
-// As with Set, the entry is removed from memory only after the write succeeds.
-// Deleting first meant a failed save returned an error while having already
-// stopped the gateway from using that credential, so the caller could not tell
-// whether the key was live or gone.
 func (s *Store) Delete(ref string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -192,7 +160,6 @@ func (s *Store) Delete(ref string) error {
 	return nil
 }
 
-// List returns the set of stored refs.
 func (s *Store) List() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -217,8 +184,7 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	// fsync before rename so a crash between write and rename cannot lose the
-	// last key add/rm. Clean up the temp file on any failure.
+
 	cleanup := func() {
 		fh.Close()
 		os.Remove(tmp)

@@ -1,8 +1,3 @@
-// Package cache implements the normalized exact-match response cache. The
-// cache key is the SHA-256 of the request with volatile fields stripped and
-// JSON object keys canonicalized (sorted). Only non-streaming completions are
-// cached; streaming repeats are served by provider-native prompt caching via
-// sticky routing instead.
 package cache
 
 import (
@@ -14,16 +9,14 @@ import (
 	"time"
 )
 
-// volatileFields are top-level request fields that do not affect the response
-// and are stripped before hashing.
 var volatileFields = map[string]bool{
 	"timestamp":           true,
 	"request_id":          true,
 	"session_id":          true,
 	"metadata":            true,
 	"user":                true,
-	"stream":              true,  // only non-stream requests reach the cache.
-	"n":                   false, // keep: affects response content.
+	"stream":              true,
+	"n":                   false,
 	"temperature":         false,
 	"tools":               false,
 	"messages":            false,
@@ -41,8 +34,6 @@ var volatileFields = map[string]bool{
 	"parallel_tool_calls": false,
 }
 
-// Normalize returns canonical JSON bytes: volatile fields removed, map keys
-// sorted (encoding/json sorts map keys deterministically at every level).
 func Normalize(req map[string]any) ([]byte, error) {
 	m := make(map[string]any, len(req))
 	for k, v := range req {
@@ -54,59 +45,44 @@ func Normalize(req map[string]any) ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// Key hashes canonical bytes to a cache key string.
 func Key(canonical []byte) string {
 	h := sha256.Sum256(canonical)
 	return hex.EncodeToString(h[:])
 }
 
-// Entry is a cached response.
 type Entry struct {
 	Key              string
-	Body             []byte // raw JSON response body (non-stream).
+	Body             []byte
 	ContentType      string
 	Status           int
 	Model            string
 	PromptTokens     int
 	CompletionTokens int
-	// Provider records WHICH route produced this response.
-	//
-	// It is provenance, not attribution. A cache hit did not call this provider,
-	// so it is not attributed to it in the per-provider metrics; recording where
-	// the cached answer came from is what lets a hit report
-	// "cache_hit_from:p1" instead of inventing a "cache" provider that no
-	// operator configured and that grows without bound as the cache warms.
+
 	Provider  string
 	CreatedAt time.Time
 	expires   time.Time
 }
 
-// Cache is a bounded LRU with per-entry TTL. In-process only; no external
-// cache service by design. It respects two independent bounds: a maximum entry
-// count and (optionally) a total approximate byte budget.
 type Cache struct {
 	mu       sync.Mutex
 	max      int
 	ttl      time.Duration
-	maxBytes int64 // <= 0 means unbounded.
-	bytes    int64 // approximate total bytes currently consumed.
+	maxBytes int64
+	bytes    int64
 	entries  map[string]*list.Element
-	order    *list.List // front = most recently used.
+	order    *list.List
 	hit      int64
 	miss     int64
 	evict    int64
 }
 
-// sizeOf approximates the memory an entry consumes in the cache.
 const overheadBytes = 256
 
 func entrySize(e Entry) int64 {
 	return int64(len(e.Body)) + overheadBytes
 }
 
-// New builds an LRU cache with a max entry count, a TTL, and an optional total
-// byte budget. A maxBytes <= 0 means the byte budget is unbounded (only the
-// entry-count bound applies).
 func New(maxEntries int, ttl time.Duration, maxBytes int64) *Cache {
 	return &Cache{
 		max:      maxEntries,
@@ -122,7 +98,6 @@ type item struct {
 	e   Entry
 }
 
-// Get returns a live (unexpired) entry and marks it most-recently-used.
 func (c *Cache) Get(key string) (Entry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -141,15 +116,6 @@ func (c *Cache) Get(key string) (Entry, bool) {
 	return it.e, true
 }
 
-// ExpiresAt reports when the entry for key expires, or the zero time if the key
-// is absent.
-//
-// Set always recomputes the expiry from the current time, so an entry's lifetime
-// is a direct, observable property of who wrote it and when. That makes "a
-// reader silently refreshed this entry" an assertable fact rather than a
-// suspicion, which matters for coalesced fetches: a follower re-writing the
-// shared entry would extend its life on every waiter and keep a stale response
-// alive indefinitely. It is read-only and does not count as a hit or a miss.
 func (c *Cache) ExpiresAt(key string) time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -160,8 +126,6 @@ func (c *Cache) ExpiresAt(key string) time.Time {
 	return el.Value.(*item).e.expires
 }
 
-// Set inserts or refreshes an entry, evicting expired/least-recently-used as
-// needed to respect both the entry-count and byte budgets.
 func (c *Cache) Set(e Entry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -189,8 +153,6 @@ func (c *Cache) Set(e Entry) {
 	c.evictBytesOverLocked()
 }
 
-// evictBytesOverLocked evicts least-recently-used entries until total bytes are
-// within the byte budget (no-op when unbounded).
 func (c *Cache) evictBytesOverLocked() {
 	if c.maxBytes <= 0 || c.bytes <= c.maxBytes {
 		return
@@ -204,7 +166,6 @@ func (c *Cache) evictBytesOverLocked() {
 	}
 }
 
-// Delete removes a key.
 func (c *Cache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -213,7 +174,6 @@ func (c *Cache) Delete(key string) {
 	}
 }
 
-// SweepExpired removes expired entries; cheap enough to call periodically.
 func (c *Cache) SweepExpired() {
 	c.mu.Lock()
 	c.sweepExpiredLocked()
@@ -242,7 +202,6 @@ func (c *Cache) removeLocked(el *list.Element) {
 	c.evict++
 }
 
-// Stats reports hit/miss/evict counters for observability.
 func (c *Cache) Stats() (hit, miss, evict, size int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

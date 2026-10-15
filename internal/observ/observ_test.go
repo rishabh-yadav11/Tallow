@@ -96,7 +96,7 @@ func TestEnabledAggregation(t *testing.T) {
 		c.Record(r.m, r.durMs)
 	}
 
-	lat := []int64{5, 25, 40, 90} // sorted ascending: Snapshot sorts internally before indexing
+	lat := []int64{5, 25, 40, 90}
 	want := Snapshot{
 		Enabled:          true,
 		Total:            4,
@@ -119,17 +119,11 @@ func TestEnabledAggregation(t *testing.T) {
 	}
 }
 
-// TestLatencyReservoirBounded records more durations than the reservoir
-// capacity (512) with strictly increasing values. If the reservoir kept every
-// sample, the early tiny latencies would drag the percentiles down (p95 would
-// sit at 570 for 600 records); keeping only the last 512 puts p95 at 574, so
-// the assertion window below deliberately excludes the unbounded value. The
-// previous window [560,590] contained 570 and therefore could never fail.
 func TestLatencyReservoirBounded(t *testing.T) {
 	c := New(true)
 	const records = 600
 	for i := 0; i < records; i++ {
-		c.Record(meta("p", "ok", 1, 1, false, 1), int64(i)) // 0..599 ms
+		c.Record(meta("p", "ok", 1, 1, false, 1), int64(i))
 	}
 
 	s := c.Snapshot()
@@ -139,15 +133,14 @@ func TestLatencyReservoirBounded(t *testing.T) {
 	if s.LatencyP50Ms < 330 || s.LatencyP50Ms > 360 {
 		t.Errorf("LatencyP50Ms = %d, want in [330,360] (bounded reservoir ~344; unbounded would be 300)", s.LatencyP50Ms)
 	}
-	// Unbounded p95 = 570; bounded (last 512 of 0..599, i.e. 88..599) = 574.
+
 	if s.LatencyP95Ms < 571 || s.LatencyP95Ms > 590 {
 		t.Errorf("LatencyP95Ms = %d, want in [571,590] (bounded reservoir ~574; unbounded would be 570)", s.LatencyP95Ms)
 	}
 	if s.LatencyP95Ms > records-1 {
 		t.Errorf("LatencyP95Ms = %d exceeds max recorded %d", s.LatencyP95Ms, records-1)
 	}
-	// The window and sample count must be reported so a reader knows these
-	// percentiles are a sliding window, not lifetime percentiles.
+
 	if s.LatencySamples != 512 {
 		t.Errorf("LatencySamples = %d, want 512 (bounded reservoir)", s.LatencySamples)
 	}
@@ -156,10 +149,6 @@ func TestLatencyReservoirBounded(t *testing.T) {
 	}
 }
 
-// TestLatencySamplesBelowCapacity covers the unfilled-reservoir case: the
-// sample count must reflect real samples rather than the capacity, and the
-// window must still be named when there is no traffic at all, so a zero
-// percentile is never ambiguous.
 func TestLatencySamplesBelowCapacity(t *testing.T) {
 	c := New(true)
 	for i := 0; i < 7; i++ {
@@ -201,7 +190,7 @@ func TestToggleLive(t *testing.T) {
 	c.Record(meta("p", "ok", 10, 5, false, 2), 50)
 	c.Record(meta("p", "error", 10, 5, false, 2), 50)
 	afterDisabled := c.Snapshot()
-	// Counters must be frozen at wantFirst, but Enabled reflects the live toggle.
+
 	wantDisabled := wantFirst
 	wantDisabled.Enabled = false
 	assertSnapshot(t, afterDisabled, wantDisabled)
@@ -223,7 +212,7 @@ func TestToggleLive(t *testing.T) {
 
 func TestConcurrentRecord(t *testing.T) {
 	const workers = 8
-	const perWorker = 250 // total 2000
+	const perWorker = 250
 
 	c := New(true)
 	var wg sync.WaitGroup
@@ -284,22 +273,14 @@ func TestSnapshotReturnsCopy(t *testing.T) {
 	}
 }
 
-// TestPercentileIndexPinsActualBehavior fixes what the percentile index formula
-// actually reports for tiny reservoirs, which is NOT a mathematically faithful
-// p50/p95. The index is sorted[n*50/100] / sorted[n*95/100] (integer index),
-// so for n=2 it reports p50 == p95 == max, and for n=3 p50 is the second
-// element while p95 is the third. These are pinned as the CURRENT behavior,
-// with the expected values written out independently (the second element, the
-// third element) rather than re-deriving the index formula, so a future change
-// to the formula forces an intentional update to this assertion.
 func TestPercentileIndexPinsActualBehavior(t *testing.T) {
-	// Distinct latencies so every element is observable in the snapshot.
+
 	t.Run("n=2 raises p50 and p95 to the max", func(t *testing.T) {
 		c := New(true)
 		c.Record(meta("p", "ok", 1, 1, false, 0), 10)
 		c.Record(meta("p", "ok", 1, 1, false, 0), 20)
 		s := c.Snapshot()
-		// n*50/100 = 1, n*95/100 = 1 -> both index 1, the second (max) element.
+
 		if s.LatencyP50Ms != 20 {
 			t.Errorf("p50 with n=2 = %d, want 20 (the second element, not a real median)", s.LatencyP50Ms)
 		}
@@ -313,7 +294,7 @@ func TestPercentileIndexPinsActualBehavior(t *testing.T) {
 		c.Record(meta("p", "ok", 1, 1, false, 0), 20)
 		c.Record(meta("p", "ok", 1, 1, false, 0), 30)
 		s := c.Snapshot()
-		// n*50/100 = 1 (second element = 20), n*95/100 = 2 (third element = 30).
+
 		if s.LatencyP50Ms != 20 {
 			t.Errorf("p50 with n=3 = %d, want 20 (the second element)", s.LatencyP50Ms)
 		}
@@ -323,16 +304,13 @@ func TestPercentileIndexPinsActualBehavior(t *testing.T) {
 	})
 }
 
-// TestSnapshotInvariants pins that the error and cached counts never exceed the
-// total. This catches double-counting regressions: an error sneaking into the
-// total twice, or a cached request counted beyond its intersections.
 func TestSnapshotInvariants(t *testing.T) {
 	c := New(true)
-	// Mix of ok/error and cached/not, so the invariants have real work to do.
+
 	c.Record(meta("p", "ok", 1, 1, false, 1), 10)
 	c.Record(meta("p", "error", 1, 1, false, 1), 10)
 	c.Record(meta("p", "ok", 1, 1, true, 1), 10)
-	c.Record(meta("", "error", 1, 1, false, 1), 5) // gateway-level error, no provider
+	c.Record(meta("", "error", 1, 1, false, 1), 5)
 	s := c.Snapshot()
 	if s.Errors > s.Total {
 		t.Errorf("Errors (%d) > Total (%d): double-counting regression", s.Errors, s.Total)

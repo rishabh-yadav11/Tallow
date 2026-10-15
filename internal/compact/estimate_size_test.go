@@ -2,15 +2,6 @@ package compact
 
 import "testing"
 
-// EstimateSize is currently unreferenced by production code: nothing in the
-// tree calls it, and the "trimmed N bytes" log line its doc comment describes
-// was never wired up. It is covered here anyway, because the semantics are
-// subtle enough (role filter, string filter, byte length) that the first
-// caller should not have to rediscover them, and because dead code that is
-// wrong is a trap for whoever does wire it up.
-
-// TestEstimateSizeCountsOnlyToolContent pins the two filters: role must be
-// "tool" and content must be a string. Anything else contributes zero.
 func TestEstimateSizeCountsOnlyToolContent(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -36,9 +27,7 @@ func TestEstimateSizeCountsOnlyToolContent(t *testing.T) {
 			want: 8,
 		},
 		{
-			// User, assistant and system content is not tool output, so it must
-			// not be counted. A bug that ignored the role filter would report
-			// the whole conversation as trimmed tool output.
+
 			name: "ignores non-tool roles",
 			messages: []any{
 				map[string]any{"role": "user", "content": "aaaaaaaaaaaaaaaa"},
@@ -49,8 +38,7 @@ func TestEstimateSizeCountsOnlyToolContent(t *testing.T) {
 			want: 2,
 		},
 		{
-			// Tool content in a non-string form (a content block array, a
-			// number, nil) is skipped rather than counted or panicking.
+
 			name: "skips non-string content",
 			messages: []any{
 				map[string]any{"role": "tool", "content": nil},
@@ -71,8 +59,7 @@ func TestEstimateSizeCountsOnlyToolContent(t *testing.T) {
 			want: 3,
 		},
 		{
-			// A role of the right type but the wrong value, and a missing role,
-			// are both excluded. An empty role is not the tool role.
+
 			name: "excludes wrong or missing role",
 			messages: []any{
 				map[string]any{"role": "tools", "content": "aaaa"},
@@ -83,18 +70,16 @@ func TestEstimateSizeCountsOnlyToolContent(t *testing.T) {
 			want: 0,
 		},
 		{
-			// Byte length, not rune count: callers use this to reason about
-			// byte-bounded trimming, so multi-byte content must count bytes.
+
 			name: "counts bytes not runes",
 			messages: []any{
-				map[string]any{"role": "tool", "content": "世界"}, // 6 bytes, 2 runes
-				map[string]any{"role": "tool", "content": "👍"},  // 4 bytes, 1 rune
+				map[string]any{"role": "tool", "content": "世界"},
+				map[string]any{"role": "tool", "content": "👍"},
 			},
 			want: 10,
 		},
 		{
-			// A tool message with an empty string contributes zero, which must
-			// not be confused with "not counted" by any caller arithmetic.
+
 			name:     "empty tool content is zero",
 			messages: []any{map[string]any{"role": "tool", "content": ""}},
 			want:     0,
@@ -109,13 +94,11 @@ func TestEstimateSizeCountsOnlyToolContent(t *testing.T) {
 	}
 }
 
-// TestEstimateSizeIsAdditive checks the accumulation is a plain sum, not, for
-// example, clamped at a single message's size.
 func TestEstimateSizeIsAdditive(t *testing.T) {
 	var msgs []any
 	total := 0
 	for i := 0; i < 50; i++ {
-		s := "0123456789" // 10 bytes
+		s := "0123456789"
 		msgs = append(msgs, map[string]any{"role": "tool", "content": s})
 		total += len(s)
 	}

@@ -1,6 +1,3 @@
-// Package main implements tallowctl, the terminal dashboard for the Tallow
-// LLM gateway. It talks only to the gateway's admin control interface over a
-// local Unix-socket HTTP API and never reaches into gateway internals.
 package main
 
 import (
@@ -23,8 +20,6 @@ const (
 	shownLogs    = 15
 )
 
-// runTUI runs the Bubble Tea dashboard for the gateway admin API served over
-// the given Unix domain socket until the user quits (q / Esc / Ctrl-C).
 func runTUI(adminSocket string) error {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -38,15 +33,6 @@ func runTUI(adminSocket string) error {
 	_, err := p.Run()
 	return err
 }
-
-// ---- data shapes ----
-//
-// Most admin endpoints (providers, aliases, health, cache, config) are served
-// from Go view types that carry snake_case json tags. The raw metrics and
-// request-log records, however, are marshalled from tag-less structs and thus
-// hit the wire with Go's default PascalCase field names (e.g. UptimeSeconds,
-// DurMillis, PromptTokens). Those are decoded via a tolerant object view so the
-// dashboard works against either casing.
 
 type healthResp struct {
 	Status  string `json:"status"`
@@ -78,12 +64,7 @@ type metricsResp struct {
 	CostMicros       int64
 	LatencyP50Ms     int64
 	LatencyP95Ms     int64
-	// LatencyWindow and LatencySamples are the basis the percentiles above were
-	// computed from. The collector computes them from a bounded sliding
-	// reservoir, not from the lifetime counters beside them (M8), so a reader
-	// of this dashboard needs them: without them the displayed p95 is
-	// indistinguishable from an all-time percentile and reads healthy during
-	// exactly the incident a percentile is consulted for.
+
 	LatencyWindow  string
 	LatencySamples int64
 	ByProvider     map[string]providerStat
@@ -189,7 +170,6 @@ type configResp struct {
 	Version string `json:"version"`
 }
 
-// snapshot holds everything the dashboard renders for one poll.
 type snapshot struct {
 	health       healthResp
 	metrics      metricsResp
@@ -201,8 +181,6 @@ type snapshot struct {
 	config       configResp
 }
 
-// ---- tolerant JSON decoding ----
-
 type flexObject map[string]json.RawMessage
 
 func parseFlex(data []byte) flexObject {
@@ -213,8 +191,6 @@ func parseFlex(data []byte) flexObject {
 	return flexObject(m)
 }
 
-// get returns the value for the first candidate key present, matching keys
-// case- and separator-insensitively as a fallback.
 func (f flexObject) get(candidates ...string) json.RawMessage {
 	for _, c := range candidates {
 		if v, ok := f[c]; ok {
@@ -284,8 +260,6 @@ func normalizeKey(s string) string {
 	return string(b)
 }
 
-// ---- model ----
-
 type tickMsg struct{}
 
 type fetchResult struct {
@@ -345,8 +319,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ---- fetch ----
-
 func getJSON(client *http.Client, path string, out any) error {
 	resp, err := client.Get("http://tallow" + path)
 	if err != nil {
@@ -359,9 +331,6 @@ func getJSON(client *http.Client, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// fetchAll probes /health first (the liveness signal); if that fails the
-// gateway is unreachable. Remaining endpoints are best-effort so a single bad
-// endpoint doesn't blank the whole dashboard.
 func fetchAll(client *http.Client) (*snapshot, error) {
 	s := &snapshot{}
 	if err := getJSON(client, "/health", &s.health); err != nil {
@@ -381,8 +350,6 @@ func fetchAll(client *http.Client) (*snapshot, error) {
 	return s, nil
 }
 
-// ---- rendering ----
-
 var (
 	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00d5ff"))
 	sectionStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#b388ff"))
@@ -396,11 +363,11 @@ var (
 func healthColor(state string) string {
 	switch state {
 	case "closed":
-		return "#00c853" // circuit closed: healthy
+		return "#00c853"
 	case "open":
-		return "#ff5252" // circuit tripped: unhealthy
+		return "#ff5252"
 	case "half-open":
-		return "#ffd740" // testing
+		return "#ffd740"
 	default:
 		return "245"
 	}
@@ -417,7 +384,6 @@ func statusColor(status string) string {
 	}
 }
 
-// rpmStr renders an RPM remaining value; negative means "unlimited".
 func rpmStr(v int) string {
 	if v < 0 {
 		return "∞"
@@ -429,10 +395,6 @@ func dollars(cents int64) string {
 	return fmt.Sprintf("$%.2f", float64(cents)/100.0)
 }
 
-// microDollars renders a micro-USD amount for display. The gateway reports
-// cost in micro-USD so sub-cent spend is not truncated away; the TUI shows
-// dollars. Values below one cent still render their true magnitude rather
-// than a flat $0.00, so real spend stays visible.
 func microDollars(micros int64) string {
 	return fmt.Sprintf("$%.4f", float64(micros)/1e6)
 }
@@ -477,7 +439,6 @@ func (m *model) unreachableView() string {
 func renderDashboard(s *snapshot) string {
 	var b strings.Builder
 
-	// 1. header
 	version := s.health.Version
 	if version == "" {
 		version = s.config.Version
@@ -491,7 +452,6 @@ func renderDashboard(s *snapshot) string {
 	b.WriteString(labelStyle.Render(fmt.Sprintf("uptime %s   config %s",
 		fmtUptime(s.metrics.UptimeSeconds), s.config.Path)) + "\n\n")
 
-	// 2. totals
 	b.WriteString(sectionStyle.Render("Totals") + "\n")
 	to := s.metrics
 	fmt.Fprintf(&b, "requests %d   errors %s   cached %s\n",
@@ -500,37 +460,25 @@ func renderDashboard(s *snapshot) string {
 		to.PromptTokens, to.CompletionTokens)
 	fmt.Fprintf(&b, "cost %s   p50 %d ms   p95 %d ms\n",
 		microDollars(to.CostMicros), to.LatencyP50Ms, to.LatencyP95Ms)
-	// Name the window the percentiles were computed over (M8). The collector
-	// keeps a bounded sliding reservoir, not lifetime latencies, so a bare
-	// "p95 90 ms" is indistinguishable from an all-time figure - and reads
-	// reassuringly healthy during an incident, which is the moment an
-	// operator consults it. One short suffix makes the basis explicit.
-	//
-	// The collector names its own window ("last_512_requests"); sample count is
-	// appended because it is the part that differs day to day and tells the
-	// reader how much evidence the percentile actually rests on.
+
 	if to.LatencyWindow != "" {
 		fmt.Fprintf(&b, "%s\n", mutedStyle.Render(
 			fmt.Sprintf("latency over %s, %d sampled", to.LatencyWindow, to.LatencySamples)))
 	}
 	b.WriteString("\n")
 
-	// 3. providers / keys
 	b.WriteString(sectionStyle.Render("Providers") + "\n")
 	b.WriteString(renderProviders(s.providers))
 	b.WriteString("\n")
 
-	// 4. aliases
 	b.WriteString(sectionStyle.Render("Aliases") + "\n")
 	b.WriteString(renderAliases(s.aliases))
 	b.WriteString("\n")
 
-	// 5. recent log
 	b.WriteString(sectionStyle.Render("Recent requests") + "\n")
 	b.WriteString(renderLogs(s.logs))
 	b.WriteString("\n")
 
-	// 6. cache
 	c := s.cache
 	b.WriteString(sectionStyle.Render("Cache") + "  ")
 	fmt.Fprintf(&b, "hit %d   miss %d   evict %d   entries %d\n",
@@ -588,8 +536,6 @@ func renderProviders(providers []providerView) string {
 	return b.String()
 }
 
-// providerRemaining aggregates a provider's key-level RPM remaining; when every
-// key is unlimited (or there are no keys) it falls back to the configured rate.
 func providerRemaining(p providerView) int {
 	if len(p.Keys) == 0 {
 		return p.RPM
@@ -660,8 +606,6 @@ func renderLogs(logs []logEntry) string {
 	return b.String()
 }
 
-// keyTail trims a "/"- or "."-delimited key id to a short tail for the log
-// column (long dotted keys stay readable).
 func keyTail(key string) string {
 	if i := strings.LastIndexByte(key, '/'); i >= 0 && i < len(key)-1 {
 		return key[i+1:]

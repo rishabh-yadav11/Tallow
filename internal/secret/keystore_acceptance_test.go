@@ -8,23 +8,6 @@ import (
 	"testing"
 )
 
-// This file verifies the rollback contract the way an operator meets it: across
-// a restart, using LoadStore on the real file, and by reading the bytes on disk
-// rather than trusting the in-memory view.
-//
-// keystore_failure_test.go injects a write failure and checks the in-memory map.
-// That is the right unit test, but it stops one process lifetime short of the
-// question that matters. When `tallowctl key add` prints an error and the
-// operator restarts Tallow, what does the gateway actually load? The contract
-// Set and Delete now promise is that the in-memory map always describes what is
-// on disk, so the answers here must agree across a reload: a failed add leaves
-// no trace on disk, a failed delete leaves the old credential usable, and a
-// failed overwrite leaves the previous credential intact. Every case also pins
-// the on-disk bytes, so a store that merely failed to read back correctly
-// cannot pass.
-
-// loadFresh returns a keystore on disk seeded with the given entries, loaded
-// through the real LoadStore, plus the box and path needed to drive it.
 func loadFresh(t *testing.T, path string, box *Box, seed map[string]string) *Store {
 	t.Helper()
 	s, err := LoadStore(path, box)
@@ -48,9 +31,6 @@ func newTestBox(t *testing.T) *Box {
 	return box
 }
 
-// onDiskRefs reads the keystore file directly and returns its refs, without
-// going through a Store. This is the ground truth an operator would find on
-// disk after a crash or restart.
 func onDiskRefs(t *testing.T, path string) []string {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -81,10 +61,6 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// TestFailedAddIsInvisibleAfterRestart is the operator-visible half of the
-// rollback. The add reports an error, so the operator believes nothing was
-// stored. After a restart the gateway must load a keystore with no such entry -
-// not merely an in-memory map that happens to agree.
 func TestFailedAddIsInvisibleAfterRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "keys")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -93,7 +69,6 @@ func TestFailedAddIsInvisibleAfterRestart(t *testing.T) {
 	path := filepath.Join(dir, "keys.json")
 	box := newTestBox(t)
 
-	// Seed a working store while the directory is still writable.
 	s, err := LoadStore(path, box)
 	if err != nil {
 		t.Fatalf("LoadStore: %v", err)
@@ -102,8 +77,6 @@ func TestFailedAddIsInvisibleAfterRestart(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Now make the directory unwritable, which is the real-world shape of the
-	// failure: disk full, read-only mount, or a permissions mistake.
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatal(err)
 	}
@@ -116,8 +89,6 @@ func TestFailedAddIsInvisibleAfterRestart(t *testing.T) {
 		t.Fatal("expected the save to fail on a read-only filesystem")
 	}
 
-	// The live store still serves the pre-existing credential, and the rejected
-	// credential is not live.
 	if got, err := s.Get("existing"); err != nil || got != "kept" {
 		t.Fatalf("after the failed add, Get(existing) = %q, %v; want %q", got, err, "kept")
 	}
@@ -126,9 +97,6 @@ func TestFailedAddIsInvisibleAfterRestart(t *testing.T) {
 			"key the operator was told was not stored")
 	}
 
-	// Now the decisive check: a fresh LoadStore, as a restarting Tallow would
-	// do, must not see the rejected credential, and the on-disk file must never
-	// have mentioned it.
 	if got := onDiskRefs(t, path); !equalStrings(got, []string{"existing"}) {
 		t.Errorf("on-disk refs are %v, want [existing]: the rejected credential "+
 			"reached disk", got)
@@ -146,9 +114,6 @@ func TestFailedAddIsInvisibleAfterRestart(t *testing.T) {
 	}
 }
 
-// TestFailedOverwriteKeepsTheOldCredentialAfterRestart pins the overwrite case,
-// which is the one an operator is most likely to hit: rotating a key whose save
-// fails must leave the OLD key working, not no key and not the new one.
 func TestFailedOverwriteKeepsTheOldCredentialAfterRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "keys")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -165,7 +130,6 @@ func TestFailedOverwriteKeepsTheOldCredentialAfterRestart(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Make the directory unwritable so the rotation's save fails for real.
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatal(err)
 	}
@@ -178,12 +142,11 @@ func TestFailedOverwriteKeepsTheOldCredentialAfterRestart(t *testing.T) {
 		t.Fatal("expected the overwrite to fail on a read-only filesystem")
 	}
 
-	// The in-memory view must still be the old value.
 	if got, err := s.Get("api"); err != nil || got != "old-secret" {
 		t.Errorf("after the failed overwrite Get(api) = %q, %v; want the previous "+
 			"value %q", got, err, "old-secret")
 	}
-	// And the previous value must still be on disk and still loadable.
+
 	if got := onDiskRefs(t, path); !equalStrings(got, []string{"api"}) {
 		t.Errorf("on-disk refs are %v, want [api]", got)
 	}
@@ -197,9 +160,6 @@ func TestFailedOverwriteKeepsTheOldCredentialAfterRestart(t *testing.T) {
 	}
 }
 
-// TestFailedDeleteKeepsTheKeyUsableAfterRestart is the mirror image. A delete
-// that reports an error must not have taken the credential away: the gateway
-// should keep working, and a restart must still find the key.
 func TestFailedDeleteKeepsTheKeyUsableAfterRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "keys")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -228,7 +188,6 @@ func TestFailedDeleteKeepsTheKeyUsableAfterRestart(t *testing.T) {
 		t.Fatal("expected the delete to fail on a read-only filesystem")
 	}
 
-	// Still live in memory, and still on disk after a restart.
 	if got, err := s.Get("api"); err != nil || got != "still-needed" {
 		t.Errorf("after the failed delete Get(api) = %q, %v; want %q: a delete "+
 			"that reported an error took the credential away anyway", got, err, "still-needed")
@@ -248,9 +207,6 @@ func TestFailedDeleteKeepsTheKeyUsableAfterRestart(t *testing.T) {
 	}
 }
 
-// TestSuccessfulOperationsSurviveRestart is the positive control for the whole
-// file. If these do not round-trip, the failures above would prove nothing,
-// because a store that never wrote anything would also "keep" the old value.
 func TestSuccessfulOperationsSurviveRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keys.json")
 	box := newTestBox(t)
@@ -268,12 +224,6 @@ func TestSuccessfulOperationsSurviveRestart(t *testing.T) {
 		t.Errorf("on-disk refs are %v, want %v", got, want)
 	}
 
-	// List returns refs in Go map iteration order, which is deliberately
-	// randomised. The CLI sorts before printing (cmd/tallowctl/key.go), and so
-	// does the on-disk helper above, so this is the one assertion that has to
-	// sort for itself. Asserting a fixed order here made the test fail
-	// intermittently, which is worse than not testing it: it turns a real
-	// regression signal into noise a maintainer learns to re-run away from.
 	reopened, err := LoadStore(path, box)
 	if err != nil {
 		t.Fatalf("reload: %v", err)
@@ -291,15 +241,12 @@ func TestSuccessfulOperationsSurviveRestart(t *testing.T) {
 	if _, err := reopened.Get("b"); err == nil {
 		t.Error("the deleted ref came back after a restart")
 	}
-	// A deleted credential must not be recoverable from the file either.
+
 	if refs := onDiskRefs(t, path); !equalStrings(refs, want) {
 		t.Errorf("after a restart the on-disk refs are %v, want %v", refs, want)
 	}
 }
 
-// TestNoTemporaryFileSurvivesAFailedSave checks the failure path leaves no debris.
-// A leftover keys.json.tmp holding a sealed credential is a plaintext-at-rest
-// leak of the rejected write, and the next save would rename it into place.
 func TestNoTemporaryFileSurvivesAFailedSave(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "keys")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -328,7 +275,7 @@ func TestNoTemporaryFileSurvivesAFailedSave(t *testing.T) {
 		t.Errorf("a temp keystore survived a failed save (stat err = %v): it can "+
 			"leak the rejected credential or be renamed into place by a later save", err)
 	}
-	// The keystore itself must not have been created either.
+
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("a failed save created the keystore file (stat err = %v)", err)
 	}

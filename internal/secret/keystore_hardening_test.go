@@ -6,16 +6,6 @@ import (
 	"testing"
 )
 
-// The keystore holds every provider credential the gateway uses. These cover
-// the states an operator can actually find on disk after an interrupted
-// upgrade, a bad edit, or a permissions mistake - each of which must fail
-// closed and say something actionable, rather than silently starting the
-// gateway with an empty or half-read key set.
-
-// TestLoadStoreRejectsCorruptJSON covers a truncated or hand-edited keystore.
-// Returning an empty store here would be the worst outcome: the gateway would
-// start normally and then fail every upstream call with an authentication
-// error, pointing the operator at their provider rather than at the keystore.
 func TestLoadStoreRejectsCorruptJSON(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
@@ -47,9 +37,6 @@ func TestLoadStoreRejectsCorruptJSON(t *testing.T) {
 	}
 }
 
-// TestLoadStoreRejectsAFutureVersion guards the version gate. A keystore
-// written by a newer tallowctl may hold fields this binary would silently drop
-// on the next Set, so it must be refused rather than downgraded.
 func TestLoadStoreRejectsAFutureVersion(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
@@ -65,10 +52,6 @@ func TestLoadStoreRejectsAFutureVersion(t *testing.T) {
 	}
 }
 
-// TestLoadStoreAcceptsAnEmptyEntriesMap covers the legitimate state where a
-// keystore exists but holds no keys. That is what `tallowctl key add` produces
-// before the first add, and it must load cleanly rather than being treated as
-// corrupt.
 func TestLoadStoreAcceptsAnEmptyEntriesMap(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
@@ -91,10 +74,6 @@ func TestLoadStoreAcceptsAnEmptyEntriesMap(t *testing.T) {
 	}
 }
 
-// TestKeystoreFileIsNotWorldReadable checks the permission of the file the
-// keystore is written to. These are plaintext-equivalent provider credentials;
-// 0o600 is the only acceptable mode, and a umask or a pre-existing file must
-// not widen it.
 func TestKeystoreFileIsNotWorldReadable(t *testing.T) {
 	if os.Getenv("GOOS") == "windows" {
 		t.Skip("POSIX file modes do not apply on Windows")
@@ -120,8 +99,6 @@ func TestKeystoreFileIsNotWorldReadable(t *testing.T) {
 		t.Errorf("keystore mode = %04o, want no group or world access", perm)
 	}
 
-	// A pre-existing file with loose permissions must be tightened, not left
-	// alone. os.OpenFile ignores the mode for an existing file.
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -138,9 +115,6 @@ func TestKeystoreFileIsNotWorldReadable(t *testing.T) {
 	}
 }
 
-// TestNoTemporaryFileSurvivesASuccessfulSave checks the atomic-write path
-// leaves no .tmp behind. A leftover temp file is a full plaintext-shaped copy
-// of the keystore sitting next to the real one, unpruned.
 func TestNoTemporaryFileSurvivesASuccessfulSave(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
@@ -160,8 +134,6 @@ func TestNoTemporaryFileSurvivesASuccessfulSave(t *testing.T) {
 	}
 }
 
-// TestGetReportsAMissingRef checks the plain miss path, which the gateway hits
-// on every reload for a key the operator has not added yet.
 func TestGetReportsAMissingRef(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
@@ -180,9 +152,6 @@ func TestGetReportsAMissingRef(t *testing.T) {
 	}
 }
 
-// TestGetFailsClosedOnAWrongMasterKey is the tamper case at the keystore
-// level. A keystore written under one master key must not decrypt under
-// another, and must not return the ciphertext as if it were plaintext.
 func TestGetFailsClosedOnAWrongMasterKey(t *testing.T) {
 	dir := t.TempDir()
 	boxA, err := NewBox([]byte("master-A"))
@@ -215,12 +184,6 @@ func TestGetFailsClosedOnAWrongMasterKey(t *testing.T) {
 	}
 }
 
-// TestLoadStoreReturnsNoStoreOnAReadError covers the failure that is neither a
-// missing file nor a parse error: the keystore exists but cannot be read. The
-// important property is that LoadStore returns a nil store. Handing back a
-// usable-looking store alongside an error invites a caller to carry on with an
-// empty key set, and the gateway would then start normally and fail every
-// upstream call with an authentication error.
 func TestLoadStoreReturnsNoStoreOnAReadError(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
@@ -239,8 +202,6 @@ func TestLoadStoreReturnsNoStoreOnAReadError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
 
-	// If the mode was not actually enforced, the read succeeds and there is
-	// nothing to assert.
 	if _, err := os.ReadFile(path); err == nil {
 		t.Skip("the file is still readable; this environment cannot exercise the read error")
 	}
@@ -255,10 +216,6 @@ func TestLoadStoreReturnsNoStoreOnAReadError(t *testing.T) {
 	}
 }
 
-// TestLoadStoreRejectsAnOlderKeystoreVersion closes the other side of the
-// version gate. Version 0 is what a pre-versioning build, or a hand-written
-// file with the field omitted, would produce. Accepting it would read the
-// entries under a schema this binary has never validated.
 func TestLoadStoreRejectsAnOlderKeystoreVersion(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
@@ -274,10 +231,6 @@ func TestLoadStoreRejectsAnOlderKeystoreVersion(t *testing.T) {
 	}
 }
 
-// TestSetOverwriteRestoresThePriorValueOnFailure is the overwrite variant of
-// the rollback. Replacing an existing credential is the common case, and a
-// failed write must leave the working credential in place rather than a
-// half-applied mixture.
 func TestSetOverwriteRestoresThePriorValueOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	box, err := NewBox([]byte("master"))
