@@ -9,9 +9,6 @@ import (
 	"time"
 )
 
-// requestMetaWireKeys is the admin API wire contract: the exact JSON keys a
-// RequestMeta marshals to, in struct declaration order. Renaming or dropping
-// any `json` tag changes this set and fails the tests below.
 var requestMetaWireKeys = []string{
 	"id",
 	"started_at",
@@ -59,9 +56,6 @@ func filledRequestMeta() RequestMeta {
 	}
 }
 
-// TestRequestMetaWireKeys defends the admin API wire contract: the exact set
-// of JSON keys RequestMeta produces. A renamed tag shows up as one missing and
-// one unexpected key; a dropped tag (no `json:"..."`) leaks the Go field name.
 func TestRequestMetaWireKeys(t *testing.T) {
 	b, err := json.Marshal(filledRequestMeta())
 	if err != nil {
@@ -79,9 +73,6 @@ func TestRequestMetaWireKeys(t *testing.T) {
 	}
 }
 
-// TestRequestMetaMarshalValues pins the encoded values and their JSON types:
-// durations and costs as numbers, stream/cached as booleans, timestamps as
-// RFC3339 strings, everything else as strings.
 func TestRequestMetaMarshalValues(t *testing.T) {
 	cases := []struct {
 		name string
@@ -161,9 +152,6 @@ func TestRequestMetaMarshalValues(t *testing.T) {
 	}
 }
 
-// TestRequestMetaRoundTrip checks marshal→unmarshal fidelity. StartedAt is
-// built with time.Date in UTC so the value carries no monotonic clock reading
-// and no zone offset — DeepEqual on the decoded time is exact.
 func TestRequestMetaRoundTrip(t *testing.T) {
 	in := filledRequestMeta()
 	b, err := json.Marshal(in)
@@ -179,8 +167,6 @@ func TestRequestMetaRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRequestMetaZeroValueJSON pins the zero-value encoding: every wire key is
-// present (no `omitempty` anywhere) and zeros encode as 0/false/""/zero-time.
 func TestRequestMetaZeroValueJSON(t *testing.T) {
 	b, err := json.Marshal(RequestMeta{})
 	if err != nil {
@@ -192,9 +178,6 @@ func TestRequestMetaZeroValueJSON(t *testing.T) {
 	}
 }
 
-// TestKeyBudgetZeroSemantics: the Key doc contract says zero budgets mean
-// unlimited. The observable contract is that zero values round-trip and stay
-// distinct from set values.
 func TestKeyBudgetZeroSemantics(t *testing.T) {
 	t.Run("zero key round trips unchanged", func(t *testing.T) {
 		var in Key
@@ -244,9 +227,6 @@ func TestKeyBudgetZeroSemantics(t *testing.T) {
 	}
 }
 
-// TestTargetPricingZeroIsUnknown: the Target doc contract says pricing 0 means
-// unknown, reported as $0. Zero pricing round-trips and is distinct from set
-// pricing.
 func TestTargetPricingZeroIsUnknown(t *testing.T) {
 	t.Run("zero pricing round trips unchanged", func(t *testing.T) {
 		var in Target
@@ -296,9 +276,6 @@ func TestTargetPricingZeroIsUnknown(t *testing.T) {
 	})
 }
 
-// TestRequestMetaCoalescedMarshal pins the Coalesced flag through the wire:
-// it marshals as true (never omitted since there is no omitempty) and survives
-// a round trip.
 func TestRequestMetaCoalescedMarshal(t *testing.T) {
 	in := filledRequestMeta()
 	in.Coalesced = true
@@ -325,9 +302,6 @@ func TestRequestMetaCoalescedMarshal(t *testing.T) {
 	}
 }
 
-// TestTargetPricingBoundaries pins that the full pricing range survives a JSON
-// round trip exactly: the documented sub-cent floor (0.0005), an absurdly large
-// bound (1,000,000), and fragile negative pricing all come back bit-for-bit.
 func TestTargetPricingBoundaries(t *testing.T) {
 	for _, price := range []float64{0.0005, 1000000, -1, -0.00025} {
 		in := Target{Provider: "p", PriceInputPerM: price, PriceOutputPerM: price}

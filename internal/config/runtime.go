@@ -8,8 +8,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/money"
 )
 
-// Build converts the validated TOML document into runtime model values.
-// Key secrets are left empty here; the app resolves them via the keystore.
 func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 	provs := make([]model.Provider, 0, len(c.Provider))
 	for _, p := range c.Provider {
@@ -29,13 +27,20 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 			HealthInterval: hi,
 			RPM:            p.RPM,
 			Timeout:        to,
+			ProxyURL:       p.ProxyURL,
+			Disabled:       p.Disabled,
+			Headers:        p.Headers,
+			ExcludedModels: p.ExcludedModels,
+			Catalog:        p.Catalog,
+			RequestRetry:   p.RequestRetry,
+			DisableCooling: p.DisableCooling,
 		}
 		for _, k := range p.Key {
 			w, err := Dur(k.Window)
 			if err != nil {
 				return nil, nil, fmt.Errorf("provider %q key %q: window: %w", p.Name, k.ID, err)
 			}
-			mp.Keys = append(mp.Keys, model.Key{
+			mk := model.Key{
 				ID:             k.ID,
 				Ref:            k.Ref,
 				RPM:            k.RPM,
@@ -43,18 +48,33 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 				Window:         w,
 				MaxConcurrent:  k.MaxConcurrent,
 				CostLimitCents: k.CostLimitCents,
-				// The operator configures the cap in cents; the runtime
-				// budget enforces it in micro-USD so sub-cent spend is
-				// accounted instead of truncated away.
+
 				CostLimitMicros: money.CentsToMicroUSD(k.CostLimitCents),
-			})
+				Weight:          k.Weight,
+				Priority:        k.Priority,
+				Headers:         k.Headers,
+				ProxyURL:        k.ProxyURL,
+				RequestRetry:    k.RequestRetry,
+				ErrorRules:      copyErrorRules(k.ErrorRules),
+			}
+
+			dc := p.DisableCooling
+			if k.DisableCooling != nil {
+				dc = *k.DisableCooling
+			}
+			mk.DisableCooling = dc
+			mp.Keys = append(mp.Keys, mk)
 		}
 		provs = append(provs, mp)
 	}
 
 	aliases := make([]model.Alias, 0, len(c.Alias))
 	for _, a := range c.Alias {
-		ma := model.Alias{Name: a.Name}
+		ma := model.Alias{
+			Name:           a.Name,
+			DisplayName:    a.DisplayName,
+			ExcludedModels: a.ExcludedModels,
+		}
 		for _, t := range a.Target {
 			ma.Targets = append(ma.Targets, model.Target{
 				Provider:        t.Provider,
@@ -65,6 +85,8 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 				SupportsStream:  t.SupportsStream,
 				PriceInputPerM:  t.PriceInputPerM,
 				PriceOutputPerM: t.PriceOutputPerM,
+				ForceMapping:    t.ForceMapping,
+				DisplayName:     t.DisplayName,
 			})
 		}
 		aliases = append(aliases, ma)
@@ -72,7 +94,22 @@ func (c *Config) Build() ([]model.Provider, []model.Alias, error) {
 	return provs, aliases, nil
 }
 
-// Params bundles the parsed runtime knobs derived from config durations.
+func copyErrorRules(in []ErrorRule) []model.ErrorRule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]model.ErrorRule, len(in))
+	for i, r := range in {
+		out[i] = model.ErrorRule{
+			Status:      r.Status,
+			Match:       r.Match,
+			MatchRegexp: r.MatchRegexp,
+			Action:      r.Action,
+		}
+	}
+	return out
+}
+
 type Params struct {
 	QueueTimeout time.Duration
 	ReadTimeout  time.Duration
@@ -83,14 +120,18 @@ type Params struct {
 	RollupEvery  time.Duration
 	VacuumEvery  time.Duration
 	MaxBodyBytes int64
+
+	Strategy                 string
+	RequestRetry             int
+	MaxRetryCredentials      int
+	MaxRetryInterval         time.Duration
+	StreamKeepalive          time.Duration
+	SessionAffinityEnabled   bool
+	SessionAffinityTTL       time.Duration
+	SessionAffinitySubagents bool
+	SessionAffinityRebindOn  string
 }
 
-// BuildParams parses the duration-derived runtime knobs.
-//
-// Every duration is also range-checked here rather than only being parsed, so a
-// negative timeout cannot reach the HTTP server (H9). Validate rejects these
-// documents earlier with a clearer message; this second check keeps
-// BuildParams safe for any caller that constructs a Config directly.
 func (c *Config) BuildParams() (Params, error) {
 	q, err := Dur(c.Server.QueueTimeout)
 	if err != nil {
@@ -106,8 +147,7 @@ func (c *Config) BuildParams() (Params, error) {
 	if rt < 0 {
 		return Params{}, fmt.Errorf("read_timeout: must not be negative, got %s", rt)
 	}
-	// WriteTimeout 0 means "unbounded", which is the documented default and is
-	// correct for a streaming LLM response. Only a negative value is rejected.
+
 	wt, err := Dur(c.Server.WriteTimeout)
 	if err != nil {
 		return Params{}, fmt.Errorf("write_timeout: %w", err)
@@ -129,10 +169,7 @@ func (c *Config) BuildParams() (Params, error) {
 	if ttl <= 0 {
 		return Params{}, fmt.Errorf("cache ttl: must be positive, got %s", ttl)
 	}
-	// H7: a sticky TTL of 0 used to mean "never expire", which combined with a
-	// client-chosen X-Session-Id header to make the sticky map an unbounded
-	// write-only structure. It is rejected outright, and the default is set in
-	// applyDefaults.
+
 	sticky, err := Dur(c.Server.StickyTTL)
 	if err != nil {
 		return Params{}, fmt.Errorf("sticky_ttl: %w", err)
@@ -157,15 +194,50 @@ func (c *Config) BuildParams() (Params, error) {
 	if c.Server.MaxRequestBytes < 0 {
 		return Params{}, fmt.Errorf("max_request_bytes: must not be negative, got %d", c.Server.MaxRequestBytes)
 	}
+
+	mri, err := Dur(c.Routing.MaxRetryInterval)
+	if err != nil {
+		return Params{}, fmt.Errorf("routing.max_retry_interval: %w", err)
+	}
+	if mri < 0 {
+		return Params{}, fmt.Errorf("routing.max_retry_interval: must not be negative, got %s", mri)
+	}
+	sk, err := Dur(c.Server.StreamKeepalive)
+	if err != nil {
+		return Params{}, fmt.Errorf("server.stream_keepalive: %w", err)
+	}
+	if sk < 0 {
+		return Params{}, fmt.Errorf("server.stream_keepalive: must not be negative, got %s", sk)
+	}
+	saTTL, err := Dur(c.Routing.SessionAffinityTTL)
+	if err != nil {
+		return Params{}, fmt.Errorf("routing.session_affinity_ttl: %w", err)
+	}
+	if saTTL < 0 {
+		return Params{}, fmt.Errorf("routing.session_affinity_ttl: must not be negative, got %s", saTTL)
+	}
+	strategy := c.Routing.Strategy
+	if strategy == "" {
+		strategy = "round-robin"
+	}
 	return Params{
-		QueueTimeout: q,
-		ReadTimeout:  rt,
-		WriteTimeout: wt,
-		IdleTimeout:  idle,
-		StickyTTL:    sticky,
-		CacheTTL:     ttl,
-		RollupEvery:  rollup,
-		VacuumEvery:  vacuum,
-		MaxBodyBytes: c.Server.MaxRequestBytes,
+		QueueTimeout:             q,
+		ReadTimeout:              rt,
+		WriteTimeout:             wt,
+		IdleTimeout:              idle,
+		StickyTTL:                sticky,
+		CacheTTL:                 ttl,
+		RollupEvery:              rollup,
+		VacuumEvery:              vacuum,
+		MaxBodyBytes:             c.Server.MaxRequestBytes,
+		Strategy:                 strategy,
+		RequestRetry:             c.Routing.RequestRetry,
+		MaxRetryCredentials:      c.Routing.MaxRetryCredentials,
+		MaxRetryInterval:         mri,
+		StreamKeepalive:          sk,
+		SessionAffinityEnabled:   c.Routing.SessionAffinity,
+		SessionAffinityTTL:       saTTL,
+		SessionAffinitySubagents: c.Routing.SessionAffinitySubagents,
+		SessionAffinityRebindOn:  c.Routing.SessionAffinityRebindOn,
 	}, nil
 }

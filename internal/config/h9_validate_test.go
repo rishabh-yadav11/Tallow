@@ -7,22 +7,6 @@ import (
 	"testing"
 )
 
-// H9: Validate() used to check no durations at all. Duration parsing lived in
-// BuildParams, which runs *after* Validate has already declared the document
-// valid, so a garbage duration passed validation and failed later at an
-// unpredictable point, and a NEGATIVE duration passed validation entirely.
-//
-// The three distinct harms were:
-//
-//	negative retention days  -> delete live data immediately (silent loss)
-//	negative cache max_bytes -> nonsensical cache bound
-//	garbage duration string  -> fails at load-with-wrong-error rather than at
-//	                            validate, naming the wrong key
-//
-// The fix moved parsing and range-checking into Validate, where every rule
-// names the exact TOML key so the operator is told which line to fix.
-
-// baseConfig is a minimal valid document; each test overrides one knob.
 func baseConfig() Config {
 	c := Config{Version: SchemaVersion}
 	c.Provider = []Provider{{
@@ -47,13 +31,11 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-// TestH9ValidateRejectsBadDurations is the core H9 regression: every duration
-// knob must be parsed and range-checked by Validate, not deferred to BuildParams.
 func TestH9ValidateRejectsBadDurations(t *testing.T) {
 	cases := []struct {
 		name  string
 		mut   func(*Config)
-		wantK string // substring the error must mention, i.e. the TOML key
+		wantK string
 	}{
 		{
 			name:  "garbage queue timeout",
@@ -106,7 +88,7 @@ func TestH9ValidateRejectsBadDurations(t *testing.T) {
 			wantK: "server.sticky_ttl",
 		},
 		{
-			// 0 was the H7 finding: it made the expiry branch unreachable.
+
 			name:  "zero sticky ttl means never expire",
 			mut:   func(c *Config) { c.Server.StickyTTL = "0s" },
 			wantK: "server.sticky_ttl",
@@ -192,8 +174,6 @@ func TestH9ValidateRejectsBadDurations(t *testing.T) {
 	}
 }
 
-// TestH9ValidateRejectsNegativeCounts covers the non-duration half of H9: the
-// numeric knobs whose negative values had distinct, damaging meanings.
 func TestH9ValidateRejectsNegativeCounts(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -204,8 +184,7 @@ func TestH9ValidateRejectsNegativeCounts(t *testing.T) {
 		{"negative max_request_bytes", func(c *Config) { c.Server.MaxRequestBytes = -1 }, "server.max_request_bytes"},
 		{"negative cache max_entries", func(c *Config) { c.Cache.MaxEntries = -1 }, "cache.max_entries"},
 		{"negative cache max_bytes", func(c *Config) { c.Cache.MaxBytes = -1 }, "cache.max_bytes"},
-		// These are the silent-data-loss cases: a negative retention day count
-		// means "delete everything now" rather than "keep nothing".
+
 		{"negative raw_bodies_days", func(c *Config) { v := -30; c.Retention.RawBodiesDays = &v }, "retention.raw_bodies_days"},
 		{"negative metadata_days", func(c *Config) { v := -30; c.Retention.MetadataDays = &v }, "retention.metadata_days"},
 		{"negative errors_days", func(c *Config) { v := -1; c.Retention.ErrorsDays = &v }, "retention.errors_days"},
@@ -228,9 +207,6 @@ func TestH9ValidateRejectsNegativeCounts(t *testing.T) {
 	}
 }
 
-// TestH9BadDurationFailsAtLoadNotLater is the end-to-end property: Load must
-// refuse a garbage duration, naming the key, rather than accepting the document
-// and failing at BuildParams.
 func TestH9BadDurationFailsAtLoadNotLater(t *testing.T) {
 	body := `version = 1
 
@@ -252,7 +228,7 @@ name = "gpt-4"
 	path := writeConfig(t, body)
 	cfg, err := Load(path)
 	if err == nil {
-		// Load accepted it. The question is whether Validate caught it.
+
 		if verr := cfg.Validate(); verr == nil {
 			t.Fatalf("H9 NOT FIXED: both Load and Validate accepted queue_timeout = %q", "not-a-duration")
 		}
@@ -263,14 +239,11 @@ name = "gpt-4"
 	}
 }
 
-// TestH9ValidDurationsStillPass guards against the fix over-rejecting. A
-// legitimate config must still validate, including the documented zero
-// write_timeout meaning "unbounded for streaming".
 func TestH9ValidDurationsStillPass(t *testing.T) {
 	c := baseConfig()
 	c.Server.QueueTimeout = "30s"
 	c.Server.ReadTimeout = "30s"
-	c.Server.WriteTimeout = "0s" // unbounded: valid and documented
+	c.Server.WriteTimeout = "0s"
 	c.Server.IdleTimeout = "60s"
 	c.Server.StickyTTL = "15m"
 	c.Cache.TTL = "5m"
@@ -288,14 +261,9 @@ func TestH9ValidDurationsStillPass(t *testing.T) {
 	}
 }
 
-// TestH9EmptyDurationsAreSkipped documents the deliberate carve-out: an empty
-// duration field is skipped, not treated as zero, because a Config built by
-// hand (as tests and embedders do) has empty strings everywhere. applyDefaults
-// fills them on the Load path. What matters is that an operator cannot write a
-// garbage or negative value and have it accepted.
 func TestH9EmptyDurationsAreSkipped(t *testing.T) {
 	c := baseConfig()
-	// Every duration left empty.
+
 	if err := c.Validate(); err != nil {
 		t.Fatalf("a Config with empty duration fields was rejected; empty means unset, not invalid: %v", err)
 	}

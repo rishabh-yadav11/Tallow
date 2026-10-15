@@ -6,52 +6,41 @@ import (
 	"testing"
 )
 
-// M14: any base_url was accepted, so a config could aim the gateway at an
-// internal host. The upstream request carries the provider Authorization header
-// and the full user prompt, so that turned the gateway into a credentialed HTTP
-// client for whatever the config named.
-//
-// The address policy is deliberately tested as a TABLE over address space rather
-// than as a handful of examples. The whole point of a default-deny rule is that
-// it holds for the address nobody thought to enumerate, so the test enumerates.
-
-// TestM14IsPublicAddrDenyByDefault is the core address-space policy.
 func TestM14IsPublicAddrDenyByDefault(t *testing.T) {
 	blocked := []struct {
 		addr string
 		why  string
 	}{
-		// Loopback. The classic SSRF target, and what httptest binds to.
+
 		{"127.0.0.1", "IPv4 loopback"},
 		{"127.255.255.254", "IPv4 loopback range edge"},
 		{"::1", "IPv6 loopback"},
-		// IPv4-mapped loopback. The trap case: without Unmap, this reads as a
-		// public IPv6 address and sails through the guard.
+
 		{"::ffff:127.0.0.1", "IPv4-mapped loopback"},
 		{"::ffff:10.0.0.1", "IPv4-mapped RFC1918"},
-		// RFC1918.
+
 		{"10.0.0.1", "RFC1918 10/8"},
 		{"10.255.255.255", "RFC1918 10/8 edge"},
 		{"172.16.0.1", "RFC1918 172.16/12 low"},
 		{"172.31.255.254", "RFC1918 172.16/12 high"},
 		{"192.168.1.1", "RFC1918 192.168/16"},
-		// Carrier-grade NAT: globally routable in form, not in fact.
+
 		{"100.64.0.1", "CGNAT 100.64/10 low"},
 		{"100.127.255.255", "CGNAT 100.64/10 high"},
-		// Link-local, including the cloud metadata endpoint.
+
 		{"169.254.1.1", "link-local"},
 		{"169.254.169.254", "cloud metadata endpoint"},
 		{"fe80::1", "IPv6 link-local"},
-		// Unique-local, the IPv6 analogue of RFC1918.
+
 		{"fc00::1", "IPv6 unique-local fc00::/7"},
 		{"fd00::1", "IPv6 unique-local fd00::/8"},
-		// Unspecified and "this network".
+
 		{"0.0.0.0", "unspecified"},
 		{"0.1.2.3", "0.0.0.0/8 this-network"},
-		// Reserved.
+
 		{"240.0.0.1", "240.0.0.0/4 reserved"},
 		{"255.255.255.255", "broadcast"},
-		// Multicast.
+
 		{"224.0.0.1", "IPv4 multicast"},
 		{"ff02::1", "IPv6 link-local multicast"},
 	}
@@ -66,11 +55,11 @@ func TestM14IsPublicAddrDenyByDefault(t *testing.T) {
 	}
 
 	allowed := []string{
-		"1.1.1.1", "8.8.8.8", "93.184.216.34", "172.32.0.1", // just outside 172.16/12
-		"100.63.255.255", // just below CGNAT
-		"100.128.0.1",    // just above CGNAT
-		"192.169.0.1",    // just outside 192.168/16
-		"11.0.0.1",       // just outside 10/8
+		"1.1.1.1", "8.8.8.8", "93.184.216.34", "172.32.0.1",
+		"100.63.255.255",
+		"100.128.0.1",
+		"192.169.0.1",
+		"11.0.0.1",
 		"2606:4700:4700::1111",
 	}
 	for _, s := range allowed {
@@ -87,8 +76,6 @@ func TestM14IsPublicAddrDenyByDefault(t *testing.T) {
 	}
 }
 
-// TestM14DialControlRefusesPrivateAddresses checks the guard at the boundary it
-// actually runs at - the dialer - rather than only the predicate it calls.
 func TestM14DialControlRefusesPrivateAddresses(t *testing.T) {
 	t.Cleanup(func() { SetAllowPrivateBaseURL(false) })
 	SetAllowPrivateBaseURL(false)
@@ -115,7 +102,7 @@ func TestM14DialControlRefusesPrivateAddresses(t *testing.T) {
 			if !asPrivateAddrError(err, &pae) {
 				t.Fatalf("expected a *PrivateAddrError so callers can recognise the policy refusal, got %T: %v", err, err)
 			}
-			// The message is the operator's only clue, so it must say what to do.
+
 			for _, want := range []string{"base_url", "SetAllowPrivateBaseURL"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("refusal message does not mention %q, so the operator cannot act on it: %v", want, err)
@@ -125,8 +112,6 @@ func TestM14DialControlRefusesPrivateAddresses(t *testing.T) {
 	}
 }
 
-// TestM14OptOutAllowsPrivateUpstreams is the other half: a private upstream is a
-// legitimate deployment, and the guard must be switchable.
 func TestM14OptOutAllowsPrivateUpstreams(t *testing.T) {
 	t.Cleanup(func() { SetAllowPrivateBaseURL(false) })
 
@@ -143,8 +128,6 @@ func TestM14OptOutAllowsPrivateUpstreams(t *testing.T) {
 	}
 }
 
-// TestM14DialControlRejectsUnparseableAddress: a guard that silently permits
-// when it cannot parse is not a guard.
 func TestM14DialControlRejectsUnparseableAddress(t *testing.T) {
 	t.Cleanup(func() { SetAllowPrivateBaseURL(false) })
 	SetAllowPrivateBaseURL(false)
@@ -156,8 +139,6 @@ func TestM14DialControlRejectsUnparseableAddress(t *testing.T) {
 	}
 }
 
-// TestM14DialControlAllowsPublicLiterals is the non-regression half: a real
-// public provider must still be reachable, or the guard is a denial of service.
 func TestM14DialControlAllowsPublicLiterals(t *testing.T) {
 	t.Cleanup(func() { SetAllowPrivateBaseURL(false) })
 	SetAllowPrivateBaseURL(false)
@@ -169,8 +150,6 @@ func TestM14DialControlAllowsPublicLiterals(t *testing.T) {
 	}
 }
 
-// TestM14ValidateBaseURL covers the structural half, which runs at load time and
-// is what turns an operator typo into a message rather than a 502.
 func TestM14ValidateBaseURL(t *testing.T) {
 	bad := []struct {
 		url    string
@@ -221,8 +200,6 @@ func TestM14ValidateBaseURL(t *testing.T) {
 	}
 }
 
-// TestM14ValidateRejectsBadBaseURLThroughConfig is the wiring test: the
-// structural check must actually run from Validate, not merely exist.
 func TestM14ValidateRejectsBadBaseURLThroughConfig(t *testing.T) {
 	for _, u := range []string{"api.example.com", "file:///etc/passwd", "https://user:pw@api.example.com"} {
 		c := baseConfig()
@@ -233,13 +210,6 @@ func TestM14ValidateRejectsBadBaseURLThroughConfig(t *testing.T) {
 	}
 }
 
-// TestM14EveryResolvedAddressMustBePublic covers the branch an attacker
-// actually controls: what their domain resolves to.
-//
-// Judging only the first resolved address would let a name resolving to one
-// public and one private address pass validation and then connect to the private
-// one. This is the DNS-rebinding shape of M14, and it is why the guard checks
-// every address rather than picking a winner.
 func TestM14EveryResolvedAddressMustBePublic(t *testing.T) {
 	pub := netip.MustParseAddr("1.1.1.1")
 	pub2 := netip.MustParseAddr("8.8.8.8")
@@ -253,9 +223,6 @@ func TestM14EveryResolvedAddressMustBePublic(t *testing.T) {
 		}
 	})
 
-	// The private address is FIRST in one case and LAST in the other, so a
-	// first-address-only check fails one and the last-address-only fails the
-	// other. A guard that inspects only one position cannot pass both.
 	for _, tc := range []struct {
 		name string
 		ips  []netip.Addr
@@ -286,8 +253,6 @@ func TestM14EveryResolvedAddressMustBePublic(t *testing.T) {
 	})
 }
 
-// asPrivateAddrError is errors.As specialised, so the test reads cleanly and
-// the type assertion stays honest.
 func asPrivateAddrError(err error, target **PrivateAddrError) bool {
 	for err != nil {
 		if e, ok := err.(*PrivateAddrError); ok {

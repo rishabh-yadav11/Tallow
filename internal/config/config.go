@@ -1,147 +1,197 @@
-// Package config loads, validates, and version-guards the hand-editable TOML
-// configuration. The schema version must match SchemaVersion; mismatches are a
-// hard error so future schema changes never silently break an existing file.
 package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 )
 
-// SchemaVersion is the only config version Tallow understands today. Bumping it
-// is a breaking change that must come with validation logic.
 const SchemaVersion = 1
 
-// Config is the full TOML document.
 type Config struct {
-	Version       int           `toml:"version"`
-	Server        Server        `toml:"server"`
-	Auth          Auth          `toml:"auth"`
-	Secret        SecretCfg     `toml:"secret"`
-	Store         StoreCfg      `toml:"store"`
-	Cache         CacheCfg      `toml:"cache"`
-	Retention     Retention     `toml:"retention"`
-	Compaction    Compaction    `toml:"compaction"`
-	Observability Observability `toml:"observability"`
-	Provider      []Provider    `toml:"provider"`
-	Alias         []Alias       `toml:"alias"`
+	Version       int           `toml:"version" json:"version"`
+	Server        Server        `toml:"server" json:"server"`
+	Auth          Auth          `toml:"auth" json:"auth"`
+	Secret        SecretCfg     `toml:"secret" json:"secret"`
+	Store         StoreCfg      `toml:"store" json:"store"`
+	Cache         CacheCfg      `toml:"cache" json:"cache"`
+	Retention     Retention     `toml:"retention" json:"retention"`
+	Compaction    Compaction    `toml:"compaction" json:"compaction"`
+	Observability Observability `toml:"observability" json:"observability"`
+	Routing       Routing       `toml:"routing" json:"routing"`
+	Provider      []Provider    `toml:"provider" json:"provider"`
+	Alias         []Alias       `toml:"alias" json:"alias"`
+}
+
+type Routing struct {
+	Strategy string `toml:"strategy" json:"strategy"`
+
+	RequestRetry int `toml:"request_retry" json:"request_retry"`
+
+	MaxRetryCredentials int `toml:"max_retry_credentials" json:"max_retry_credentials"`
+
+	MaxRetryInterval string `toml:"max_retry_interval" json:"max_retry_interval"`
+
+	CooldownFile string `toml:"cooldown_file" json:"cooldown_file"`
+
+	SessionAffinity bool `toml:"session_affinity" json:"session_affinity"`
+
+	SessionAffinityTTL string `toml:"session_affinity_ttl" json:"session_affinity_ttl"`
+
+	SessionAffinitySubagents bool `toml:"session_affinity_subagents" json:"session_affinity_subagents"`
+
+	SessionAffinityRebindOn string `toml:"session_affinity_rebind_on" json:"session_affinity_rebind_on"`
 }
 
 type Server struct {
-	Listen        string `toml:"listen"`         // client-facing OpenAI endpoint.
-	AdminSocket   string `toml:"admin_socket"`   // control interface (unix socket).
-	MaxConcurrent int    `toml:"max_concurrent"` // global in-flight cap.
-	QueueTimeout  string `toml:"queue_timeout"`  // bounded-queue wait (duration).
-	ReadTimeout   string `toml:"read_timeout"`
-	// WriteTimeout bounds how long a response may take. 0 means the per-provider
-	// upstream timeout governs; a negative value is rejected by Validate.
-	WriteTimeout string `toml:"write_timeout"`
-	// IdleTimeout bounds how long an idle keep-alive connection is held.
-	IdleTimeout string `toml:"idle_timeout"`
-	// MaxRequestBytes caps the buffered request body (H6). 0 means the built-in
-	// default of 8 MiB; a negative value is rejected by Validate.
-	MaxRequestBytes int64 `toml:"max_request_bytes"`
-	// StickyTTL is the idle expiry of sticky affinity. Unlike before, it
-	// defaults rather than defaulting to "never expire" (H7).
-	StickyTTL string `toml:"sticky_ttl"`
+	Listen        string `toml:"listen" json:"listen"`
+	AdminSocket   string `toml:"admin_socket" json:"admin_socket"`
+	MaxConcurrent int    `toml:"max_concurrent" json:"max_concurrent"`
+	QueueTimeout  string `toml:"queue_timeout" json:"queue_timeout"`
+	ReadTimeout   string `toml:"read_timeout" json:"read_timeout"`
+
+	WriteTimeout string `toml:"write_timeout" json:"write_timeout"`
+
+	IdleTimeout string `toml:"idle_timeout" json:"idle_timeout"`
+
+	MaxRequestBytes int64 `toml:"max_request_bytes" json:"max_request_bytes"`
+
+	StickyTTL string `toml:"sticky_ttl" json:"sticky_ttl"`
+
+	TLSCert         string `toml:"tls_cert" json:"tls_cert"`
+	TLSKey          string `toml:"tls_key" json:"tls_key"`
+	StreamKeepalive string `toml:"stream_keepalive" json:"stream_keepalive"`
 }
 
 type Auth struct {
-	// APIKeys are the bearer tokens clients must present. Non-empty = strict
-	// allow-list. When Open is true the gateway accepts any (or no) token even
-	// if the allow-list is empty.
-	APIKeys []string `toml:"api_keys"`
-	// Open, when true, makes the gateway accept requests without a valid API
-	// key. It is safe-by-default: Open defaults to false, so an empty
-	// api_keys list does NOT leave the gateway unauthenticated unless the
-	// operator explicitly opts in.
-	Open bool `toml:"open"`
+	APIKeys []string `toml:"api_keys" json:"api_keys"`
+
+	Open bool `toml:"open" json:"open"`
 }
 
 type SecretCfg struct {
-	// Keyfile is a 0600 file holding the master key bytes, used when
-	// TALLOW_MASTER_KEY is not set. The env var wins when both are present.
-	Keyfile string `toml:"keyfile"`
-	// Keystore is the side-storage file holding encrypted provider keys.
-	Keystore string `toml:"keystore"`
+	Keyfile string `toml:"keyfile" json:"keyfile"`
+
+	Keystore string `toml:"keystore" json:"keystore"`
 }
 
 type StoreCfg struct {
-	Path      string `toml:"path"`
-	RawBodies *bool  `toml:"raw_bodies"` // capture request/response bodies.
+	Path      string `toml:"path" json:"path"`
+	RawBodies *bool  `toml:"raw_bodies" json:"raw_bodies"`
 }
 
 type CacheCfg struct {
-	Enabled    *bool  `toml:"enabled"`
-	MaxEntries int    `toml:"max_entries"`
-	TTL        string `toml:"ttl"`       // exact-match entry lifetime (duration).
-	MaxBytes   int64  `toml:"max_bytes"` // byte cap on cached bodies; 0/negative = default 256 MiB.
+	Enabled    *bool  `toml:"enabled" json:"enabled"`
+	MaxEntries int    `toml:"max_entries" json:"max_entries"`
+	TTL        string `toml:"ttl" json:"ttl"`
+	MaxBytes   int64  `toml:"max_bytes" json:"max_bytes"`
 }
 
 type Retention struct {
-	// Day counts are pointers so an explicitly-written 0 ("keep forever") can be
-	// told apart from an omitted key (which defaults). 0 must be preserved: the
-	// store treats 0 as keep-forever and the example config documents it, so an
-	// unconditional default would silently destroy data.
-	RawBodiesDays *int   `toml:"raw_bodies_days"`
-	MetadataDays  *int   `toml:"metadata_days"`
-	ErrorsDays    *int   `toml:"errors_days"`
-	RollupCron    string `toml:"rollup_interval"` // how often to roll up + delete.
-	VacuumCron    string `toml:"vacuum_interval"` // how often to VACUUM.
+	RawBodiesDays *int   `toml:"raw_bodies_days" json:"raw_bodies_days"`
+	MetadataDays  *int   `toml:"metadata_days" json:"metadata_days"`
+	ErrorsDays    *int   `toml:"errors_days" json:"errors_days"`
+	RollupCron    string `toml:"rollup_interval" json:"rollup_interval"`
+	VacuumCron    string `toml:"vacuum_interval" json:"vacuum_interval"`
 }
 
 type Compaction struct {
-	Enabled            *bool `toml:"enabled"`
-	MaxToolOutputChars int   `toml:"max_tool_output_chars"`
+	Enabled            *bool `toml:"enabled" json:"enabled"`
+	MaxToolOutputChars int   `toml:"max_tool_output_chars" json:"max_tool_output_chars"`
 }
 
 type Observability struct {
-	Enabled bool `toml:"enabled"`
+	Enabled bool `toml:"enabled" json:"enabled"`
 }
 
 type Provider struct {
-	Name           string   `toml:"name"`
-	BaseURL        string   `toml:"base_url"`
-	Fallback       []string `toml:"fallback"`
-	RPM            int      `toml:"rpm"` // optional aggregate provider-level cap.
-	HealthCheck    bool     `toml:"health_check"`
-	HealthInterval string   `toml:"health_interval"`
-	Timeout        string   `toml:"timeout"`
-	Key            []Key    `toml:"key"`
+	Name           string   `toml:"name" json:"name"`
+	BaseURL        string   `toml:"base_url" json:"base_url"`
+	Fallback       []string `toml:"fallback" json:"fallback"`
+	RPM            int      `toml:"rpm" json:"rpm"`
+	HealthCheck    bool     `toml:"health_check" json:"health_check"`
+	HealthInterval string   `toml:"health_interval" json:"health_interval"`
+	Timeout        string   `toml:"timeout" json:"timeout"`
+	Key            []Key    `toml:"key" json:"key"`
+
+	ProxyURL string `toml:"proxy_url" json:"proxy_url"`
+
+	Disabled bool `toml:"disabled" json:"disabled"`
+
+	Headers map[string]string `toml:"headers" json:"headers"`
+
+	ExcludedModels []string `toml:"excluded_models" json:"excluded_models"`
+
+	Catalog bool `toml:"catalog" json:"catalog"`
+
+	RequestRetry *int `toml:"request_retry" json:"request_retry"`
+
+	DisableCooling bool `toml:"disable_cooling" json:"disable_cooling"`
 }
 
 type Key struct {
-	ID             string `toml:"id"`
-	Ref            string `toml:"ref"` // keystore reference for the secret.
-	RPM            int    `toml:"rpm"`
-	MaxRequests    int    `toml:"max_requests"`
-	Window         string `toml:"window"`
-	MaxConcurrent  int    `toml:"max_concurrent"`
-	CostLimitCents int64  `toml:"cost_limit_cents"`
+	ID             string `toml:"id" json:"id"`
+	Ref            string `toml:"ref" json:"ref"`
+	RPM            int    `toml:"rpm" json:"rpm"`
+	MaxRequests    int    `toml:"max_requests" json:"max_requests"`
+	Window         string `toml:"window" json:"window"`
+	MaxConcurrent  int    `toml:"max_concurrent" json:"max_concurrent"`
+	CostLimitCents int64  `toml:"cost_limit_cents" json:"cost_limit_cents"`
+
+	Weight   int `toml:"weight" json:"weight"`
+	Priority int `toml:"priority" json:"priority"`
+
+	Headers map[string]string `toml:"headers" json:"headers"`
+
+	ProxyURL string `toml:"proxy_url" json:"proxy_url"`
+
+	RequestRetry *int `toml:"request_retry" json:"request_retry"`
+
+	DisableCooling *bool `toml:"disable_cooling" json:"disable_cooling"`
+
+	ErrorRules []ErrorRule `toml:"error_rules" json:"error_rules"`
+}
+
+type ErrorRule struct {
+	Status      int      `toml:"status" json:"status"`
+	Match       []string `toml:"match" json:"match"`
+	MatchRegexp []string `toml:"match_regexp" json:"match_regexp"`
+
+	Action string `toml:"action" json:"action"`
 }
 
 type Alias struct {
-	Name   string   `toml:"name"`
-	Target []Target `toml:"target"`
+	Name   string   `toml:"name" json:"name"`
+	Target []Target `toml:"target" json:"target"`
+
+	DisplayName string `toml:"display_name" json:"display_name"`
+
+	ExcludedModels []string `toml:"excluded_models" json:"excluded_models"`
 }
 
 type Target struct {
-	Provider        string  `toml:"provider"`
-	Model           string  `toml:"model"`
-	ContextWindow   int     `toml:"context_window"`
-	SupportsTools   bool    `toml:"supports_tools"`
-	SupportsVision  bool    `toml:"supports_vision"`
-	SupportsStream  bool    `toml:"supports_stream"`
-	PriceInputPerM  float64 `toml:"price_input_per_1m"`
-	PriceOutputPerM float64 `toml:"price_output_per_1m"`
+	Provider      string `toml:"provider" json:"provider"`
+	Model         string `toml:"model" json:"model"`
+	ContextWindow int    `toml:"context_window" json:"context_window"`
+
+	MaxContextLength int     `toml:"max_context_length" json:"max_context_length"`
+	SupportsTools    bool    `toml:"supports_tools" json:"supports_tools"`
+	SupportsVision   bool    `toml:"supports_vision" json:"supports_vision"`
+	SupportsStream   bool    `toml:"supports_stream" json:"supports_stream"`
+	PriceInputPerM   float64 `toml:"price_input_per_1m" json:"price_input_per_1m"`
+	PriceOutputPerM  float64 `toml:"price_output_per_1m" json:"price_output_per_1m"`
+
+	ForceMapping bool `toml:"force_mapping" json:"force_mapping"`
+
+	DisplayName string `toml:"display_name" json:"display_name"`
 }
 
-// Load reads and decodes path, returning the validated configuration.
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -173,20 +223,12 @@ func (c *Config) applyDefaults() error {
 	if c.Server.AdminSocket == "" {
 		c.Server.AdminSocket = defaultAdminSocket()
 	}
-	// H6: these three were previously left at the zero value, which meant
-	// ReadTimeout, WriteTimeout and IdleTimeout were all unset and therefore
-	// infinite. A slowloris client could hold a connection open indefinitely.
-	// The defaults are unconditional: an operator who genuinely wants no
-	// write timeout cannot get it, and that is deliberate, because a streaming
-	// LLM response has no useful upper bound on its own and the per-provider
-	// upstream timeout already governs it. A non-positive override is rejected
-	// by Validate rather than silently treated as "unlimited".
+
 	if c.Server.ReadTimeout == "" {
 		c.Server.ReadTimeout = "30s"
 	}
 	if c.Server.WriteTimeout == "" {
-		// Longer than ReadTimeout because a streaming completion legitimately
-		// produces output for minutes.
+
 		c.Server.WriteTimeout = "0s"
 	}
 	if c.Server.IdleTimeout == "" {
@@ -195,17 +237,23 @@ func (c *Config) applyDefaults() error {
 	if c.Server.MaxRequestBytes == 0 {
 		c.Server.MaxRequestBytes = 8 << 20
 	}
-	// H7: StickyTTL had no default, and 0 made the expiry branch unreachable
-	// because the guard read `if s.ttl > 0 && ...`. A config that simply
-	// omitted the knob therefore accumulated one permanent sticky entry per
-	// client-chosen X-Session-Id, with no cap and no eviction. 15m matches the
-	// shipped example config and is long enough to hold a real conversation
-	// together.
+
 	if c.Server.StickyTTL == "" {
 		c.Server.StickyTTL = "15m"
 	}
-	// Day counts keep their explicitly-set 0 ("keep forever") and only fall
-	// back to a default when the key was omitted entirely (nil pointer).
+
+	if c.Routing.Strategy == "" {
+		c.Routing.Strategy = "round-robin"
+	}
+
+	for ai := range c.Alias {
+		for ti := range c.Alias[ai].Target {
+			if c.Alias[ai].Target[ti].ContextWindow == 0 && c.Alias[ai].Target[ti].MaxContextLength > 0 {
+				c.Alias[ai].Target[ti].ContextWindow = c.Alias[ai].Target[ti].MaxContextLength
+			}
+		}
+	}
+
 	if c.Retention.RawBodiesDays == nil {
 		v := 5
 		c.Retention.RawBodiesDays = &v
@@ -236,7 +284,7 @@ func (c *Config) applyDefaults() error {
 	if c.Compaction.MaxToolOutputChars == 0 {
 		c.Compaction.MaxToolOutputChars = 8000
 	}
-	// On-by-default feature flags (pointer bools so `enabled = false` works).
+
 	if c.Cache.Enabled == nil {
 		v := true
 		c.Cache.Enabled = &v
@@ -249,7 +297,7 @@ func (c *Config) applyDefaults() error {
 		v := true
 		c.Store.RawBodies = &v
 	}
-	// Expand ~ in path-bearing fields.
+
 	c.Server.AdminSocket = tilde(c.Server.AdminSocket)
 	c.Secret.Keyfile = tilde(c.Secret.Keyfile)
 	c.Secret.Keystore = tilde(c.Secret.Keystore)
@@ -273,15 +321,6 @@ func defaultAdminSocket() string {
 	return "tallow-admin.sock"
 }
 
-// Validate enforces the schema version and structural invariants.
-//
-// H9: durations used to be parsed only in BuildParams, which runs AFTER
-// Validate has already declared the document valid, so a config with
-// `queue_timeout = "not-a-duration"` loaded successfully and then failed at an
-// unpredictable later point, and one with `queue_timeout = "-1h"` or
-// `metadata_days = -30` was accepted outright. Parsing and range-checking
-// durations here makes a bad config fail fast at load, with the offending key
-// named.
 func (c *Config) Validate() error {
 	if c.Version != SchemaVersion {
 		return fmt.Errorf("unsupported config version %d (want %d)", c.Version, SchemaVersion)
@@ -290,6 +329,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.validateCounts(); err != nil {
+		return err
+	}
+	if err := c.validateRouting(); err != nil {
+		return err
+	}
+	if err := c.validateTLS(); err != nil {
 		return err
 	}
 	seenP := map[string]bool{}
@@ -301,14 +346,12 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate provider %q", p.Name)
 		}
 		seenP[p.Name] = true
-		// M14: base_url is the field that decides where a request carrying the
-		// provider Authorization header and the full user prompt is sent, so it
-		// gets a real structural check rather than a bare non-empty test. The
-		// address-space half of the policy cannot live here - it depends on what
-		// the name resolves to at connection time - and is enforced per-dial by
-		// config.DialControl.
+
 		if err := ValidateBaseURL(p.Name, p.BaseURL); err != nil {
 			return err
+		}
+		if err := validateProxyURL(p.ProxyURL); err != nil {
+			return fmt.Errorf("provider %q: proxy_url: %w", p.Name, err)
 		}
 		seenK := map[string]bool{}
 		for _, k := range p.Key {
@@ -321,6 +364,20 @@ func (c *Config) Validate() error {
 			seenK[k.ID] = true
 			if k.RPM < 0 || k.MaxRequests < 0 {
 				return fmt.Errorf("provider %q key %q: negative limit", p.Name, k.ID)
+			}
+			if k.Weight < 0 {
+				return fmt.Errorf("provider %q key %q: weight: must not be negative, got %d", p.Name, k.ID, k.Weight)
+			}
+			if k.Priority < 0 {
+				return fmt.Errorf("provider %q key %q: priority: must not be negative, got %d", p.Name, k.ID, k.Priority)
+			}
+			if err := validateProxyURL(k.ProxyURL); err != nil {
+				return fmt.Errorf("provider %q key %q: proxy_url: %w", p.Name, k.ID, err)
+			}
+			for ri, r := range k.ErrorRules {
+				if err := validateErrorRule(r); err != nil {
+					return fmt.Errorf("provider %q key %q: error rule %d: %w", p.Name, k.ID, ri, err)
+				}
 			}
 		}
 	}
@@ -348,16 +405,64 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validateDurations parses every duration knob and range-checks it.
-//
-// Each entry names the exact TOML key, so an operator is told which line to fix
-// rather than receiving a bare parse failure from a later stage.
-//
-// An EMPTY field is skipped rather than treated as zero. applyDefaults fills
-// every one of these in on the Load path, so an empty field reaching here means
-// the caller built a Config by hand, and rejecting that would make Validate
-// unusable on its own. What matters for H9 is that an operator cannot write a
-// garbage or negative duration and have it accepted.
+func (c *Config) validateRouting() error {
+	switch c.Routing.Strategy {
+	case "", "round-robin", "weighted-round-robin", "fill-first":
+	default:
+		return fmt.Errorf("routing.strategy: invalid value %q (want round-robin, weighted-round-robin, or fill-first)", c.Routing.Strategy)
+	}
+	switch c.Routing.SessionAffinityRebindOn {
+	case "", "any", "quota":
+	default:
+		return fmt.Errorf("routing.session_affinity_rebind_on: invalid value %q (want any or quota)", c.Routing.SessionAffinityRebindOn)
+	}
+	return nil
+}
+
+func (c *Config) validateTLS() error {
+	if (c.Server.TLSCert == "") != (c.Server.TLSKey == "") {
+		return fmt.Errorf("server.tls_cert and server.tls_key must be set together")
+	}
+	return nil
+}
+
+var proxySchemes = map[string]bool{
+	"socks5": true, "socks5h": true, "socks": true, "http": true, "https": true,
+}
+
+func validateProxyURL(s string) error {
+	if s == "" || s == "direct" {
+		return nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", s, err)
+	}
+	if !proxySchemes[u.Scheme] {
+		return fmt.Errorf("unsupported scheme %q (want socks5, socks5h, socks, http, or https)", u.Scheme)
+	}
+	return nil
+}
+
+var errorActions = map[string]bool{
+	"stop": true, "stop-and-cooldown": true, "continue": true, "continue-and-cooldown": true,
+}
+
+func validateErrorRule(r ErrorRule) error {
+	if !errorActions[r.Action] {
+		return fmt.Errorf("action %q (want stop, stop-and-cooldown, continue, or continue-and-cooldown)", r.Action)
+	}
+	if r.Status != 0 && (r.Status < 400 || r.Status > 599) {
+		return fmt.Errorf("status %d out of range (0 means any, or 400..599)", r.Status)
+	}
+	for _, pat := range r.MatchRegexp {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("match_regexp %q does not compile: %w", pat, err)
+		}
+	}
+	return nil
+}
+
 func (c *Config) validateDurations() error {
 	type durRule struct {
 		key       string
@@ -367,16 +472,18 @@ func (c *Config) validateDurations() error {
 	rules := []durRule{
 		{"server.queue_timeout", c.Server.QueueTimeout, false},
 		{"server.read_timeout", c.Server.ReadTimeout, true},
-		// WriteTimeout 0 means unbounded, which is the documented default: a
-		// streaming completion has no useful upper bound of its own.
+
 		{"server.write_timeout", c.Server.WriteTimeout, true},
 		{"server.idle_timeout", c.Server.IdleTimeout, true},
-		// H7: sticky_ttl must be positive. 0 used to mean "never expire", which
-		// with a client-chosen X-Session-Id made the sticky map unbounded.
+
 		{"server.sticky_ttl", c.Server.StickyTTL, false},
+
+		{"server.stream_keepalive", c.Server.StreamKeepalive, true},
 		{"cache.ttl", c.Cache.TTL, false},
 		{"retention.rollup_interval", c.Retention.RollupCron, false},
 		{"retention.vacuum_interval", c.Retention.VacuumCron, false},
+		{"routing.max_retry_interval", c.Routing.MaxRetryInterval, true},
+		{"routing.session_affinity_ttl", c.Routing.SessionAffinityTTL, true},
 	}
 	for _, r := range rules {
 		if r.value == "" {
@@ -424,11 +531,6 @@ func (c *Config) validateDurations() error {
 	return nil
 }
 
-// validateCounts range-checks the non-duration numeric knobs.
-//
-// A negative retention day count means "delete everything immediately", which
-// is silent data loss rather than a startup error, and a negative cache byte
-// bound becomes a nonsensical limit. Both are rejected here.
 func (c *Config) validateCounts() error {
 	if c.Server.MaxConcurrent < 0 {
 		return fmt.Errorf("server.max_concurrent: must not be negative, got %d", c.Server.MaxConcurrent)
@@ -457,9 +559,6 @@ func (c *Config) validateCounts() error {
 	return nil
 }
 
-// dayCount returns the value of a retention pointer, treating a nil (key that
-// was omitted and never defaulted, e.g. a hand-built Config) as 0 so it is not
-// flagged negative through the applyDefaults path.
 func dayCount(p *int) int {
 	if p == nil {
 		return 0
@@ -467,14 +566,6 @@ func dayCount(p *int) int {
 	return *p
 }
 
-// Dur parses a duration string, returning 0 for empty.
-//
-// An empty value is a legitimate "unset" in config.toml, and applyDefaults
-// fills it in before this is ever called, so the empty case returning 0 is a
-// deliberate no-op rather than a silent parse failure. Every caller either
-// surfaces the error (Dur) or has already validated the field (validateDurations,
-// which calls Dur), so a malformed duration fails at config load rather than
-// silently becoming 0 and disabling whatever it governed.
 func Dur(s string) (time.Duration, error) {
 	if s == "" {
 		return 0, nil

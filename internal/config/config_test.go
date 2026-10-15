@@ -7,8 +7,6 @@ import (
 	"testing"
 )
 
-// minimalValid returns a Config that passes Validate with one provider, one
-// key, and one alias targeting it.
 func minimalValid() *Config {
 	return &Config{
 		Version: SchemaVersion,
@@ -119,9 +117,6 @@ func TestValidateAliasInvariants(t *testing.T) {
 	})
 }
 
-// TestLoadValidatesExampleConfigShape exercises Load end-to-end with an
-// inline TOML doc mirroring examples/config.toml, so the parse -> defaults ->
-// validate pipeline used at every startup is actually tested.
 func TestLoadValidatesExampleConfigShape(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
@@ -180,10 +175,6 @@ func TestLoadRejectsBadVersion(t *testing.T) {
 	}
 }
 
-// TestLoadKeepsExplicitZeroRetention pins the "0 = KEEP FOREVER" contract: an
-// operator who explicitly writes raw_bodies_days = 0 must keep 0 through Load,
-// not see it silently replaced with the 5-day default (which would destroy
-// retained raw bodies).
 func TestLoadKeepsExplicitZeroRetention(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
@@ -228,9 +219,6 @@ model = "m-1"
 	}
 }
 
-// TestLoadDefaultsOmittedRetentionKeys pins that omitting the retention keys
-// entirely still yields the documented 5/30/90 defaults, distinct from an
-// explicit 0 (keep forever).
 func TestLoadDefaultsOmittedRetentionKeys(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

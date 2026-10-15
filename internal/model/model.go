@@ -1,73 +1,92 @@
-// Package model holds the shared runtime types consumed across the gateway:
-// providers, keys, aliases, and per-request metadata. Config (TOML) is
-// deserialized separately and converted into these runtime values.
 package model
 
 import "time"
 
-// Provider is one OpenAI-compatible upstream endpoint. Tallow never hardcodes
-// vendors; anything with a key + base URL and the chat-completions contract
-// works.
 type Provider struct {
 	Name    string
 	BaseURL string
-	// Fallback is an ordered list of provider names to try when this provider
-	// is unavailable or has no usable key.
+
 	Fallback       []string
 	HealthCheck    bool
 	HealthInterval time.Duration
-	RPM            int // optional aggregate provider-level RPM cap.
+	RPM            int
 	Timeout        time.Duration
 	Keys           []Key
+
+	ProxyURL string
+
+	Disabled bool
+
+	Headers map[string]string
+
+	ExcludedModels []string
+
+	Catalog bool
+
+	RequestRetry *int
+
+	DisableCooling bool
 }
 
-// Key is a single account/credential within a provider, plus its hard limits.
 type Key struct {
 	ID     string
-	Secret string // decrypted at runtime; never persisted plaintext.
-	Ref    string // keystore reference resolving the ciphertext.
+	Secret string
+	Ref    string
 
-	// Budgets. Zero means unlimited.
-	RPM            int           // fixed-window requests per minute.
-	MaxRequests    int           // hard cap within Window.
-	Window         time.Duration // window for MaxRequests.
-	MaxConcurrent  int           // per-key in-flight cap.
-	CostLimitCents int64         // cumulative cost cap, in cents ($0.01 units).
+	RPM            int
+	MaxRequests    int
+	Window         time.Duration
+	MaxConcurrent  int
+	CostLimitCents int64
 
-	// CostLimitMicros is CostLimitCents expressed in the internal micro-USD
-	// unit that all cost accumulation actually uses. It is the value the
-	// runtime budget tracker enforces; keeping both here lets config keep its
-	// human-friendly cent unit while the budget compares without truncation.
 	CostLimitMicros int64
+
+	Weight   int
+	Priority int
+
+	Headers map[string]string
+
+	ProxyURL string
+
+	RequestRetry *int
+
+	DisableCooling bool
+
+	ErrorRules []ErrorRule
 }
 
-// Alias maps a client-facing model name to an ordered list of provider
-// targets. The order is the fallback order for failover.
+type ErrorRule struct {
+	Status      int
+	Match       []string
+	MatchRegexp []string
+	Action      string
+}
+
 type Alias struct {
 	Name    string
 	Targets []Target
+
+	DisplayName string
+
+	ExcludedModels []string
 }
 
-// Target binds an alias to a specific provider + upstream model string, with
-// manually-declared capabilities and pricing. Auto-detection is explicitly out
-// of scope.
 type Target struct {
 	Provider       string
-	Model          string // the upstream model string to actually send.
+	Model          string
 	ContextWindow  int
 	SupportsTools  bool
 	SupportsVision bool
 	SupportsStream bool
 
-	// Pricing, USD per 1M tokens. 0 = unknown, reported as $0.
 	PriceInputPerM  float64
 	PriceOutputPerM float64
+
+	ForceMapping bool
+
+	DisplayName string
 }
 
-// RequestMeta is the per-request record: what routed where, cost, tokens,
-// status, and the reason a routing decision fired. Used by both the retention
-// store and (when enabled) live observability. JSON tags match the admin API
-// wire contract (snake_case).
 type RequestMeta struct {
 	ID            string    `json:"id"`
 	StartedAt     time.Time `json:"started_at"`
@@ -78,22 +97,13 @@ type RequestMeta struct {
 	UpstreamModel string    `json:"upstream_model"`
 	Stream        bool      `json:"stream"`
 	Cached        bool      `json:"cached"`
-	// Coalesced marks a request that was served from another caller's in-flight
-	// upstream fetch rather than issuing one of its own (H8). The response bytes
-	// and the routing attribution are real, but no additional provider spend
-	// occurred, so spend and token fields are reported as zero and the budget
-	// that owns the spend is the leader's row alone. Without this, N coalesced
-	// callers would each carry the full cost of the single shared upstream call
-	// and a store rollup would report N times the money actually spent.
+
 	Coalesced        bool   `json:"coalesced"`
 	Status           string `json:"status"`
 	RouteReason      string `json:"route_reason"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
-	// CostMicros is the request cost in micro-USD (1 USD = 1,000,000). Integer
-	// cents were previously used here, which truncated every sub-cent request
-	// to zero; micro-USD preserves the real spend and is the unit every budget
-	// and rollup is compared in.
+
 	CostMicros int64  `json:"cost_micros"`
 	Err        string `json:"err"`
 }
