@@ -91,6 +91,7 @@ func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 	mux.HandleFunc("/v1/completions", h.chatCompletions) // legacy single-turn alias.
+	mux.HandleFunc("/v1/responses", h.responses)         // OpenAI Responses API v2.
 	mux.HandleFunc("/v1/models", h.listModels)
 	mux.HandleFunc("/v1/models/", h.getModel)
 	mux.HandleFunc("/health", h.health)
