@@ -23,10 +23,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/store"
 )
 
-// --- harness -------------------------------------------------------------
-
-// countUpstream is a fake OpenAI-compatible endpoint that records how many
-// requests it actually received and what body each carried.
 type countUpstream struct {
 	srv   *httptest.Server
 	hits  atomic.Int64
@@ -63,8 +59,9 @@ func newCountUpstream(t *testing.T, delay time.Duration) *countUpstream {
 		u.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"id":"x","model":%q,"choices":[{"message":{"role":"assistant","content":"pong"}}],`+
-			`"usage":{"prompt_tokens":5,"completion_tokens":3}}`, m["model"])
+		fmt.Fprintf(w, `{"id":"resp_x","object":"response","model":%q,`+
+			`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pong"}]}],`+
+			`"usage":{"input_tokens":5,"output_tokens":3}}`, m["model"])
 	}))
 	t.Cleanup(u.srv.Close)
 	return u
@@ -79,13 +76,11 @@ func (u *countUpstream) lastBody() map[string]any {
 	return u.bodies[len(u.bodies)-1]
 }
 
-// newHarness builds a Handler wired exactly as the app wires it.
 func newHarness(t *testing.T, d Deps) *Handler {
 	t.Helper()
 	if d.Client == nil {
 		d.Client = &http.Client{
-			// M2: the production client refuses redirects, so the test client
-			// must too, or the harness would not reflect production.
+
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -98,8 +93,6 @@ func newHarness(t *testing.T, d Deps) *Handler {
 	return h
 }
 
-// oneAliasRegistry builds a registry with a single alias -> single target, so
-// the cache fast path is eligible.
 func oneAliasRegistry(baseURL string) *registry.Registry {
 	return registry.New(
 		[]model.Provider{{
@@ -114,8 +107,6 @@ func oneAliasRegistry(baseURL string) *registry.Registry {
 	)
 }
 
-// newRouter builds a router wired the way the app wires it, with generous
-// limits so the tests exercise routing rather than rate limiting.
 func newRouter(t *testing.T, reg *registry.Registry) *routing.Router {
 	t.Helper()
 	r := routing.NewRouter(reg, health.NewRegistry(), time.Minute, time.Now)
@@ -139,7 +130,7 @@ func newRouter(t *testing.T, reg *registry.Registry) *routing.Router {
 
 func doPost(t *testing.T, h *Handler, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -148,17 +139,14 @@ func doPost(t *testing.T, h *Handler, token, body string) *httptest.ResponseReco
 	return rec
 }
 
-const simpleBody = `{"model":"flash","messages":[{"role":"user","content":"hi"}]}`
+const simpleBody = `{"model":"flash","input":"hi"}`
 
-// cacheKeyForTest returns the cache key the given body would use, so a test can
-// observe one entry's lifetime directly instead of inferring it from request
-// counts. An open gateway is used, so the key is the anonymous namespace.
 func (h *Handler) cacheKeyForTest(body string) string {
 	var req map[string]any
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
 		panic(err)
 	}
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	k, ok := h.cacheKey(r, req, "flash", false)
 	if !ok {
 		return ""
@@ -166,11 +154,6 @@ func (h *Handler) cacheKeyForTest(body string) string {
 	return k
 }
 
-// --- C2: cross-tenant cache contamination -------------------------------
-
-// TestC2CacheIsScopedPerTenant is the C2 regression, reproducing the audit's
-// live measurement: two API keys send a byte-identical body and the second one
-// must NOT be served the first one's cached response.
 func TestC2CacheIsScopedPerTenant(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -184,7 +167,6 @@ func TestC2CacheIsScopedPerTenant(t *testing.T) {
 		Auth:         func(tok string) bool { return tok == "key-alice" || tok == "key-bob" },
 	})
 
-	// Alice primes the cache.
 	if rec := doPost(t, h, "key-alice", simpleBody); rec.Code != http.StatusOK {
 		t.Fatalf("alice status %d: %s", rec.Code, rec.Body.String())
 	}
@@ -192,8 +174,6 @@ func TestC2CacheIsScopedPerTenant(t *testing.T) {
 		t.Fatalf("expected 1 upstream hit after alice, got %d", up.hits.Load())
 	}
 
-	// Bob sends the identical body. Before the fix he was served Alice's cached
-	// response with zero upstream calls.
 	rec := doPost(t, h, "key-bob", simpleBody)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bob status %d: %s", rec.Code, rec.Body.String())
@@ -202,15 +182,13 @@ func TestC2CacheIsScopedPerTenant(t *testing.T) {
 		t.Fatalf("C2: bob was served from alice's cache; upstream hits = %d, want 2", hits)
 	}
 
-	// Alice's own repeat IS still a cache hit: isolation must not disable the
-	// cache for the tenant that populated it.
 	if rec := doPost(t, h, "key-alice", simpleBody); rec.Code != http.StatusOK {
 		t.Fatalf("alice repeat status %d", rec.Code)
 	}
 	if hits := up.hits.Load(); hits != 2 {
 		t.Fatalf("C2: alice's own repeat should be a cache hit; hits = %d, want 2", hits)
 	}
-	// And Bob is isolated in the same way: his entry is his own.
+
 	if rec := doPost(t, h, "key-bob", simpleBody); rec.Code != http.StatusOK {
 		t.Fatalf("bob repeat status %d", rec.Code)
 	}
@@ -219,8 +197,6 @@ func TestC2CacheIsScopedPerTenant(t *testing.T) {
 	}
 }
 
-// TestC2CacheKeyNeverContainsTheCredential proves the key is namespaced by a
-// hash and not by the raw token, so a key echoed anywhere cannot leak a secret.
 func TestC2CacheKeyNeverContainsTheCredential(t *testing.T) {
 	const secret = "key-super-secret-value"
 	key := cacheScope("m", secret, "bodyhash")
@@ -230,20 +206,16 @@ func TestC2CacheKeyNeverContainsTheCredential(t *testing.T) {
 	if strings.Contains(key, "m/") && !strings.HasPrefix(key, "m/") {
 		t.Fatalf("unexpected key shape: %s", key)
 	}
-	// Distinct credentials must produce distinct namespaces.
+
 	if key == cacheScope("m", "other", "bodyhash") {
 		t.Fatal("two different credentials collided in the same cache namespace")
 	}
-	// The same credential must be stable, or the cache would never hit.
+
 	if key != cacheScope("m", secret, "bodyhash") {
 		t.Fatal("cache key is not stable for the same credential")
 	}
 }
 
-// TestC2OpenGatewayUsesOneNamedNamespace documents the deliberate behaviour for
-// a gateway with no allow-list: there is one effective principal, so entries
-// share a namespace - but the namespace is named, not an accident of an empty
-// hash.
 func TestC2OpenGatewayUsesOneNamedNamespace(t *testing.T) {
 	got := cacheScope("m", "", "bodyhash")
 	if !strings.Contains(got, anonymousScope) {
@@ -254,10 +226,6 @@ func TestC2OpenGatewayUsesOneNamedNamespace(t *testing.T) {
 	}
 }
 
-// --- H4: auth applied per handler ---------------------------------------
-
-// TestH4AllRoutesRequireAuth is the H4 regression. With a populated allow-list,
-// every route except /health must reject an unauthenticated client.
 func TestH4AllRoutesRequireAuth(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -272,8 +240,7 @@ func TestH4AllRoutesRequireAuth(t *testing.T) {
 	for _, path := range []string{
 		"/v1/models",
 		"/v1/models/flash",
-		"/v1/chat/completions",
-		"/v1/completions",
+		"/v1/responses",
 	} {
 		t.Run("unauthenticated "+path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -282,7 +249,7 @@ func TestH4AllRoutesRequireAuth(t *testing.T) {
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("H4: %s returned %d to an unauthenticated client, want 401", path, rec.Code)
 			}
-			// The body must not leak the model inventory.
+
 			if strings.Contains(rec.Body.String(), "flash") {
 				t.Fatalf("H4: the 401 body leaked registry content: %s", rec.Body.String())
 			}
@@ -299,8 +266,6 @@ func TestH4AllRoutesRequireAuth(t *testing.T) {
 	}
 }
 
-// TestH4HealthStaysOpen keeps the one documented exemption honest: a liveness
-// probe cannot present a credential, and /health exposes nothing.
 func TestH4HealthStaysOpen(t *testing.T) {
 	reg := oneAliasRegistry("http://127.0.0.1:1")
 	h := newHarness(t, Deps{
@@ -319,15 +284,9 @@ func TestH4HealthStaysOpen(t *testing.T) {
 	}
 }
 
-// --- H8: singleflight on the hot cache key ------------------------------
-
-// TestH8ConcurrentMissesFanOutToOneUpstreamCall is the H8 regression. 40
-// identical concurrent requests used to produce 40 upstream calls at peak
-// concurrency 40.
 func TestH8ConcurrentMissesFanOutToOneUpstreamCall(t *testing.T) {
 	const n = 40
-	// A slow upstream widens the window in which followers are waiting, which
-	// is exactly the condition under which the fan-out showed up.
+
 	up := newCountUpstream(t, 60*time.Millisecond)
 	reg := oneAliasRegistry(up.srv.URL)
 	c := cache.New(64, time.Minute, 0)
@@ -348,7 +307,7 @@ func TestH8ConcurrentMissesFanOutToOneUpstreamCall(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(simpleBody))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(simpleBody))
 			rec := httptest.NewRecorder()
 			<-start
 			routes.ServeHTTP(rec, req)
@@ -371,8 +330,6 @@ func TestH8ConcurrentMissesFanOutToOneUpstreamCall(t *testing.T) {
 	}
 }
 
-// TestH8CoalescedFollowersStillGetTheBody guards the obvious failure mode of
-// coalescing: the leader's response body must still reach every follower.
 func TestH8CoalescedFollowersStillGetTheBody(t *testing.T) {
 	const n = 8
 	up := newCountUpstream(t, 20*time.Millisecond)
@@ -394,7 +351,7 @@ func TestH8CoalescedFollowersStillGetTheBody(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(simpleBody))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(simpleBody))
 			rec := httptest.NewRecorder()
 			routes.ServeHTTP(rec, req)
 			bodies[i] = rec.Body.String()
@@ -409,9 +366,6 @@ func TestH8CoalescedFollowersStillGetTheBody(t *testing.T) {
 	}
 }
 
-// TestH8CoalescingDoesNotMergeDistinctBodies makes sure the flight key is the
-// cache key, not a global lock: two different prompts must not be served each
-// other's response.
 func TestH8CoalescingDoesNotMergeDistinctBodies(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -424,8 +378,8 @@ func TestH8CoalescingDoesNotMergeDistinctBodies(t *testing.T) {
 		Observ:       observ.New(true),
 	})
 
-	a := `{"model":"flash","messages":[{"role":"user","content":"alpha"}]}`
-	b := `{"model":"flash","messages":[{"role":"user","content":"beta"}]}`
+	a := `{"model":"flash","input":"alpha"}`
+	b := `{"model":"flash","input":"beta"}`
 	recA := doPost(t, h, "", a)
 	recB := doPost(t, h, "", b)
 	if recA.Code != http.StatusOK || recB.Code != http.StatusOK {
@@ -436,9 +390,6 @@ func TestH8CoalescingDoesNotMergeDistinctBodies(t *testing.T) {
 	}
 }
 
-// TestH8StreamingIsNotCoalesced states the deliberate scope limit: a streaming
-// response cannot be replayed to N clients, so the streaming path stays
-// uncoalesced and is documented as such.
 func TestH8StreamingIsNotCoalesced(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -450,24 +401,18 @@ func TestH8StreamingIsNotCoalesced(t *testing.T) {
 		CacheEnabled: true,
 		Observ:       observ.New(true),
 	})
-	streamBody := `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	streamBody := `{"model":"flash","stream":true,"input":"hi"}`
 	doPost(t, h, "", streamBody)
 	doPost(t, h, "", streamBody)
 	if up.hits.Load() != 2 {
 		t.Fatalf("streaming requests must each reach the upstream, hits=%d", up.hits.Load())
 	}
-	// And the stream flag must survive the trip upstream.
+
 	if s, _ := up.lastBody()["stream"].(bool); !s {
 		t.Fatal("the upstream body lost the stream flag")
 	}
 }
 
-// TestH8CoalescedWaitersDoNotLeakConcurrencySlots is the reservation half of
-// H8. The 24 callers share ONE upstream call, which took exactly one
-// concurrency slot and must give it back exactly once. If a waiter released a
-// reservation it never owned, or the leader never released it, the counter
-// would not return to zero and every later burst on that key would eventually
-// be rejected as over-capacity.
 func TestH8CoalescedWaitersDoNotLeakConcurrencySlots(t *testing.T) {
 	const n = 24
 	up := newCountUpstream(t, 40*time.Millisecond)
@@ -488,7 +433,7 @@ func TestH8CoalescedWaitersDoNotLeakConcurrencySlots(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(simpleBody))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(simpleBody))
 			routes.ServeHTTP(httptest.NewRecorder(), req)
 		}()
 	}
@@ -502,8 +447,6 @@ func TestH8CoalescedWaitersDoNotLeakConcurrencySlots(t *testing.T) {
 	}
 }
 
-// TestH8AccountingIsSettledExactlyOnce uses a provider with real pricing so the
-// cost settlement is observable, proving one real call is charged once.
 func TestH8AccountingIsSettledExactlyOnce(t *testing.T) {
 	const n = 16
 	up := newCountUpstream(t, 40*time.Millisecond)
@@ -516,9 +459,7 @@ func TestH8AccountingIsSettledExactlyOnce(t *testing.T) {
 			Name: "flash",
 			Targets: []model.Target{{
 				Provider: "p1", Model: "flash-v4",
-				// $1 per 1M input tokens and $2 per 1M output tokens. The fake
-				// upstream reports 5 prompt / 3 completion tokens, so one call
-				// costs 5/1M + 6/1M USD = 11 micro-USD.
+
 				PriceInputPerM:  1,
 				PriceOutputPerM: 2,
 			}},
@@ -541,7 +482,7 @@ func TestH8AccountingIsSettledExactlyOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(simpleBody))
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(simpleBody))
 			routes.ServeHTTP(httptest.NewRecorder(), req)
 		}()
 	}
@@ -550,44 +491,22 @@ func TestH8AccountingIsSettledExactlyOnce(t *testing.T) {
 	if hits := up.hits.Load(); hits != 1 {
 		t.Fatalf("expected 1 upstream call, got %d", hits)
 	}
-	// One upstream call, so the spend recorded against the provider must be the
-	// cost of one call - not n calls. Sixteen callers sharing one upstream call
-	// spent 11 micro-USD, not 176.
+
 	if got := obs.Snapshot().ByProvider["p1"].CostMicros; got != 11 {
 		t.Fatalf("H8: provider cost = %d micro-USD for ONE upstream call, want 11 (%d callers each reported the full cost)",
 			got, n)
 	}
-	// The same invariant at the aggregate level: the gateway total equals the
-	// single real call's cost.
+
 	if got := obs.Snapshot().CostMicros; got != 11 {
 		t.Fatalf("H8: total cost = %d micro-USD, want 11", got)
 	}
-	// And at the token level: the provider billed 5 prompt / 3 completion tokens
-	// once, so the totals must show that rather than 16x it.
+
 	s := obs.Snapshot()
 	if s.PromptTokens != 5 || s.CompletionTokens != 3 {
 		t.Fatalf("H8: tokens = %d/%d, want 5/3 for the single upstream call", s.PromptTokens, s.CompletionTokens)
 	}
 }
 
-// TestH8FollowersDoNotExtendTheCacheTTL keeps a follower from re-writing the
-// shared entry.
-//
-// Cache.Set always recomputes the expiry from the current time, so a follower
-// that writes the entry it merely read refreshes the TTL on every waiter. Under
-// a steady stream of identical prompts that turns the cache into a
-// permanently-live slot: an entry that is no longer hot is kept alive by its own
-// readers and never expires, so the gateway serves a stale answer indefinitely.
-//
-// Write ORDER is what makes this decidable without depending on timing. A
-// follower's Set normally lands before the leader's only if the leader is
-// delayed, and normally after it otherwise, so comparing the two expiries is
-// unreliable. Instead the test forces the order to invert: a follower whose
-// ResponseWriter blocks inside Write cannot return from its handler until the
-// leader has already written the entry. When the follower is finally released,
-// it writes - and if followers write at all, that write is now provably the
-// LAST one, so it must be the one that moved the expiry. With the fix, the
-// entry still carries only the leader's expiry.
 func TestH8FollowersDoNotExtendTheCacheTTL(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -607,27 +526,16 @@ func TestH8FollowersDoNotExtendTheCacheTTL(t *testing.T) {
 		t.Fatal("the request was not cacheable, so this test would prove nothing")
 	}
 
-	// blocked is signalled by a writer the first time it is written to, release
-	// unblocks it. A writer built this way parks inside Write until the test
-	// lets it continue, which is how the write order is controlled.
-	// releaseA unblocks the solo follower; releaseB unblocks the blocked
-	// follower in the decisive case. They must be separate channels, because
-	// closing one channel releases every writer parked on it.
 	blocked := make(chan struct{}, 8)
 	releaseA := make(chan struct{})
 	releaseB := make(chan struct{})
 
-	// The leader runs alone so its own write is unambiguous.
 	doPost(t, h, "", simpleBody)
 	leaderExpiry := c.ExpiresAt(key)
 	if leaderExpiry.IsZero() {
 		t.Fatal("the leader did not write a cache entry")
 	}
 
-	// Evict, then run one follower alone. It is the sole caller, so it is its own
-	// flight's leader and it writes the entry; capture that expiry as the
-	// baseline this follower would produce. It parks in Write, which happens
-	// after its Set, so the entry is already observable here.
 	c.Delete(key)
 	go h.Routes().ServeHTTP(&blockingWriter{
 		header: http.Header{}, blocked: blocked, release: releaseA,
@@ -639,9 +547,6 @@ func TestH8FollowersDoNotExtendTheCacheTTL(t *testing.T) {
 	}
 	close(releaseA)
 
-	// Now the decisive case: evict again and run a LEADER and a BLOCKED FOLLOWER
-	// onto one flight. The leader writes the entry before the follower is
-	// released, so a follower's write would be strictly later.
 	c.Delete(key)
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -657,15 +562,12 @@ func TestH8FollowersDoNotExtendTheCacheTTL(t *testing.T) {
 		}, newBodyRequest())
 	}()
 
-	// Wait until the follower is stuck inside Write, which means the leader has
-	// already completed its Set.
 	<-blocked
 	expiryBeforeRelease := c.ExpiresAt(key)
 	if expiryBeforeRelease.IsZero() {
 		t.Fatal("the leader did not write an entry while the follower was blocked")
 	}
-	// Release the follower so it proceeds. If a follower writes, this is the last
-	// write and it must move the expiry.
+
 	close(releaseB)
 	wg.Wait()
 
@@ -677,14 +579,10 @@ func TestH8FollowersDoNotExtendTheCacheTTL(t *testing.T) {
 	}
 }
 
-// newBodyRequest builds the canonical cacheable request used by the TTL test.
 func newBodyRequest() *http.Request {
-	return httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(simpleBody))
+	return httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(simpleBody))
 }
 
-// blockingWriter is a ResponseWriter that reports when a handler reaches Write
-// and then blocks until released, so a test can control write ORDER between a
-// leader and a follower deterministically.
 type blockingWriter struct {
 	header     http.Header
 	blocked    chan<- struct{}
@@ -705,9 +603,6 @@ func (w *blockingWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
-// --- H6: request body limit ---------------------------------------------
-
-// TestH6OversizedBodyIsRejected is the H6 regression for the memory blow-up.
 func TestH6OversizedBodyIsRejected(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -715,14 +610,12 @@ func TestH6OversizedBodyIsRejected(t *testing.T) {
 		Router:   newRouter(t, reg),
 		Registry: reg,
 		Observ:   observ.New(true),
-		// A small cap keeps the test cheap; the DEFAULT cap is asserted
-		// separately below.
+
 		MaxRequestBytes: 4096,
 	})
 
-	// A body far larger than the cap, as the audit's 256 MiB POST was.
-	huge := `{"model":"flash","messages":[{"role":"user","content":"` +
-		strings.Repeat("A", 1<<20) + `"}]}`
+	huge := `{"model":"flash","input":"` +
+		strings.Repeat("A", 1<<20) + `"}`
 	rec := doPost(t, h, "", huge)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("H6: oversized body returned %d, want 413; body=%s", rec.Code, rec.Body.String())
@@ -732,20 +625,16 @@ func TestH6OversizedBodyIsRejected(t *testing.T) {
 	}
 }
 
-// TestH6DefaultBodyLimitIsBounded proves the limit exists even when the config
-// leaves it unset, which is the default case.
 func TestH6DefaultBodyLimitIsBounded(t *testing.T) {
 	if maxRequestBytesDefault <= 0 {
 		t.Fatal("H6: the default request body limit is unbounded")
 	}
-	// 8 MiB is the documented default; assert it is the value actually used.
+
 	if maxRequestBytesDefault != 8<<20 {
 		t.Fatalf("H6: default limit is %d, want %d", maxRequestBytesDefault, 8<<20)
 	}
 }
 
-// TestH6BodyAtExactlyTheLimitIsAccepted covers the boundary: the cap must
-// reject only what exceeds it.
 func TestH6BodyAtExactlyTheLimitIsAccepted(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -757,8 +646,8 @@ func TestH6BodyAtExactlyTheLimitIsAccepted(t *testing.T) {
 		MaxRequestBytes: limit,
 	})
 
-	prefix := `{"model":"flash","messages":[{"role":"user","content":"`
-	suffix := `"}]}`
+	prefix := `{"model":"flash","input":"`
+	suffix := `"}`
 	pad := limit - len(prefix) - len(suffix)
 	body := prefix + strings.Repeat("A", pad) + suffix
 	if len(body) != limit {
@@ -772,13 +661,8 @@ func TestH6BodyAtExactlyTheLimitIsAccepted(t *testing.T) {
 	}
 }
 
-// --- M3: the retry body -------------------------------------------------
-
-// TestM3UpstreamBodyDoesNotMutateTheCallersMap is the M3 regression. The old
-// code assigned req["model"] in place, so a retry to a different provider sent
-// the PREVIOUS provider's model name.
 func TestM3UpstreamBodyDoesNotMutateTheCallersMap(t *testing.T) {
-	req := map[string]any{"model": "flash", "messages": []any{"hi"}}
+	req := map[string]any{"model": "flash", "input": []any{"hi"}}
 	base := baseBody(req)
 
 	got := string(upstreamBody(base, "provider-model-X"))
@@ -793,17 +677,14 @@ func TestM3UpstreamBodyDoesNotMutateTheCallersMap(t *testing.T) {
 	if req["model"] != "flash" {
 		t.Fatalf("M3: upstreamBody mutated the caller's map, model is now %v", req["model"])
 	}
-	// Rendering the same base twice must be deterministic.
+
 	if a, b := string(upstreamBody(base, "p1")), string(upstreamBody(base, "p2")); a == b {
 		t.Fatal("two different model names produced the same body")
 	}
 }
 
-// TestM3RetryAfterFailureUsesTheNewProvidersModel is the end-to-end half of
-// M3: when the first provider dies and the request retries against the second,
-// the second provider must receive ITS OWN model name, not the first one's.
 func TestM3RetryAfterFailureUsesTheNewProvidersModel(t *testing.T) {
-	// The dead provider refuses connections; the live one records its body.
+
 	live := newCountUpstream(t, 0)
 	reg := registry.New(
 		[]model.Provider{
@@ -845,14 +726,12 @@ func TestM3RetryAfterFailureUsesTheNewProvidersModel(t *testing.T) {
 	}
 }
 
-// TestM3SplicePreservesEveryOtherField guards the splice against dropping
-// fields, which a naive hand-built body would.
 func TestM3SplicePreservesEveryOtherField(t *testing.T) {
 	req := map[string]any{
 		"model":       "flash",
 		"stream":      true,
 		"temperature": 0.7,
-		"messages":    []any{map[string]any{"role": "user", "content": "hi"}},
+		"input":       []any{map[string]any{"role": "user", "content": "hi"}},
 		"user":        "alice",
 		"metadata":    map[string]any{"k": "v"},
 	}
@@ -861,7 +740,7 @@ func TestM3SplicePreservesEveryOtherField(t *testing.T) {
 	if err := json.Unmarshal(upstreamBody(base, "real-model"), &parsed); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
 	}
-	for _, k := range []string{"stream", "temperature", "messages", "user", "metadata"} {
+	for _, k := range []string{"stream", "temperature", "input", "user", "metadata"} {
 		if _, ok := parsed[k]; !ok {
 			t.Fatalf("M3: splicing the model dropped the %q field", k)
 		}
@@ -871,10 +750,8 @@ func TestM3SplicePreservesEveryOtherField(t *testing.T) {
 	}
 }
 
-// TestM3SpliceEscapesAwkwardModelNames ensures a model name containing quotes
-// or backslashes cannot produce invalid JSON.
 func TestM3SpliceEscapesAwkwardModelNames(t *testing.T) {
-	req := map[string]any{"model": "flash", "messages": []any{"hi"}}
+	req := map[string]any{"model": "flash", "input": []any{"hi"}}
 	base := baseBody(req)
 	for _, name := range []string{`we"ird`, `back\slash`, "new\nline", "中文模型", ""} {
 		var parsed map[string]any
@@ -888,15 +765,12 @@ func TestM3SpliceEscapesAwkwardModelNames(t *testing.T) {
 	}
 }
 
-// TestM3SpliceIgnoresNestedModelFields proves the top-level match is not fooled
-// by a user message that happens to contain the literal text.
 func TestM3SpliceIgnoresNestedModelFields(t *testing.T) {
 	req := map[string]any{
 		"model": "flash",
-		"messages": []any{map[string]any{
+		"input": []any{map[string]any{
 			"role": "user",
-			// A nested object with its own "model" key, which sorts early and
-			// would be found first by a naive scan.
+
 			"content": map[string]any{"model": "decoy", "x": 1},
 		}},
 	}
@@ -910,11 +784,6 @@ func TestM3SpliceIgnoresNestedModelFields(t *testing.T) {
 	}
 }
 
-// --- M7: cache hits and token accounting --------------------------------
-
-// TestM7CacheHitReportsNoTokensOrCost is the M7 regression. A cache hit consumed
-// no provider tokens and no provider money, but the old code re-added the
-// original request's tokens to the global totals while leaving cost at 0.
 func TestM7CacheHitReportsNoTokensOrCost(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -928,7 +797,6 @@ func TestM7CacheHitReportsNoTokensOrCost(t *testing.T) {
 		Observ:       obs,
 	})
 
-	// Prime, then read back, then read back again.
 	doPost(t, h, "", simpleBody)
 	doPost(t, h, "", simpleBody)
 	doPost(t, h, "", simpleBody)
@@ -940,31 +808,22 @@ func TestM7CacheHitReportsNoTokensOrCost(t *testing.T) {
 	if s.Total != 3 {
 		t.Fatalf("expected 3 total requests, got %d", s.Total)
 	}
-	// Exactly one real upstream call happened, so the totals must reflect one
-	// request's usage: the upstream reported 5 prompt / 3 completion.
+
 	if s.PromptTokens != 5 || s.CompletionTokens != 3 {
 		t.Fatalf("M7: tokens = %d/%d, want 5/3 (cache hits re-added the original request's tokens)",
 			s.PromptTokens, s.CompletionTokens)
 	}
-	// A cache hit did not come from a provider, so it must not appear in the
-	// per-provider view at all. The old code set Provider = "cache", which
-	// invented a provider bucket that no operator configured and that grew
-	// without bound as the cache warmed - the same defect class as M9, which was
-	// fixed for routing failures and left in place for cache hits.
+
 	if _, ok := s.ByProvider["cache"]; ok {
 		t.Fatalf("M7: by_provider contains a synthetic %q bucket (%+v); a cache hit is not a "+
 			"provider and must not be attributed to one", "cache", s.ByProvider["cache"])
 	}
-	// The real provider is credited with exactly the one upstream call it served.
-	// Its cost stays 0 here because oneAliasRegistry declares no pricing, so
-	// costMicros legitimately computes to nothing; what this asserts is that the
-	// real provider owns the ONE upstream call and not the two cache hits.
+
 	real := s.ByProvider["p1"]
 	if real.Requests != 1 {
 		t.Fatalf("the real provider should own the single upstream call, got %+v", real)
 	}
-	// Every provider bucket must correspond to a provider the operator actually
-	// configured. Nothing invents one.
+
 	for name := range s.ByProvider {
 		if name != "p1" {
 			t.Fatalf("by_provider contains a bucket for %q, which is not a configured provider; "+
@@ -973,8 +832,6 @@ func TestM7CacheHitReportsNoTokensOrCost(t *testing.T) {
 	}
 }
 
-// TestM7CacheStillTracksEffectiveness makes sure the M7 fix did not simply
-// disable cache reporting.
 func TestM7CacheStillTracksEffectiveness(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -994,12 +851,6 @@ func TestM7CacheStillTracksEffectiveness(t *testing.T) {
 	}
 }
 
-// --- M9: the "no route" phantom provider --------------------------------
-
-// TestM9NoRouteDoesNotInventAProvider is the M9 regression. The old code
-// recorded the failure with an empty provider, which created a permanent
-// per-provider bucket keyed by "" whose error rate read 0% and hid gateway
-// routing failures.
 func TestM9NoRouteDoesNotInventAProvider(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -1010,9 +861,7 @@ func TestM9NoRouteDoesNotInventAProvider(t *testing.T) {
 		Observ:   obs,
 	})
 
-	// An alias that exists in the registry is routable; instead ask for one
-	// that does not, so Select genuinely finds no route.
-	rec := doPost(t, h, "", `{"model":"no-such-alias","messages":[{"role":"user","content":"hi"}]}`)
+	rec := doPost(t, h, "", `{"model":"no-such-alias","input":"hi"}`)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502 for an unroutable alias, got %d", rec.Code)
 	}
@@ -1028,9 +877,6 @@ func TestM9NoRouteDoesNotInventAProvider(t *testing.T) {
 	}
 }
 
-// TestM9RealProviderFailureIsStillAttributed is the other half: the M9 fix must
-// not stop attributing failures that genuinely belong to a provider, or a real
-// provider's error rate would silently read 0%.
 func TestM9RealProviderFailureIsStillAttributed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -1059,8 +905,6 @@ func TestM9RealProviderFailureIsStillAttributed(t *testing.T) {
 	}
 }
 
-// TestM9StoreStillRecordsTheRoutingError confirms the error is persisted even
-// though no provider is invented, so it does not vanish from the audit trail.
 func TestM9StoreStillRecordsTheRoutingError(t *testing.T) {
 	up := newCountUpstream(t, 0)
 	reg := oneAliasRegistry(up.srv.URL)
@@ -1080,12 +924,11 @@ func TestM9StoreStillRecordsTheRoutingError(t *testing.T) {
 		Store:    st,
 		Observ:   observ.New(true),
 	})
-	rec := doPost(t, h, "", `{"model":"no-such-alias","messages":[{"role":"user","content":"hi"}]}`)
+	rec := doPost(t, h, "", `{"model":"no-such-alias","input":"hi"}`)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("got %d", rec.Code)
 	}
-	// The store writes asynchronously; poll briefly rather than sleeping a
-	// fixed amount, so the test is neither flaky nor slow.
+
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		rows, err := st.RecentRequests(10)

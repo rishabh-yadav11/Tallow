@@ -1,18 +1,5 @@
 package proxy
 
-// Audit tests for the streamForward first-token contract:
-//   - the pre-first-token buffer is bounded, so an upstream that sends only
-//     non-data lines cannot pin the handler open or grow memory without bound
-//     (item 1);
-//   - EOF before the first token is a retryable failure that walks the 2-key
-//     fallback chain and lands on 502, invisible to the client (item 2);
-//   - a read error AT/AFTER the first token is an interruption (retryable=false,
-//     no retry) after the client already received 200 + the first line (item 3);
-//   - send() with an empty BaseURL errors instead of panicking, and an empty
-//     Secret emits no Authorization header (item 13);
-//   - the non-streaming read-error branches of readUpstreamBody and
-//     plainForward are retryable (item 16).
-
 import (
 	"encoding/json"
 	"errors"
@@ -29,10 +16,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/routing"
 )
 
-// streamScriptRoundTripper returns a crafted Response per call so a test can
-// drive the full handler path (send -> streamForward) with a body that would be
-// impossible to produce from a real upstream (endless non-data lines, EOF
-// before data, a read error mid-stream).
 type streamScriptRoundTripper struct {
 	mu      sync.Mutex
 	calls   int
@@ -52,8 +35,6 @@ func (t *streamScriptRoundTripper) count() int {
 	return t.calls
 }
 
-// streamHandler wires a handler whose upstream is replaced by the scripted round
-// tripper, so the test controls the exact byte stream streamForward sees.
 func streamHandler(t *testing.T, reg *registry.Registry, rt http.RoundTripper) *Handler {
 	t.Helper()
 	return newHarness(t, Deps{
@@ -63,7 +44,6 @@ func streamHandler(t *testing.T, reg *registry.Registry, rt http.RoundTripper) *
 	})
 }
 
-// echoResponse builds a 200 streaming response with the given body.
 func echoResponse(body io.ReadCloser) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -72,8 +52,6 @@ func echoResponse(body io.ReadCloser) *http.Response {
 	}
 }
 
-// endlessNonData returns a reader that produces `: keep-alive\n` comment lines
-// forever, with no data line ever.
 type endlessNonData struct{}
 
 func (endlessNonData) Read(p []byte) (int, error) {
@@ -84,14 +62,10 @@ func (endlessNonData) Read(p []byte) (int, error) {
 	return copy(p, ": keep-alive\n"[:n]), nil
 }
 
-// neverEmptyClose is a no-op closer over the above.
 type neverEmptyClose struct{ endlessNonData }
 
 func (neverEmptyClose) Close() error { return nil }
 
-// firstLineThenError issues exactly one data line, then fails the next read.
-// body[...] The error is non-EOF so streamForward must classify it as an
-// interruption, not a clean end of stream.
 type firstLineThenError struct{ sent bool }
 
 func (r *firstLineThenError) Read(p []byte) (int, error) {
@@ -105,9 +79,7 @@ func (r *firstLineThenError) Read(p []byte) (int, error) {
 func (r *firstLineThenError) Close() error { return nil }
 
 func TestStreamForwardEndlessNonDataTerminatesBounded(t *testing.T) {
-	// An upstream that answers 200 and then sends only `: keep-alive\n` comment
-	// lines forever must not pin the handler open: the pre-first-token buffer is
-	// bounded, and exceeding it terminates the stream with a retryable error.
+
 	rt := &streamScriptRoundTripper{}
 	rt.factory = func(int) *http.Response {
 		return echoResponse(neverEmptyClose{})
@@ -116,13 +88,12 @@ func TestStreamForwardEndlessNonDataTerminatesBounded(t *testing.T) {
 
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		done <- doPost(t, h, "", `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		done <- doPost(t, h, "", `{"model":"flash","stream":true,"input":"hi"}`)
 	}()
 
 	select {
 	case rec := <-done:
-		// The stream never produced a token, and the failure is retryable, so the
-		// chain is exhausted: the client must receive a 502 rather than a hang.
+
 		if rec.Code != http.StatusBadGateway {
 			t.Fatalf("terminates with status %d, want 502: the client must get an "+
 				"error instead of an open stream", rec.Code)
@@ -134,16 +105,14 @@ func TestStreamForwardEndlessNonDataTerminatesBounded(t *testing.T) {
 }
 
 func TestStreamForwardEOFBeforeFirstTokenRetriesAcrossKeys(t *testing.T) {
-	// EOF before any data line is the retryable first-token failure. Two keys:
-	// the first must be retried, the second also fails, so the client gets a 502
-	// and the chain names both.
+
 	rt := &streamScriptRoundTripper{}
 	rt.factory = func(int) *http.Response {
 		return echoResponse(io.NopCloser(strings.NewReader(": keep-alive\n")))
 	}
 	h := streamHandler(t, twoProviderRegistry(t), rt)
 
-	rec := doPost(t, h, "", `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	rec := doPost(t, h, "", `{"model":"flash","stream":true,"input":"hi"}`)
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502: an EOF before the first token is a "+
@@ -161,16 +130,14 @@ func TestStreamForwardEOFBeforeFirstTokenRetriesAcrossKeys(t *testing.T) {
 }
 
 func TestStreamForwardMidStreamReadErrorStopsWithoutRetry(t *testing.T) {
-	// A read error AFTER the first token is an interruption, not a retryable
-	// failure. The client has already received 200 + the first line, and the
-	// gateway must NOT retry (the bytes cannot be replayed).
+
 	rt := &streamScriptRoundTripper{}
 	rt.factory = func(int) *http.Response {
 		return echoResponse(&firstLineThenError{})
 	}
 	h := streamHandler(t, oneAliasRegistry("http://scripted.invalid"), rt)
 
-	rec := doPost(t, h, "", `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	rec := doPost(t, h, "", `{"model":"flash","stream":true,"input":"hi"}`)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: the client already received 200 + the "+
@@ -190,12 +157,10 @@ func TestStreamForwardMidStreamReadErrorStopsWithoutRetry(t *testing.T) {
 }
 
 func TestSendEmptyBaseURLErrorsNoPanic(t *testing.T) {
-	// send with an empty BaseURL (reachable only if the router guard were ever
-	// missed) must return a forwardError instead of panicking; the retry loop
-	// maps an exhausted chain of these to 502.
+
 	h := &Handler{deps: Deps{Client: &http.Client{}}}
 	_, ferr := h.send(
-		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil),
+		httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
 		&routing.Selection{},
 		nil,
 	)
@@ -217,7 +182,7 @@ func TestSendEmptySecretOmitsAuthorizationHeader(t *testing.T) {
 	h := &Handler{deps: Deps{Client: srv.Client()}}
 
 	_, ferr := h.send(
-		httptest.NewRequest(http.MethodPost, srv.URL+"/chat/completions", nil),
+		httptest.NewRequest(http.MethodPost, srv.URL+"/responses", nil),
 		&routing.Selection{BaseURL: srv.URL, Secret: ""}, body,
 	)
 	if ferr != nil {
@@ -248,7 +213,7 @@ func TestPlainForwardReadErrorIsRetryable(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	h := &Handler{}
-	if _, ferr := h.plainForward(rec, resp); ferr == nil || !ferr.retryable {
+	if _, ferr := h.plainForward(rec, resp, ""); ferr == nil || !ferr.retryable {
 		t.Fatalf("plainForward on a failing body: got %+v, want a retryable "+
 			"error with nothing written", ferr)
 	}
@@ -258,15 +223,10 @@ func TestPlainForwardReadErrorIsRetryable(t *testing.T) {
 	}
 }
 
-// errReader returns a transport-level error on every Read call, simulating a
-// broken upstream connection.
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("read error") }
 
-// Audit item 14: coerceTokenCount accepts an integer exactly at maxTokenCount,
-// and rejects the next value (and anything past it). The cost multiplication is
-// only safe if an absurd upstream count cannot pass the gate.
 func TestCoerceTokenCountBoundaryAtMax(t *testing.T) {
 	bad := []string{`1000000000001`, `1.000000000001e12`, `1000000000002`, `-1`}
 	for _, s := range bad {
@@ -285,8 +245,6 @@ func TestCoerceTokenCountBoundaryAtMax(t *testing.T) {
 	}
 }
 
-// twoProviderRegistry builds two providers via separate round trips, each with
-// one key and its own URL, so the failure chain walks alpha/k1 then beta/k2.
 func twoProviderRegistry(t *testing.T) *registry.Registry {
 	t.Helper()
 	return registry.New(

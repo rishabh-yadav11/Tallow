@@ -18,47 +18,13 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/store"
 )
 
-// The exhausted-attempts message added in 5f787b3 is the first place a
-// TRANSPORT error's text reaches a client. Before it, an exhausted retryable
-// chain returned a constant string, so nothing about the internal upstream
-// topology escaped.
-//
-// forwardError carries the raw error from Client.Do, which for a transport
-// failure is a *url.Error. A url.Error renders as
-// `Post "<full base_url>": <cause>`, so the message leaked the provider's full
-// base_url to the calling client and into the audit row.
-//
-// That is a real disclosure and it contradicts a deliberate decision already in
-// this package: upstreamErrorMsg returns only http.StatusText and logs the
-// detail, with a comment saying "Never return this to a client". The new
-// message routed around that rule rather than through it.
-//
-// Why it matters. base_url decides where a request carrying the provider
-// Authorization header and the user's full prompt is sent. Telling an
-// untrusted client "openrouter failed against https://internal.corp.example/
-// v1" hands over the internal network layout that the SSRF guard exists to
-// keep private, and does so for free on every request that exhausts its chain.
-// The client already knows which alias it asked for; it does not get to learn
-// the addresses behind it.
-//
-// Why the suite stayed green. Every other test in this area drives a live
-// httptest server that returns an HTTP status, so the transport branch never
-// executes and every attempt reason is already a safe http.StatusText. The
-// SSRF guard blocks the loopback case that would make this easiest to notice
-// from a test, and config.SetAllowPrivateBaseURL(true) is an exported escape
-// hatch, so the case is reachable in production too.
-
-// TestExhaustedChainDoesNotLeakTheUpstreamBaseURL is the regression. The
-// upstream is closed, so every attempt fails in transport, and the chain
-// exhausts: exactly the branch that leaked.
 func TestExhaustedChainDoesNotLeakTheUpstreamBaseURL(t *testing.T) {
-	// A base_url that would be recognisable in a leak. Port 1 is privileged and
-	// nothing listens there, so the dial fails immediately in transport.
+
 	const baseURL = "http://127.0.0.1:1/internal-secret-host"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("the upstream must never be reached; the base_url is closed")
 	}))
-	srv.Close() // closed before use, so every dial fails in transport
+	srv.Close()
 
 	reg := registry.New(
 		[]model.Provider{{
@@ -96,8 +62,6 @@ func TestExhaustedChainDoesNotLeakTheUpstreamBaseURL(t *testing.T) {
 	}
 	body := rec.Body.String()
 
-	// The host is the disclosure. Everything below is about not leaking
-	// deployment internals to a client that only asked for a model name.
 	for _, leak := range []string{"127.0.0.1", "internal-secret-host", "http://", "://"} {
 		if strings.Contains(body, leak) {
 			t.Errorf("exhausted-chain response body leaks the upstream base_url "+
@@ -107,15 +71,14 @@ func TestExhaustedChainDoesNotLeakTheUpstreamBaseURL(t *testing.T) {
 				leak, body)
 		}
 	}
-	// A credential must never appear either, in any branch.
+
 	for _, secret := range []string{"sk-super-secret-value", "sk-other-secret"} {
 		if strings.Contains(body, secret) {
 			t.Errorf("exhausted-chain response body leaks a provider credential "+
 				"(%q appears in %s)", secret, body)
 		}
 	}
-	// The fix must not regress into the useless constant either: the route and
-	// a safe reason are still required for the message to be worth anything.
+
 	if !strings.Contains(body, "alpha") || !strings.Contains(body, "beta") {
 		t.Errorf("exhausted-chain body %q stopped naming the failed routes: "+
 			"redacting the URL must not remove the diagnostic that was the "+
@@ -128,9 +91,6 @@ func TestExhaustedChainDoesNotLeakTheUpstreamBaseURL(t *testing.T) {
 	}
 }
 
-// TestExhaustedChainLeakDoesNotReachTheAuditLog guards the second surface. The
-// recorded row is read by operators and exported by tooling, and it must hold
-// the same redacted text the client sees.
 func TestExhaustedChainLeakDoesNotReachTheAuditLog(t *testing.T) {
 	const baseURL = "http://127.0.0.1:1/internal-secret-host"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
@@ -174,7 +134,7 @@ func TestExhaustedChainLeakDoesNotReachTheAuditLog(t *testing.T) {
 		Store:        st,
 	})
 
-	doPost(t, h, "", `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	doPost(t, h, "", `{"model":"flash","stream":true,"input":"hi"}`)
 	st.Flush()
 
 	rows, err := st.RecentRequests(10)
@@ -201,10 +161,6 @@ func TestExhaustedChainLeakDoesNotReachTheAuditLog(t *testing.T) {
 	}
 }
 
-// TestTransportReasonIsRedacted is the unit-level control. It pins the
-// invariant that a forwardError's client-facing msg never carries the address
-// while the private field does, so a future change to the retry loop cannot
-// quietly reintroduce the raw error by using a different accessor.
 func TestTransportReasonIsRedacted(t *testing.T) {
 	const addr = `10.0.0.5:11434`
 	sel := &routing.Selection{
@@ -216,12 +172,11 @@ func TestTransportReasonIsRedacted(t *testing.T) {
 		retryable: true,
 		transport: true,
 		msg:       "connection failed",
-		private:   `upstream: Post "http://` + addr + `/v1/chat/completions": ` + `dial tcp ` + addr + `: connect: connection refused`,
+		private:   `upstream: Post "http://` + addr + `/responses": ` + `dial tcp ` + addr + `: connect: connection refused`,
 	}
 
 	got := attemptReason(sel, ferr)
-	// attemptReason is a pass-through, so the guarantee it relies on is the
-	// msg itself. Assert that directly, then assert what the caller sees.
+
 	for _, leak := range []string{addr, "10.0.0.5", "11434", "http://"} {
 		if strings.Contains(ferr.msg, leak) {
 			t.Errorf("forwardError.msg = %q leaks the upstream address (%q): "+
@@ -243,7 +198,6 @@ func TestTransportReasonIsRedacted(t *testing.T) {
 			"never reached an upstream", got)
 	}
 
-	// The detail must not be lost, it must only be withheld from the caller.
 	if !strings.Contains(ferr.logDetail(), addr) {
 		t.Errorf("forwardError.logDetail() = %q, want it to retain the address "+
 			"for the operator log: the client must not learn it, but the "+
@@ -256,15 +210,10 @@ func TestTransportReasonIsRedacted(t *testing.T) {
 	}
 }
 
-// TestTransportErrorFromARealDialIsClientSafe closes the loop on the real
-// production path. The unit test above hand-builds a forwardError, so it cannot
-// catch a construction site that forgets to be safe. This drives an actual
-// Client.Do dial against a closed port and checks the error that the retry loop
-// will hand to a client, which is where a real *url.Error arrives.
 func TestTransportErrorFromARealDialIsClientSafe(t *testing.T) {
 	const addr = "127.0.0.1:1"
 	_, ferr := (&Handler{deps: Deps{Client: &http.Client{}}}).send(
-		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}")),
+		httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("{}")),
 		&routing.Selection{BaseURL: "http://" + addr, Secret: "sk-secret"},
 		[]byte(`{}`),
 	)
@@ -288,10 +237,6 @@ func TestTransportErrorFromARealDialIsClientSafe(t *testing.T) {
 	}
 }
 
-// TestHTTPStatusReasonIsUnchanged is the positive control for the redaction: a
-// status-based reason was already safe and must stay exactly as useful as
-// before. Without this, a fix that replaced every reason with a generic string
-// would pass the leak test above.
 func TestHTTPStatusReasonIsUnchanged(t *testing.T) {
 	sel := &routing.Selection{Provider: "alpha", Key: "k1"}
 	ferr := &forwardError{retryable: true, status: http.StatusTooManyRequests,

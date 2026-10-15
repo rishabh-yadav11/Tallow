@@ -8,19 +8,13 @@ import (
 	"time"
 )
 
-// errOverCapacity sentinel used by acquireSlot.
 func isOverCapacity(err error) bool {
 	return errors.Is(err, errOverCapacity) || err == errOverCapacity
 }
 
-// TestAcquireSlotTimesOutNoLeak verifies issue #8: when the bounded queue is full,
-// acquireSlot returns over-capacity after QueueTimeout using a timer whose Stop is
-// called (no per-request time.After goroutine leak). We assert the call returns
-// promptly and frees its slot so a subsequent acquire succeeds.
 func TestAcquireSlotTimesOutNoLeak(t *testing.T) {
 	h := NewHandler(Deps{MaxConcurrent: 1, QueueTimeout: 20 * time.Millisecond})
 
-	// Occupy the only slot.
 	if err := h.acquireSlot(); err != nil {
 		t.Fatalf("first acquire failed: %v", err)
 	}
@@ -28,7 +22,7 @@ func TestAcquireSlotTimesOutNoLeak(t *testing.T) {
 	start := time.Now()
 	err := h.acquireSlot()
 	elapsed := time.Since(start)
-	// Must return over-capacity (not hang) and do so near QueueTimeout.
+
 	if !isOverCapacity(err) {
 		t.Fatalf("expected over-capacity error, got %v", err)
 	}
@@ -36,7 +30,6 @@ func TestAcquireSlotTimesOutNoLeak(t *testing.T) {
 		t.Fatalf("acquireSlot blocked too long (%v); timer likely leaked", elapsed)
 	}
 
-	// The slot must be freed once we release, so a new acquire succeeds.
 	h.releaseSlot()
 	if err := h.acquireSlot(); err != nil {
 		t.Fatalf("slot not freed after release+timeout: %v", err)
@@ -44,9 +37,6 @@ func TestAcquireSlotTimesOutNoLeak(t *testing.T) {
 	h.releaseSlot()
 }
 
-// TestAcquireSlotConcurrent exercises high churn of acquire/release to ensure the
-// bounded queue + timer Stop path does not deadlock or leak slots under load. The
-// total number of in-flight slots never exceeds MaxConcurrent.
 func TestAcquireSlotConcurrent(t *testing.T) {
 	const max = 8
 	h := NewHandler(Deps{MaxConcurrent: max, QueueTimeout: 10 * time.Millisecond})
@@ -63,7 +53,7 @@ func TestAcquireSlotConcurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
 				if err := h.acquireSlot(); err != nil {
-					continue // over capacity; fine
+					continue
 				}
 				n := atomic.AddInt64(&active, 1)
 				mu.Lock()
@@ -89,9 +79,6 @@ func TestAcquireSlotConcurrent(t *testing.T) {
 	}
 }
 
-// TestProbeSemBounded mirrors app.probeSem (issue #8): at most the semaphore
-// capacity of probe goroutines may run concurrently, so a large provider/key fanout
-// cannot spawn unbounded goroutines. We exercise the same semaphore pattern here.
 func TestProbeSemBounded(t *testing.T) {
 	const cap = 16
 	sem := make(chan struct{}, cap)
@@ -117,7 +104,7 @@ func TestProbeSemBounded(t *testing.T) {
 				mu.Unlock()
 			}()
 		default:
-			// saturated: intended backpressure; skip this round.
+
 		}
 	}
 	wg.Wait()

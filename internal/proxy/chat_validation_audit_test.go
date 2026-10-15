@@ -1,10 +1,5 @@
 package proxy
 
-// P3 audit tests for chatCompletions request validation:
-//   - a table of malformed bodies (empty, null, a JSON array, a bare string,
-//     missing model) all answer 400 and never panic (item 10);
-//   - PUT/DELETE/HEAD are answered 405 before any body is read (item 11).
-
 import (
 	"net/http"
 	"net/http/httptest"
@@ -36,7 +31,7 @@ func TestMalformedRequestBodiesAre400(t *testing.T) {
 		{"null", "null"},
 		{"array", "[]"},
 		{"bare string", `"x"`},
-		{"missing model", `{"messages":[{"role":"user","content":"hi"}]}`},
+		{"missing model", `{"input":"hi"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := doPost(t, h, "", tc.body)
@@ -59,9 +54,9 @@ func TestNonPOSTMethodsAre405(t *testing.T) {
 			rec := httptest.NewRecorder()
 			var r *http.Request
 			if method == http.MethodHead {
-				r = httptest.NewRequest(method, "/v1/chat/completions", nil)
+				r = httptest.NewRequest(method, "/v1/responses", nil)
 			} else {
-				r = httptest.NewRequest(method, "/v1/chat/completions", strings.NewReader("{}"))
+				r = httptest.NewRequest(method, "/v1/responses", strings.NewReader("{}"))
 			}
 			h.Routes().ServeHTTP(rec, r)
 			if rec.Code != http.StatusMethodNotAllowed {

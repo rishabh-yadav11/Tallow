@@ -18,13 +18,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/routing"
 )
 
-// forwardError distinguishes retryable, transport-level, and already-streamed
-// failures so the retry loop can apply the exact first-token policy.
-//
-// msg is CLIENT-SAFE. It reaches response bodies and audit rows, so it must
-// never carry the upstream base_url, a host, a port, or a credential. Errors
-// that cannot satisfy that must put their detail in private instead, which is
-// logged and never returned.
 type forwardError struct {
 	retryable     bool
 	transport     bool
@@ -32,23 +25,14 @@ type forwardError struct {
 	status        int
 	msg           string
 	private       string
-	// retryAfter is how long a rate-limited caller should wait, carried from the
-	// routing failure that produced this error. It is set only for a
-	// limit-driven 429, and is written as a Retry-After header by the response
-	// writer.
-	//
-	// It has to live here rather than being written at the point of detection,
-	// because the buffered path returns a forwardError and the response is
-	// written later, in a different function. Without it the correct 429 status
-	// arrived on the buffered path but the retry hint silently did not, which is
-	// the common case rather than an edge case.
+
+	body []byte
+
 	retryAfter time.Duration
 }
 
 func (e *forwardError) Error() string { return e.msg }
 
-// logDetail returns the full error text for logging, including anything the
-// client-safe msg withheld.
 func (e *forwardError) logDetail() string {
 	if e.private == "" {
 		return e.msg
@@ -56,7 +40,6 @@ func (e *forwardError) logDetail() string {
 	return e.private
 }
 
-// result carries token usage and (for non-stream) the response body.
 type result struct {
 	prompt     int
 	completion int
@@ -64,24 +47,6 @@ type result struct {
 	status     int
 }
 
-// send performs the upstream HTTP request and returns the raw response.
-//
-// Split out from forward so the buffered cacheable path can issue the same
-// request WITHOUT writing to a client ResponseWriter, which is what makes an
-// upstream response safe to share between coalesced callers (H8).
-// cancelOnClose wraps an upstream response body so that the request context's
-// cancel runs only when the body has been fully read (or abandoned) and closed.
-//
-// It exists because the provider timeout must cover the whole body read, not
-// just the request round trip. A naive `defer cancel()` in send fires when send
-// RETURNS - immediately after the response headers arrive and before the caller
-// reads resp.Body - cancelling the context and killing the body read. That is
-// the live-found bug this wrapper fixes: with a provider timeout configured, a
-// streaming response relaying only the first SSE chunk then failed
-// "stream interrupted: context canceled". Arbitrating cancel on Close means a
-// stalled or slow-dripping stream remains bounded by the provider timeout (the
-// documented per-provider timeout contract), and cancel runs as cleanup once
-// the body is exhausted.
 type cancelOnClose struct {
 	io.ReadCloser
 	cancel context.CancelFunc
@@ -93,16 +58,15 @@ func (c *cancelOnClose) Close() error {
 	return err
 }
 
+const upstreamResponsesPath = "/responses"
+
 func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*http.Response, *forwardError) {
-	url := strings.TrimRight(sel.BaseURL, "/") + "/chat/completions"
+	url := strings.TrimRight(sel.BaseURL, "/") + upstreamResponsesPath
 	ctx := r.Context()
 	var cancel context.CancelFunc
 	if sel.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, sel.Timeout)
-		// NOT deferred here: cancel must outlive send's return and fire only
-		// when the body is closed, see cancelOnClose. Below, every error path
-		// (request build, guard, Do) cancels explicitly so the context never
-		// leaks when no response body exists to carry the cancel.
+
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -130,13 +94,7 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 		return nil, &forwardError{
 			retryable: true,
 			transport: true,
-			// Only the category, never the error. err is a *url.Error, which
-			// renders as `Post "<full base_url>": <cause>`, and its cause
-			// repeats the address too: net.OpError prefixes "dial tcp <addr>:".
-			// So neither the whole string nor a stripped prefix of it is safe
-			// to return. The full text goes to private for the log, and the
-			// client learns only that the connection failed, which is all it
-			// can act on.
+
 			msg:     "connection failed",
 			private: "upstream: " + err.Error(),
 		}
@@ -147,18 +105,6 @@ func (h *Handler) send(r *http.Request, sel *routing.Selection, body []byte) (*h
 	return resp, nil
 }
 
-// proxyTargetGuard applies the M14 address policy to the request's destination
-// when that destination is reached THROUGH an HTTP proxy.
-//
-// The app's transport dialer runs config.DialControl, but under a proxy the
-// dialer only ever dials the proxy's address - the provider host the proxy
-// CONNECTs to is chosen from the request URL and never reaches DialControl. An
-// attacker who can write base_url would otherwise escape the SSRF guard by
-// setting a public proxy and a private target. So when a proxy is in effect for
-// the URL, the target is resolved and judged. When no proxy is configured it
-// returns nil and lets DialControl do its job on the direct path - this helper
-// proves the proxy does not bypass M14, at the cost of one resolution only when
-// a proxy is actually configured.
 func proxyTargetGuard(client *http.Client, req *http.Request) *forwardError {
 	tr, ok := client.Transport.(*http.Transport)
 	if !ok || tr.Proxy == nil {
@@ -174,8 +120,7 @@ func proxyTargetGuard(client *http.Client, req *http.Request) *forwardError {
 	if err := config.CheckTargetPublic(req.URL.Hostname()); err != nil {
 		return &forwardError{
 			transport: true,
-			// Same client-safe category as a dial failure; the detail goes to the
-			// log, never to the client.
+
 			msg:     "connection failed",
 			private: "upstream proxy target: " + err.Error(),
 		}
@@ -183,24 +128,19 @@ func proxyTargetGuard(client *http.Client, req *http.Request) *forwardError {
 	return nil
 }
 
-// readUpstreamBody reads a non-streaming upstream response and applies the
-// status policy, without writing anything to a client.
 func readUpstreamBody(resp *http.Response) ([]byte, *forwardError) {
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, &forwardError{retryable: true, msg: "read upstream: " + err.Error()}
 	}
 	if resp.StatusCode >= 400 {
-		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b)}
+		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b), body: b}
 		fe.retryable = isRetryableStatus(resp.StatusCode)
 		return nil, fe
 	}
 	return b, nil
 }
 
-// forward sends one upstream request. Streaming passthrough never buffers the
-// full body; non-streaming reads the full body before writing so a failure is
-// always retried before the client sees anything.
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, sel *routing.Selection, body []byte, stream bool) (result, *forwardError) {
 	resp, ferr := h.send(r, sel, body)
 	if ferr != nil {
@@ -208,22 +148,29 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, sel *routing.S
 	}
 	defer resp.Body.Close()
 
-	if stream {
-		return h.streamForward(w, resp)
+	forced := ""
+	if sel.Target.ForceMapping && sel.Alias != "" {
+		forced = sel.Alias
 	}
-	return h.plainForward(w, resp)
+
+	if stream {
+		return h.streamForward(w, resp, forced)
+	}
+	return h.plainForward(w, resp, forced)
 }
 
-// plainForward buffers the whole response, returning it only on full success.
-func (h *Handler) plainForward(w http.ResponseWriter, resp *http.Response) (result, *forwardError) {
+func (h *Handler) plainForward(w http.ResponseWriter, resp *http.Response, forced string) (result, *forwardError) {
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return result{}, &forwardError{retryable: true, msg: "read upstream: " + err.Error()}
 	}
 	if resp.StatusCode >= 400 {
-		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b)}
+		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b), body: b}
 		fe.retryable = isRetryableStatus(resp.StatusCode)
 		return result{}, fe
+	}
+	if forced != "" {
+		b = spliceTopLevelModel(b, forced)
 	}
 	prompt, completion := parseUsage(b)
 	w.Header().Set("Content-Type", "application/json")
@@ -232,24 +179,12 @@ func (h *Handler) plainForward(w http.ResponseWriter, resp *http.Response) (resu
 	return result{prompt: prompt, completion: completion, respBody: b}, nil
 }
 
-// streamPreHeaderLimit bounds the first-token pre-buffer in streamForward.
-//
-// An upstream that answers 200 and then sends only non-data lines (`: keep-alive`
-// comments) without ever producing a data line would otherwise make `pre` grow
-// without bound and keep the handler from ever returning. Capping it makes a
-// hostile or broken upstream terminate the stream instead of pinning the
-// connection open. The bound is reached before any token is seen, so the failure
-// stays on the retryable-first-token path and the client never observes a
-// partial stream.
 const streamPreHeaderLimit = 256 << 10
 
-// streamForward buffers only until the first token (first SSE data line),
-// then passes through. Failure before the first token is a retryable error the
-// client never sees; failure after is surfaced as an interruption.
-func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response) (result, *forwardError) {
+func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response, forced string) (result, *forwardError) {
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b)}
+		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b), body: b}
 		fe.retryable = isRetryableStatus(resp.StatusCode)
 		return result{}, fe
 	}
@@ -264,60 +199,134 @@ func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response) (res
 	started := false
 	var prompt, completion int
 
-	for {
-		line, err := br.ReadBytes('\n')
-		if err != nil {
-			if !started {
-				// Failed before the first token: transparent retry.
-				return result{}, &forwardError{retryable: true, msg: "stream failed before first token: " + err.Error()}
+	done := make(chan struct{})
+	defer close(done)
+	type lineEvent struct {
+		line []byte
+		err  error
+	}
+	lines := make(chan lineEvent, 16)
+	go func() {
+		defer close(lines)
+		for {
+			line, err := br.ReadBytes('\n')
+			if err != nil {
+				select {
+				case lines <- lineEvent{line: line, err: err}:
+				case <-done:
+				}
+				return
 			}
-			if err == io.EOF {
-				return result{prompt: prompt, completion: completion}, nil
-			}
-			// Interrupted mid-stream: no seamless recovery by design.
-			return result{prompt: prompt, completion: completion}, &forwardError{
-				retryable: false, streamStarted: true, msg: "stream interrupted: " + err.Error(),
+			select {
+			case lines <- lineEvent{line: line}:
+			case <-done:
+				return
 			}
 		}
+	}()
 
-		if !started {
-			if pre.Len()+len(line) > streamPreHeaderLimit {
-				// No data line within the bound: terminate, and report it as the
-				// retryable first-token failure so the caller can try another
-				// route rather than leaving the client on a silent open stream.
-				return result{}, &forwardError{
-					retryable: true,
-					msg:       "stream failed before first token: no data line within " + strconv.Itoa(streamPreHeaderLimit/1024) + "KiB of preamble",
-				}
-			}
-			pre.Write(line)
-			if isDataLine(line) {
-				started = true
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write(pre.Bytes())
-				pre.Reset()
+	var keepalive *time.Ticker
+	var keepaliveC <-chan time.Time
+	if h.deps.Keepalive > 0 {
+		keepalive = time.NewTicker(h.deps.Keepalive)
+		defer keepalive.Stop()
+		keepaliveC = keepalive.C
+	}
+
+	for {
+		select {
+		case <-keepaliveC:
+			if started {
+				_, _ = w.Write([]byte(": keepalive\n"))
 				if flusher != nil {
 					flusher.Flush()
 				}
 			}
 			continue
-		}
+		case ev, ok := <-lines:
+			if !ok {
 
-		_, _ = w.Write(line)
-		if flusher != nil {
-			flusher.Flush()
-		}
-		if p, c, ok := dataUsage(line); ok {
-			prompt, completion = p, c
+				if !started {
+					return result{}, &forwardError{retryable: true, msg: "stream failed before first token: EOF"}
+				}
+				return result{prompt: prompt, completion: completion}, nil
+			}
+			line, err := ev.line, ev.err
+			if err != nil {
+				if !started {
+
+					return result{}, &forwardError{retryable: true, msg: "stream failed before first token: " + err.Error()}
+				}
+				if err == io.EOF {
+					return result{prompt: prompt, completion: completion}, nil
+				}
+
+				return result{prompt: prompt, completion: completion}, &forwardError{
+					retryable: false, streamStarted: true, msg: "stream interrupted: " + err.Error(),
+				}
+			}
+
+			if !started {
+				if pre.Len()+len(line) > streamPreHeaderLimit {
+
+					return result{}, &forwardError{
+						retryable: true,
+						msg:       "stream failed before first token: no data line within " + strconv.Itoa(streamPreHeaderLimit/1024) + "KiB of preamble",
+					}
+				}
+				pre.Write(line)
+				if isDataLine(line) {
+					started = true
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(pre.Bytes())
+					pre.Reset()
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+				continue
+			}
+
+			out := line
+			if forced != "" {
+				out = patchStreamModel(line, forced)
+			}
+			_, _ = w.Write(out)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if p, c, ok := dataUsage(line); ok {
+				prompt, completion = p, c
+			}
 		}
 	}
+}
+
+func patchStreamModel(line []byte, alias string) []byte {
+	t := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(t, []byte("data:")) {
+		return line
+	}
+	payload := bytes.TrimSpace(bytes.TrimSuffix(t[len("data:"):], []byte("\r")))
+
+	if len(payload) == 0 || (payload[0] != '{' && payload[0] != '[') {
+		return line
+	}
+	patched := spliceTopLevelModel(payload, alias)
+	if len(patched) == len(payload) && bytes.Equal(patched, payload) {
+		return line
+	}
+	out := make([]byte, 0, len(line))
+	out = append(out, t[:len(t)-len(payload)]...)
+	out = append(out, patched...)
+	out = append(out, line[len(t):]...)
+	return out
 }
 
 func isDataLine(line []byte) bool {
 	return bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:"))
 }
 
-// dataUsage extracts usage tokens from an SSE data line when present.
 func dataUsage(line []byte) (int, int, bool) {
 	t := bytes.TrimSpace(line)
 	if !bytes.HasPrefix(t, []byte("data:")) {
@@ -335,29 +344,6 @@ func parseUsage(body []byte) (int, int) {
 	return p, c
 }
 
-// usageTokens extracts prompt and completion token counts from a response body
-// or SSE payload, coercing each field INDEPENDENTLY.
-//
-// H3: the previous version declared a single typed `int` per field inside one
-// all-or-nothing json.Unmarshal. encoding/json aborts the ENTIRE struct decode
-// on the first type mismatch for a typed field - it does not skip it the way it
-// does for map[string]any - so a single float- or string-encoded token count
-// discarded BOTH numbers. Measured against the real functions:
-//
-//	{"usage":{"prompt_tokens":1500,"completion_tokens":250}}        -> p=1500 c=250
-//	{"usage":{"prompt_tokens":1500.0,"completion_tokens":250.0}}      -> p=0    c=0
-//	{"usage":{"prompt_tokens":"1500","completion_tokens":"250"}}      -> p=0    c=0
-//	{"usage":{"prompt_tokens":null,"completion_tokens":250}}          -> p=0    c=250
-//	{"usage":{"input_tokens":1500,"completion_tokens":250}}           -> p=0    c=0
-//
-// Float and string encodings are emitted by several OpenAI-compatible gateways
-// and by vLLM's older tokenizer accounting, and `input_tokens` is the
-// Anthropic-style spelling. The caller discarded the ok=false return, so the
-// loss was silent and compounded C3: cost recorded as zero with no error.
-//
-// Decoding into json.RawMessage and coercing per field means a bad
-// prompt_tokens degrades to 0 while completion_tokens survives, and a field
-// encoded as a float or a numeric string is accepted rather than discarded.
 func usageTokens(payload []byte) (prompt, completion int, ok bool) {
 	var v struct {
 		Usage map[string]json.RawMessage `json:"usage"`
@@ -365,15 +351,12 @@ func usageTokens(payload []byte) (prompt, completion int, ok bool) {
 	if err := json.Unmarshal(payload, &v); err != nil || v.Usage == nil {
 		return 0, 0, false
 	}
-	// Accept every spelling seen in the wild, not just the OpenAI one, since the
-	// gateway fronts several provider dialects and a missing count is silent
-	// under-billing either way.
+
 	prompt = firstTokenCount(v.Usage, "prompt_tokens", "input_tokens", "prompt_eval_count")
 	completion = firstTokenCount(v.Usage, "completion_tokens", "output_tokens", "eval_count")
 	return prompt, completion, true
 }
 
-// firstTokenCount returns the first parseable token count among the given keys.
 func firstTokenCount(usage map[string]json.RawMessage, keys ...string) int {
 	for _, k := range keys {
 		raw, ok := usage[k]
@@ -387,21 +370,12 @@ func firstTokenCount(usage map[string]json.RawMessage, keys ...string) int {
 	return 0
 }
 
-// coerceTokenCount parses one token-count field, accepting the encodings that
-// real providers actually emit.
-//
-// A negative count is rejected rather than clamped: there is no arithmetic in
-// which a negative token count is meaningful, and admitting one would let a
-// hostile or buggy upstream subtract from the gateway's usage totals. A count
-// so large it cannot be a real request is likewise rejected, because
-// costMicros is derived from it by multiplication and an absurd value would
-// overflow the budget arithmetic rather than merely misreport.
 func coerceTokenCount(raw json.RawMessage) (int, bool) {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || s == "null" {
 		return 0, false
 	}
-	// Strip surrounding quotes so a numeric string ("250") parses like a number.
+
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
 		var str string
 		if err := json.Unmarshal(raw, &str); err != nil {
@@ -409,17 +383,12 @@ func coerceTokenCount(raw json.RawMessage) (int, bool) {
 		}
 		s = strings.TrimSpace(str)
 	}
-	// Accept "1500" and "1500.0" and "1.5e3" alike. A float decode is required
-	// because encoding/json refuses an integer literal into a float field only
-	// when it has a fractional part; parsing as float and rounding accepts
-	// every case uniformly.
+
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, false
 	}
-	// Round rather than truncate: providers that emit 1500.0 mean 1500 tokens,
-	// and truncating 1500.9 to 1500 is fine, but truncating a value that arrived
-	// as 1500.999999 due to float accumulation should not lose a whole token.
+
 	n := int(math.Round(f))
 	if n < 0 || n > maxTokenCount {
 		return 0, false
@@ -427,31 +396,16 @@ func coerceTokenCount(raw json.RawMessage) (int, bool) {
 	return n, true
 }
 
-// maxTokenCount bounds an accepted token count. 1e12 is far beyond any real
-// request and keeps the downstream cost multiplication well inside int64.
 const maxTokenCount = 1e12
 
 func isRetryableStatus(code int) bool {
 	return code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500
 }
 
-// upstreamErrorMsg builds the client-facing error for an upstream failure.
-//
-// M1: this used to return the upstream's own error text verbatim, so a provider
-// response of "invalid api key sk-live-AAAA1111 for org_zzz999" reached the
-// client with the credential prefix and the account id intact. The gateway was
-// functioning as an error-message relay for its own upstream providers'
-// internals.
-//
-// The detail is not discarded - it is the single most useful thing an operator
-// has when a request fails - so it is logged at ERROR and the client receives a
-// stable generic message plus the upstream status. A caller can correlate
-// through the gateway log rather than through a credential disclosure.
 func upstreamErrorMsg(status int, body []byte) string {
 	detail := upstreamErrorDetail(body)
 	if detail != "" {
-		// Logged, not returned. slog is used rather than a package-level logger
-		// so this composes with whatever handler the app installed.
+
 		slog.Error("upstream request failed",
 			"status", status,
 			"detail", detail)
@@ -459,8 +413,6 @@ func upstreamErrorMsg(status int, body []byte) string {
 	return http.StatusText(status)
 }
 
-// upstreamErrorDetail extracts an OpenAI-style error message for LOGGING only.
-// Never return this to a client; see upstreamErrorMsg.
 func upstreamErrorDetail(body []byte) string {
 	var v struct {
 		Error struct {

@@ -12,9 +12,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/registry"
 )
 
-// providerWithTimeoutRegistry builds a registry whose provider carries a
-// Timeout, so the router propagates it into the Selection used by send. This is
-// how a provider timeout reaches send in production.
 func providerWithTimeoutRegistry(baseURL string, timeout time.Duration) *registry.Registry {
 	return registry.New(
 		[]model.Provider{{
@@ -30,13 +27,6 @@ func providerWithTimeoutRegistry(baseURL string, timeout time.Duration) *registr
 	)
 }
 
-// TestStreamProviderTimeoutDoesNotCancelBeforeBody is the live-found streaming
-// bug: a `defer cancel()` in send fired on send's RETURN, immediately after the
-// response headers, cancelling the context and killing the body read. With a
-// provider timeout configured, a streaming upstream that flushes a first SSE
-// chunk then a second one later relayed only the first and failed
-// "stream interrupted: context canceled". The cancel must live on body Close, and
-// the second data line must still arrive.
 func TestStreamProviderTimeoutDoesNotCancelBeforeBody(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fl, _ := w.(http.Flusher)
@@ -56,7 +46,7 @@ func TestStreamProviderTimeoutDoesNotCancelBeforeBody(t *testing.T) {
 		Registry: reg,
 		Observ:   observ.New(true),
 	})
-	body := `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	body := `{"model":"flash","stream":true,"input":"hi"}`
 	rec := doPost(t, h, "", body)
 
 	if rec.Code != http.StatusOK {
@@ -73,13 +63,6 @@ func TestStreamProviderTimeoutDoesNotCancelBeforeBody(t *testing.T) {
 	}
 }
 
-// TestEndlessNonDataStreamTerminatesByProviderTimeout proves a slow-dripping
-// keep-alive-only upstream is still bounded by the provider timeout on a
-// timeout-configured gateway. The stream sends only `: keep-alive` comment
-// lines (never a data line) every ~5ms forever. Before the fix the timeout was
-// cancelled at send return, so the request would pin until the 256KiB
-// pre-buffer cap instead of the far shorter provider timeout; a timeout must
-// still terminate the stream within a bounded window.
 func TestEndlessNonDataStreamTerminatesByProviderTimeout(t *testing.T) {
 	const providerTimeout = 300 * time.Millisecond
 	done := make(chan struct{})
@@ -108,7 +91,7 @@ func TestEndlessNonDataStreamTerminatesByProviderTimeout(t *testing.T) {
 		Registry: reg,
 		Observ:   observ.New(true),
 	})
-	body := `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	body := `{"model":"flash","stream":true,"input":"hi"}`
 
 	const bound = 2 * time.Second
 	start := time.Now()

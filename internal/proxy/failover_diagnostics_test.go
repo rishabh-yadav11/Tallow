@@ -20,26 +20,8 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/store"
 )
 
-// The failover loop used to throw away the reason for every failed attempt and
-// report only "upstream attempts exhausted". That single string was returned
-// for a refused private base_url, a rejected API key, and a dead socket alike.
-//
-// The cost is not cosmetic. An operator who sees that message has to reproduce
-// the failure by hand to learn which of those it was, and the three cases have
-// three different fixes: move the host, rotate the key, or restart the service.
-// The audit log was equally silent, because the same truncated string was what
-// got stored.
-//
-// This was found while validating the documented quick start: pointing a
-// provider at a loopback upstream produced a 502 whose message named no
-// provider, no key, and no cause, while /logs showed only "upstream attempts
-// exhausted".
-
-// TestExhaustedChainNamesEveryFailedRoute is the core regression. Each target
-// fails with a distinct, identifiable reason, and all of them must appear.
 func TestExhaustedChainNamesEveryFailedRoute(t *testing.T) {
-	// A distinct status per target, so each failure is separately identifiable
-	// in the final message.
+
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -74,8 +56,6 @@ func TestExhaustedChainNamesEveryFailedRoute(t *testing.T) {
 		Observ:   observ.New(true),
 	})
 
-	// Both targets 500, which is retryable, so the chain is genuinely exhausted
-	// rather than short-circuited on a non-retryable error.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprint(w, `{"error":"upstream boom"}`)
@@ -94,8 +74,7 @@ func TestExhaustedChainNamesEveryFailedRoute(t *testing.T) {
 				body, want)
 		}
 	}
-	// The attempt count lets an operator confirm the chain was actually walked
-	// to the end, rather than stopping silently partway.
+
 	if !strings.Contains(body, "after 2") {
 		t.Errorf("exhausted-chain message %q does not report the number of "+
 			"attempts, so a short-circuited chain is indistinguishable from a "+
@@ -103,9 +82,6 @@ func TestExhaustedChainNamesEveryFailedRoute(t *testing.T) {
 	}
 }
 
-// TestExhaustedChainNamesTheCause proves the message carries the actual cause,
-// not just the route. Two different upstream statuses must be distinguishable,
-// because "which provider" and "why" are both needed to act.
 func TestExhaustedChainNamesTheCause(t *testing.T) {
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
@@ -141,13 +117,6 @@ func TestExhaustedChainNamesTheCause(t *testing.T) {
 		Observ:   observ.New(true),
 	})
 
-	// alpha is rate limited, beta is broken. Both are retryable, so both are
-	// tried and both reasons must survive.
-	//
-	// The targets are told apart by the model name in the request body, which is
-	// what actually distinguishes an upstream attempt for alpha from one for
-	// beta. A test that guessed at some other marker (a path, a header the proxy
-	// does not set) would silently never exercise the branch it claims to cover.
 	var alphaSeen, betaSeen bool
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -169,11 +138,7 @@ func TestExhaustedChainNamesTheCause(t *testing.T) {
 		t.Fatalf("test setup did not exercise both targets (alpha=%v beta=%v); "+
 			"the chain did not run as this test assumes", alphaSeen, betaSeen)
 	}
-	// The two causes must be tellable apart. A message naming both routes but
-	// not the distinct status of each has saved the operator far less than it
-	// looks: "alpha/k1: Too Many Requests" and "beta/k2: Bad Gateway" point at
-	// different fixes (wait out a quota versus investigate an outage), and a
-	// message that rendered both as the same generic text would not.
+
 	if !strings.Contains(body, "Too Many Requests") {
 		t.Errorf("exhausted-chain message %q does not carry the 429 that "+
 			"alpha returned: a rate limit is indistinguishable from an outage",
@@ -186,21 +151,6 @@ func TestExhaustedChainNamesTheCause(t *testing.T) {
 	}
 }
 
-// TestExhaustedChainReasonIsRecordedInTheAuditLog guards the store-facing half.
-// An operator reads /logs far more often than the client error, so a message
-// that names the cause in the HTTP response but not in the recorded row would
-// still leave the operator in the dark.
-//
-// This deliberately uses a TWO-target alias and a streaming request. Two
-// details, each of which silently narrowed the first version of this test:
-//   - A ONE-target chain never reaches the exhausted-attempts path. The single
-//     failed attempt is recorded against that key, the next pass's Select finds
-//     nothing and returns a "no route" error, and that early return carries its
-//     own already-useful text. A one-target test therefore passed while
-//     asserting nothing about the code path it was named for.
-//   - A NON-streaming request goes through the coalesced-flight code, which sets
-//     meta.Err from its own fetch value rather than from the streaming loop. So
-//     a mutation that only reverts the streaming loop left it passing.
 func TestExhaustedChainReasonIsRecordedInTheAuditLog(t *testing.T) {
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
@@ -235,10 +185,7 @@ func TestExhaustedChainReasonIsRecordedInTheAuditLog(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	defer st.Close()
-	// Caching is enabled deliberately. cacheKey returns not-cacheable for a
-	// streaming request regardless, so whether it is on is irrelevant to this
-	// test's subject - and leaving it off would mean the cache fast path could
-	// never be reached here, which is a silent way to narrow a test's coverage.
+
 	h := newHarness(t, Deps{
 		Router:       r,
 		Registry:     reg,
@@ -253,13 +200,8 @@ func TestExhaustedChainReasonIsRecordedInTheAuditLog(t *testing.T) {
 		fmt.Fprint(w, `{"error":"boom"}`)
 	})
 
-	// Stream so the request takes the path whose loop builds the message.
-	// The upstream 500s, so nothing is ever streamed to the client; the request
-	// fails before the first token, which is the retryable path under test.
-	doPost(t, h, "", `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	doPost(t, h, "", `{"model":"flash","stream":true,"input":"hi"}`)
 
-	// Store writes are queued, so the queue must be drained before the row is
-	// readable. Reading before the drain would assert against an empty table.
 	st.Flush()
 	rows, err := st.RecentRequests(10)
 	if err != nil {
@@ -288,10 +230,6 @@ func TestExhaustedChainReasonIsRecordedInTheAuditLog(t *testing.T) {
 	}
 }
 
-// TestExhaustedMessageStaysBoundedOnLongChains keeps the added detail from
-// becoming a denial-of-service vector. A fallback chain can be long, and the
-// error is written to the store and returned to a client, so it must be capped
-// while still reporting the true total.
 func TestExhaustedMessageStaysBoundedOnLongChains(t *testing.T) {
 	var many []string
 	for i := 0; i < 50; i++ {
@@ -303,8 +241,7 @@ func TestExhaustedMessageStaysBoundedOnLongChains(t *testing.T) {
 			"is stored per request and returned to clients, so it must be bounded",
 			len(msg))
 	}
-	// The true count must survive the truncation, or the operator cannot tell
-	// how much of the chain was actually walked.
+
 	if !strings.Contains(msg, "after 50") {
 		t.Errorf("truncated message %q loses the true attempt count", msg)
 	}
@@ -314,9 +251,6 @@ func TestExhaustedMessageStaysBoundedOnLongChains(t *testing.T) {
 	}
 }
 
-// TestExhaustedMessageWithNoAttempts is the boundary control: Select can fail
-// before any attempt is made, in which case there is nothing to report and the
-// message must still be well formed.
 func TestExhaustedMessageWithNoAttempts(t *testing.T) {
 	if got := exhaustedMessage(nil); got != "upstream attempts exhausted" {
 		t.Errorf("exhaustedMessage(nil) = %q, want the plain message", got)
