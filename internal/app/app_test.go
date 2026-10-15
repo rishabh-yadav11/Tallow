@@ -22,7 +22,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
-// fakeUpstream is an OpenAI-compatible stub that records requests.
 type fakeUpstream struct {
 	mu     sync.Mutex
 	bodies []map[string]any
@@ -42,11 +41,11 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	if s, _ := req["stream"].(bool); s {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
-		fmt.Fprint(w, "data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"id\":\"x\",\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
 		fl.Flush()
-		fmt.Fprint(w, "data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"id\":\"x\",\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n\n")
 		fl.Flush()
-		fmt.Fprint(w, "data: {\"id\":\"x\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n")
 		fl.Flush()
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		fl.Flush()
@@ -55,12 +54,13 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"id":     "x",
-		"object": "chat.completion",
+		"object": "response",
 		"model":  req["model"],
-		"choices": []any{map[string]any{
-			"index": 0, "message": map[string]any{"role": "assistant", "content": "pong"}, "finish_reason": "stop",
+		"output": []any{map[string]any{
+			"type": "message", "role": "assistant",
+			"content": []any{map[string]any{"type": "output_text", "text": "pong"}},
 		}},
-		"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 3},
+		"usage": map[string]any{"input_tokens": 5, "output_tokens": 3},
 	})
 }
 
@@ -212,23 +212,22 @@ func TestEndToEndRoutingAndCache(t *testing.T) {
 	upSrv, up := setup(t)
 	gw := startGateway(t, upSrv.URL)
 
-	nb := `{"model":"flash","messages":[{"role":"user","content":"hi"}]}`
-	resp, got := post(t, gw.URL+"/v1/chat/completions", nb)
+	nb := `{"model":"flash","input":"hi"}`
+	resp, got := post(t, gw.URL+"/v1/responses", nb)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, got)
 	}
 	if !strings.Contains(got, "pong") {
 		t.Fatalf("missing content: %s", got)
 	}
-	// The upstream must have received the mapped model, not the alias.
+
 	last, _ := up.lastBody()
 	if last["model"] != "flash-v4" {
 		t.Fatalf("upstream model = %v, want flash-v4", last["model"])
 	}
 	hitsAfterFirst := up.hits.Load()
 
-	// Identical request must be served from the exact-match cache.
-	_, got2 := post(t, gw.URL+"/v1/chat/completions", nb)
+	_, got2 := post(t, gw.URL+"/v1/responses", nb)
 	if !strings.Contains(got2, "pong") {
 		t.Fatalf("cached response missing content: %s", got2)
 	}
@@ -241,8 +240,8 @@ func TestEndToEndStreaming(t *testing.T) {
 	upSrv, _ := setup(t)
 	gw := startGateway(t, upSrv.URL)
 
-	body := `{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`
-	got := streaming(t, gw.URL+"/v1/chat/completions", body)
+	body := `{"model":"flash","stream":true,"input":"hi"}`
+	got := streaming(t, gw.URL+"/v1/responses", body)
 	if !strings.Contains(got, "hello") || !strings.Contains(got, "world") {
 		t.Fatalf("stream missing tokens: %q", got)
 	}
@@ -255,10 +254,9 @@ func TestEndToEndFailoverBeforeFirstToken(t *testing.T) {
 	upSrv, up := setup(t)
 	gw := startGateway(t, upSrv.URL)
 
-	// First target is a dead provider; the request must transparently retry.
 	before := up.hits.Load()
-	resp, got := post(t, gw.URL+"/v1/chat/completions",
-		`{"model":"failover","messages":[{"role":"user","content":"hi"}]}`)
+	resp, got := post(t, gw.URL+"/v1/responses",
+		`{"model":"failover","input":"hi"}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("failover status %d: %s", resp.StatusCode, got)
 	}
@@ -274,8 +272,8 @@ func TestEndToEndToolPassthrough(t *testing.T) {
 	upSrv, up := setup(t)
 	gw := startGateway(t, upSrv.URL)
 
-	body := `{"model":"flash","messages":[{"role":"user","content":"use the tool"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{}}}}]}`
-	resp, _ := post(t, gw.URL+"/v1/chat/completions", body)
+	body := `{"model":"flash","input":"use the tool","tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{}}}}]}`
+	resp, _ := post(t, gw.URL+"/v1/responses", body)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
@@ -285,9 +283,6 @@ func TestEndToEndToolPassthrough(t *testing.T) {
 	}
 }
 
-// startGatewayAuth builds a gateway with an explicit auth policy. When open is
-// true the gateway accepts any token; when false (the safe default) it requires a
-// configured api key. apiKeys, if non-empty, whitelists those tokens.
 func startGatewayAuth(t *testing.T, upstreamURL string, open bool, apiKeys []string) *httptest.Server {
 	dir := t.TempDir()
 	const masterKey = "integration-master-key"
@@ -378,47 +373,40 @@ func boolStr(b bool) string {
 	return "false"
 }
 
-// TestAuthClosedRejectsRequests verifies the user-facing fix for issue #6:
-// an empty api_keys list with open=false must NOT open the gateway; requests
-// without a valid key get 401.
 func TestAuthClosedRejectsRequests(t *testing.T) {
 	upSrv, _ := setup(t)
 	gw := startGatewayAuth(t, upSrv.URL, false, nil)
 
-	resp, _ := post(t, gw.URL+"/v1/chat/completions",
-		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	resp, _ := post(t, gw.URL+"/v1/responses",
+		`{"model":"flash","input":"hi"}`)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for closed gateway with no token, got %d", resp.StatusCode)
 	}
 }
 
-// TestAuthOpenAcceptsAnyToken verifies open=true restores the loopback-trust
-// behavior explicitly opted into (e.g. by the integration harness).
 func TestAuthOpenAcceptsAnyToken(t *testing.T) {
 	upSrv, _ := setup(t)
 	gw := startGatewayAuth(t, upSrv.URL, true, nil)
 
-	resp, _ := post(t, gw.URL+"/v1/chat/completions",
-		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	resp, _ := post(t, gw.URL+"/v1/responses",
+		`{"model":"flash","input":"hi"}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200 for open gateway, got %d", resp.StatusCode)
 	}
 }
 
-// TestAuthKeyAllowList verifies a configured api_keys allow-list is honored.
 func TestAuthKeyAllowList(t *testing.T) {
 	upSrv, _ := setup(t)
 	gw := startGatewayAuth(t, upSrv.URL, false, []string{"secret-key"})
 
-	// Wrong key -> 401.
-	resp, _ := postAuth(t, gw.URL+"/v1/chat/completions", "wrong",
-		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+	resp, _ := postAuth(t, gw.URL+"/v1/responses", "wrong",
+		`{"model":"flash","input":"hi"}`)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for wrong key, got %d", resp.StatusCode)
 	}
-	// Correct key -> 200.
-	resp, body := postAuth(t, gw.URL+"/v1/chat/completions", "secret-key",
-		`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+
+	resp, body := postAuth(t, gw.URL+"/v1/responses", "secret-key",
+		`{"model":"flash","input":"hi"}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200 for correct key, got %d: %s", resp.StatusCode, body)
 	}
@@ -441,9 +429,6 @@ func postAuth(t *testing.T, url, token, body string) (*http.Response, string) {
 	return resp, string(b)
 }
 
-// TestHotReloadUnderLoad exercises the issue #1 race: concurrent config hot-reload
-// (which rewrites Router.budgets / observ.enabled under lock) against live
-// requests. Under -race this fails before the fix; it must pass after.
 func TestHotReloadUnderLoad(t *testing.T) {
 	upSrv, _ := setup(t)
 	dir := t.TempDir()
@@ -514,8 +499,8 @@ name = "flash"
 				case <-stop:
 					return
 				default:
-					resp, _ := post(t, srv.URL+"/v1/chat/completions",
-						`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`)
+					resp, _ := post(t, srv.URL+"/v1/responses",
+						`{"model":"flash","input":"hi"}`)
 					if resp != nil {
 						resp.Body.Close()
 					}
@@ -523,7 +508,7 @@ name = "flash"
 			}
 		}()
 	}
-	// Hammer reloads concurrently with requests.
+
 	for i := 0; i < 200; i++ {
 		writeCfg(i%2 == 0)
 		if err := a.Reload(); err != nil {
@@ -534,9 +519,6 @@ name = "flash"
 	wg.Wait()
 }
 
-// freePort reserves and releases a loopback TCP port, returning its number. There
-// is a small TOCTOU window before the caller binds it, which is acceptable for a
-// test; callers retry if bind fails.
 func freePort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -548,11 +530,6 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// TestAppRunEndToEnd boots the actual gateway via App.Run (proxy ListenAndServe,
-// admin unix socket, health loop, retention loop, config watcher) against a fake
-// upstream, serves a real chat request, then cancels the context to verify
-// graceful shutdown returns nil. This exercises the run path that the in-process
-// httptest.NewServer(a.ProxyHandler()) harness never touches.
 func TestAppRunEndToEnd(t *testing.T) {
 	upSrv, up := setup(t)
 	dir := t.TempDir()
@@ -620,7 +597,7 @@ name = "flash"
 		go func() { done <- a.Run(ctx) }()
 
 		baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
-		// Poll /health until the proxy is listening.
+
 		ready := false
 		for i := 0; i < 100; i++ {
 			req, _ := http.NewRequest(http.MethodGet, baseURL+"/health", nil)
@@ -648,7 +625,7 @@ name = "flash"
 			}()
 			break
 		}
-		// Not ready: tear down and retry on a fresh port.
+
 		cancel()
 		<-done
 	}
@@ -657,11 +634,9 @@ name = "flash"
 		t.Fatal("gateway never became ready")
 	}
 
-	// Real chat request through the live Run() server. Use a no-keep-alive client
-	// so the connection closes promptly and graceful shutdown does not block on it.
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions",
-		strings.NewReader(`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`))
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/responses",
+		strings.NewReader(`{"model":"flash","input":"hi"}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {

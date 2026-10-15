@@ -18,13 +18,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
-// This file covers the admin.Backend surface of App: the read-only views that
-// back the admin socket, plus the accessors. These are operator-visible, so a
-// silent regression here either misreports a provider's health or hides a
-// budget that is actually exhausted.
-
-// viewApp builds a running App with the given provider/alias/store config, on
-// top of a stub upstream, and returns the App.
 func viewApp(t *testing.T, upstreamURL string, extra string) *app.App {
 	t.Helper()
 	dir := t.TempDir()
@@ -137,17 +130,12 @@ name = "solo"
 	return a
 }
 
-// withUpstream starts a stub upstream and builds a view App on top of it.
 func withUpstream(t *testing.T) *app.App {
 	t.Helper()
 	srv, _ := setup(t)
 	return viewApp(t, srv.URL, "")
 }
 
-// TestProvidersViewReportsEveryProviderAndKey is the core admin view. Every
-// configured provider must appear, and every key under it, with the configured
-// limits echoed back. A provider that silently drops out of this view is
-// invisible to an operator trying to debug routing.
 func TestProvidersViewReportsEveryProviderAndKey(t *testing.T) {
 	a := withUpstream(t)
 
@@ -182,8 +170,7 @@ func TestProvidersViewReportsEveryProviderAndKey(t *testing.T) {
 	if k.RPM != 60 {
 		t.Errorf("key RPM = %d, want 60", k.RPM)
 	}
-	// The budget limits must be visible, or an operator cannot tell a
-	// concurrency refusal from a rate refusal.
+
 	if k.MaxInflight != 4 {
 		t.Errorf("MaxInflight = %d, want 4", k.MaxInflight)
 	}
@@ -191,8 +178,6 @@ func TestProvidersViewReportsEveryProviderAndKey(t *testing.T) {
 		t.Errorf("CostLimit = %d, want 500", k.CostLimit)
 	}
 
-	// A provider with no keys still appears, just with an empty key list. It
-	// must not be dropped.
 	for _, pv := range views {
 		if pv.Name == "p2" && len(pv.Keys) != 1 {
 			t.Errorf("p2 has %d keys, want 1", len(pv.Keys))
@@ -200,9 +185,6 @@ func TestProvidersViewReportsEveryProviderAndKey(t *testing.T) {
 	}
 }
 
-// TestProvidersViewReportsNonEmptyHealth pins that every provider and key
-// carries a health string. An empty string would render as a blank cell and
-// read as "no data" rather than a state.
 func TestProvidersViewReportsNonEmptyHealth(t *testing.T) {
 	a := withUpstream(t)
 	for _, pv := range a.ProvidersView() {
@@ -217,9 +199,6 @@ func TestProvidersViewReportsNonEmptyHealth(t *testing.T) {
 	}
 }
 
-// TestHealthViewKeysEveryProviderAndKeyFlat checks the flat map form, which is
-// what the admin socket serializes. Keys must be namespaced so a provider named
-// like "provider:x" cannot collide with a key entry.
 func TestHealthViewKeysEveryProviderAndKeyFlat(t *testing.T) {
 	a := withUpstream(t)
 	m := a.HealthView()
@@ -233,7 +212,6 @@ func TestHealthViewKeysEveryProviderAndKeyFlat(t *testing.T) {
 	}
 }
 
-// TestAliasesViewReturnsAliasesAndTargets checks the alias view shape.
 func TestAliasesViewReturnsAliasesAndTargets(t *testing.T) {
 	a := withUpstream(t)
 	views := a.AliasesView()
@@ -250,7 +228,7 @@ func TestAliasesViewReturnsAliasesAndTargets(t *testing.T) {
 	if len(flash.Targets) != 2 {
 		t.Fatalf("flash has %d targets, want 2", len(flash.Targets))
 	}
-	// Both targets must be distinct and intact.
+
 	seen := map[string]string{}
 	for _, tv := range flash.Targets {
 		if prev, dup := seen[tv.Provider]; dup {
@@ -267,18 +245,13 @@ func TestAliasesViewReturnsAliasesAndTargets(t *testing.T) {
 	}
 }
 
-// TestBudgetsViewReportsLivePerKeyBudgets drives real traffic and then checks
-// the budget view reflects it. A budget view that always reports full headroom
-// is worse than no view at all, because it tells an operator the opposite of
-// the truth.
 func TestBudgetsViewReportsLivePerKeyBudgets(t *testing.T) {
 	srv, _ := setup(t)
 	a := viewApp(t, srv.URL, "")
 
-	// Drive enough traffic to consume headroom on p1:k1 (rpm 60).
 	for i := 0; i < 5; i++ {
-		body := strings.NewReader(`{"model":"flash-v4","messages":[{"role":"user","content":"hi"}]}`)
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", body)
+		body := strings.NewReader(`{"model":"flash-v4","input":"hi"}`)
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses", body)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -288,7 +261,6 @@ func TestBudgetsViewReportsLivePerKeyBudgets(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	// BudgetsView must report an entry for p1/k1 with the configured limit.
 	var found bool
 	for _, b := range a.BudgetsView() {
 		if b.Provider == "p1" && b.Key == "k1" {
@@ -306,19 +278,15 @@ func TestBudgetsViewReportsLivePerKeyBudgets(t *testing.T) {
 	}
 }
 
-// TestRecentRequestsReflectsTraffic checks the store-backed read paths actually
-// read. These swallow their error, so an empty result must be distinguishable
-// from a broken query, and this pins that traffic shows up.
 func TestRecentRequestsReflectsTraffic(t *testing.T) {
 	srv, _ := setup(t)
 	a := viewApp(t, srv.URL, "")
-	// viewApp does not wrap the handler, so serve it here; without this the
-	// request below would go straight to the upstream and never be recorded.
+
 	gw := httptest.NewServer(a.ProxyHandler())
 	t.Cleanup(gw.Close)
 
-	body := strings.NewReader(`{"model":"flash-v4","messages":[{"role":"user","content":"hi"}]}`)
-	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/chat/completions", body)
+	body := strings.NewReader(`{"model":"flash-v4","input":"hi"}`)
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/responses", body)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -327,7 +295,6 @@ func TestRecentRequestsReflectsTraffic(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	// The store is written asynchronously, so poll rather than sleep once.
 	deadline := time.Now().Add(5 * time.Second)
 	var reqs []model.RequestMeta
 	for time.Now().Before(deadline) {
@@ -340,11 +307,7 @@ func TestRecentRequestsReflectsTraffic(t *testing.T) {
 	if len(reqs) == 0 {
 		t.Error("RecentRequests is empty after a successful request")
 	}
-	// A non-positive limit falls back to the method's default rather than
-	// returning nothing. This is a deliberate defensive clamp in the store, and
-	// it is unreachable from the admin socket, whose limitParam already maps any
-	// limit<=0 to the default before calling in. So assert the clamp holds and
-	// is bounded, rather than asserting an empty result.
+
 	for _, n := range []int{0, -1, -1000} {
 		if got := a.RecentRequests(n); len(got) == 0 {
 			t.Errorf("RecentRequests(%d) returned nothing, want the default page", n)
@@ -363,8 +326,6 @@ func TestRecentRequestsReflectsTraffic(t *testing.T) {
 	}
 }
 
-// TestAccessorsReportConfigAndVersion covers the small operator-visible
-// accessors.
 func TestAccessorsReportConfigAndVersion(t *testing.T) {
 	srv, _ := setup(t)
 	a := viewApp(t, srv.URL, "")
@@ -381,18 +342,15 @@ func TestAccessorsReportConfigAndVersion(t *testing.T) {
 	if a.AdminSocket() == "" {
 		t.Error("AdminSocket is empty")
 	}
-	// CacheStats must be readable and non-negative.
+
 	hits, miss, evict, size := a.CacheStats()
 	if hits < 0 || miss < 0 || evict < 0 || size < 0 {
 		t.Errorf("CacheStats returned a negative value: %d %d %d %d", hits, miss, evict, size)
 	}
-	// Metrics must be a usable snapshot.
+
 	_ = a.Metrics()
 }
 
-// TestAccessorsTrackReload checks the accessors are live: after a hot reload
-// that changes the listen address, the accessor must report the new value, not
-// the value captured at construction.
 func TestAccessorsTrackReload(t *testing.T) {
 	srv, _ := setup(t)
 	dir := t.TempDir()
@@ -447,7 +405,6 @@ base_url = "%s"
 		t.Fatalf("ListenAddr = %q before reload", got)
 	}
 
-	// Change the listen address and the provider's RPM, then reload.
 	cfg2 := strings.Replace(cfg, `listen = "127.0.0.1:0"`, `listen = "127.0.0.1:9099"`, 1)
 	cfg2 = strings.Replace(cfg2, `base_url = "`+srv.URL+`"`, `base_url = "`+srv.URL+`"`+"\nrpm = 77", 1)
 	if err := os.WriteFile(cfgPath, []byte(cfg2), 0o600); err != nil {
@@ -460,7 +417,7 @@ base_url = "%s"
 		t.Errorf("ListenAddr = %q after reload, want 127.0.0.1:9099: the accessor "+
 			"serves the config captured at construction", got)
 	}
-	// The provider view must reflect the reloaded RPM too.
+
 	for _, pv := range a.ProvidersView() {
 		if pv.Name == "p1" && pv.RPM != 77 {
 			t.Errorf("p1 RPM = %d after reload, want 77", pv.RPM)
@@ -468,9 +425,6 @@ base_url = "%s"
 	}
 }
 
-// TestMetricsSnapshotIsSerializable makes sure the metrics view can actually be
-// written to the admin socket as JSON. A snapshot with an unserializable field
-// would fail at the admin boundary, which is hard to reach from a unit test.
 func TestMetricsSnapshotIsSerializable(t *testing.T) {
 	a := withUpstream(t)
 	b, err := json.Marshal(a.Metrics())
@@ -482,10 +436,6 @@ func TestMetricsSnapshotIsSerializable(t *testing.T) {
 	}
 }
 
-// TestViewsAreSafeUnderConcurrentReload exercises the read-only views while a
-// reload swaps the registry underneath them. A view that reads a.reg without
-// synchronization races with the swap, and the admin socket is reachable
-// concurrently in production.
 func TestViewsAreSafeUnderConcurrentReload(t *testing.T) {
 	srv, _ := setup(t)
 	a := viewApp(t, srv.URL, "")
@@ -493,7 +443,6 @@ func TestViewsAreSafeUnderConcurrentReload(t *testing.T) {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 
-	// Concurrent readers of every view.
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -514,7 +463,7 @@ func TestViewsAreSafeUnderConcurrentReload(t *testing.T) {
 			}
 		}()
 	}
-	// Concurrent reloaders, as a config watcher plus an operator would produce.
+
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
@@ -534,10 +483,6 @@ func TestViewsAreSafeUnderConcurrentReload(t *testing.T) {
 	wg.Wait()
 }
 
-// TestProxyHandlerIsStableAcrossReload checks the handler identity is preserved
-// across a reload, since a reload that rebuilt the handler would drop
-// in-flight connections. This is the documented "reuses all long-lived
-// objects" guarantee.
 func TestProxyHandlerIsStableAcrossReload(t *testing.T) {
 	srv, _ := setup(t)
 	a := viewApp(t, srv.URL, "")
@@ -553,7 +498,7 @@ func TestProxyHandlerIsStableAcrossReload(t *testing.T) {
 	if after == nil {
 		t.Fatal("ProxyHandler is nil after reload")
 	}
-	// The handler must still serve requests after a reload.
+
 	probe := httptest.NewRecorder()
 	after.ServeHTTP(probe, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if probe.Code == 0 {

@@ -10,22 +10,13 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/config"
 )
 
-// TestH6ServerTimeoutsAreAlwaysBounded is the H6 regression for the transport
-// layer, complementing the body-size cap in the proxy.
-//
-// A zero timeout in net/http means "no limit", so the risk here is not a badly
-// chosen value but a value that silently becomes unbounded. The header bound in
-// particular used to return the configured read_timeout verbatim, so a Config
-// that never went through applyDefaults - which is how tests and embedders
-// build one - produced ReadHeaderTimeout == 0 and a server that would hold a
-// half-sent request open forever.
 func TestH6ServerTimeoutsAreAlwaysBounded(t *testing.T) {
 	cases := []struct {
 		name   string
 		params config.Params
 	}{
 		{
-			// The dangerous case: nothing configured at all.
+
 			name:   "zero read timeout",
 			params: config.Params{},
 		},
@@ -38,7 +29,7 @@ func TestH6ServerTimeoutsAreAlwaysBounded(t *testing.T) {
 			params: config.Params{ReadTimeout: time.Millisecond},
 		},
 		{
-			// A long read_timeout must not buy an unbounded header read.
+
 			name:   "very long read timeout",
 			params: config.Params{ReadTimeout: 10 * time.Minute},
 		},
@@ -60,8 +51,6 @@ func TestH6ServerTimeoutsAreAlwaysBounded(t *testing.T) {
 	}
 }
 
-// TestH6DefaultsProduceBoundedServer checks the values a real deployment gets
-// from a config file, rather than a hand-built Params.
 func TestH6DefaultsProduceBoundedServer(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tallow.toml")
@@ -92,8 +81,6 @@ func TestH6DefaultsProduceBoundedServer(t *testing.T) {
 	}
 }
 
-// TestH6RequestBodyCapIsWired is the config-to-handler half: a configured cap
-// must actually reach the proxy, or the MaxBytesReader has nothing to enforce.
 func TestH6RequestBodyCapIsWired(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tallow.toml")

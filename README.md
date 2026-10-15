@@ -68,7 +68,7 @@ Open the dashboard in another terminal: `tallowctl dashboard`.
 
 ```
                  ┌──────────────────────────  tallow (one static binary) ──────────────────────────┐
-OpenAI client ──►│ HTTP /v1/chat/completions                                                        │
+OpenAI client ──►│ HTTP /v1/responses                                                            │
                  │   │ auth · concurrency queue                                                     │
                  │   ▼                                                                              │
                  │  compaction (tool-output truncation)                                             │

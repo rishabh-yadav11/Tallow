@@ -7,13 +7,6 @@ import (
 	"testing"
 )
 
-// TestM2UpstreamClientRefusesRedirects pins the M2 fix to the PRODUCTION
-// client constructor.
-//
-// The behavioural tests in internal/proxy build a matching client themselves,
-// which means they would keep passing if someone deleted the CheckRedirect
-// wiring from newHTTPClient. This test is the one that fails in that case, so
-// the guard cannot be silently dropped.
 func TestM2UpstreamClientRefusesRedirects(t *testing.T) {
 	c := newHTTPClient()
 	if c.CheckRedirect == nil {
@@ -24,9 +17,6 @@ func TestM2UpstreamClientRefusesRedirects(t *testing.T) {
 	}
 }
 
-// TestM2UpstreamClientEndToEnd drives the production constructor against a
-// redirecting upstream and a would-be attacker, proving the credential reaches
-// only the first hop.
 func TestM2UpstreamClientEndToEnd(t *testing.T) {
 	const secret = "sk-live-LEAKME"
 
@@ -41,12 +31,12 @@ func TestM2UpstreamClientEndToEnd(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+secret {
 			t.Errorf("the first hop should carry the credential, got %q", got)
 		}
-		http.Redirect(w, r, attacker.URL+"/chat/completions", http.StatusTemporaryRedirect)
+		http.Redirect(w, r, attacker.URL+"/responses", http.StatusTemporaryRedirect)
 	}))
 	defer upstream.Close()
 
 	c := newHTTPClient()
-	req, err := http.NewRequest(http.MethodPost, upstream.URL+"/chat/completions", strings.NewReader(`{}`))
+	req, err := http.NewRequest(http.MethodPost, upstream.URL+"/responses", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}

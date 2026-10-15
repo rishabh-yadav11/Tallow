@@ -15,11 +15,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
-// providersWithKey builds a single-provider snapshot whose single key carries
-// the given limits, so a test can observe exactly one budget id: "p1/k1".
-//
-// BaseURL is set because the router treats an empty one as "the provider
-// vanished", which is the very signal the stale-selection fix (C1) relies on.
 func providersWithKey(limits budget.KeyLimits) []model.Provider {
 	return []model.Provider{{
 		Name:    "p1",
@@ -40,18 +35,6 @@ func newTestRouter() (*registry.Registry, *routing.Router) {
 	return reg, routing.NewRouter(reg, health.NewRegistry(), 0, nil)
 }
 
-// TestC4PublishOrderClosesTornWindow is the DETERMINISTIC C4 regression test.
-//
-// It drives a real App.Reload and uses the publishHook seam to inspect the
-// exact intermediate state, between the two independently-locked mutations.
-// That is the only way to test this reliably: the window is nanoseconds wide,
-// so a concurrent observer cannot catch a regression, which is precisely why
-// the audit's original code shipped broken with a green suite.
-//
-// The invariant under test is one-directional and is what the publish order
-// buys: at no point may a key be ROUTABLE and lacking a budget. The reverse -
-// a budget installed for a key not yet in the registry - is harmless, because
-// an unroutable key cannot be reached.
 func TestC4PublishOrderClosesTornWindow(t *testing.T) {
 	dir := t.TempDir()
 	const masterKey = "c4-master-key"
@@ -113,9 +96,6 @@ name = "a1"
 		t.Fatal(err)
 	}
 
-	// Add a SECOND provider on reload. p2 is the interesting one: before this
-	// reload only p1 existed, so p2 is "newly added" and is exactly the key the
-	// audit's torn window left unrestrained.
 	cfg2 := cfg + `
 [[provider]]
 name = "p2"
@@ -138,9 +118,7 @@ base_url = "https://p2.example"
 	)
 
 	publishHook = func() {
-		// This runs between SetBudgets and Swap under the audit's OLD order it
-		// would run between Swap and SetBudgets, so what we see here is exactly
-		// the state a request could have landed on.
+
 		mu.Lock()
 		defer mu.Unlock()
 		_, p2Routable := a.reg.Provider("p2")
@@ -174,10 +152,6 @@ base_url = "https://p2.example"
 	}
 }
 
-// TestC4BudgetsPublishedBeforeRegistryOnRemove covers the removal half, which
-// the audit noted had no test at all and which is the path that panicked in C1.
-// Removing a provider must leave it unroutable and un-budgeted, and a Select
-// must fail cleanly rather than dereference a nil budget.
 func TestC4BudgetsPublishedBeforeRegistryOnRemove(t *testing.T) {
 	reg, r := newTestRouter()
 
@@ -189,7 +163,6 @@ func TestC4BudgetsPublishedBeforeRegistryOnRemove(t *testing.T) {
 		t.Fatalf("precondition: p1 should be routable: %v", err)
 	}
 
-	// Reload that REMOVES p1: budgets first, then the registry.
 	empty := []model.Provider{}
 	r.SetBudgets(keyLimits(empty), provRPM(empty))
 	reg.Swap(empty, aliasesFor("p1"))
@@ -205,9 +178,6 @@ func TestC4BudgetsPublishedBeforeRegistryOnRemove(t *testing.T) {
 	}
 }
 
-// TestC4KeyAddedMidPublishIsNeverUnbudgeted reproduces the audit's measurement
-// directly: 50 requests against a key configured RPM=1 / MaxConcurrent=1. If
-// the key were unrestrained, all 50 would succeed.
 func TestC4KeyAddedMidPublishIsNeverUnbudgeted(t *testing.T) {
 	reg, r := newTestRouter()
 
@@ -227,11 +197,6 @@ func TestC4KeyAddedMidPublishIsNeverUnbudgeted(t *testing.T) {
 	}
 }
 
-// TestC4NoTornWindowUnderConcurrentReload hammers Select against a reload
-// publishing in a loop, and asserts the race-free property under -race. It is
-// not a deterministic regression test (see the hook test above for that); it
-// exists to catch data races and to ensure no request panics or receives a
-// nil-budget selection.
 func TestC4NoTornWindowUnderConcurrentReload(t *testing.T) {
 	reg, r := newTestRouter()
 
@@ -268,7 +233,7 @@ func TestC4NoTornWindowUnderConcurrentReload(t *testing.T) {
 				}
 				sel, err := r.Select("a1", "", nil)
 				if err != nil {
-					continue // clean failure is acceptable
+					continue
 				}
 				if sel == nil {
 					t.Error("select returned (nil, nil)")

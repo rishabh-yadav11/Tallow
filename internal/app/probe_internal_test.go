@@ -7,14 +7,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/registry"
 )
 
-// TestAliasModelByProvider verifies the issue #7 fix: the health probe must use a
-// model the provider under test actually serves (taken from the alias target whose
-// Provider matches), not blindly the first alias's target model.
-//
-// Scenario: provider "p1" serves model "p1-model" (via alias "a1"); provider "p2"
-// serves "p2-model" (via alias "a2"). The first alias in iteration order (a1)
-// targets p1, so a naive implementation reusing the first alias target would probe
-// p2 with "p1-model" -- wrong. The correct mapping is per-provider.
 func TestAliasModelByProvider(t *testing.T) {
 	a := &App{}
 	a.reg = registry.New(
@@ -37,9 +29,6 @@ func TestAliasModelByProvider(t *testing.T) {
 	}
 }
 
-// TestAliasModelByProviderDistinctAliasesSameProvider guards against silently
-// collapsing two different models for the same provider onto the first-seen one
-// when aliases target the same provider with different models.
 func TestAliasModelByProviderDistinctAliasesSameProvider(t *testing.T) {
 	a := &App{}
 	a.reg = registry.New(
@@ -50,7 +39,7 @@ func TestAliasModelByProviderDistinctAliasesSameProvider(t *testing.T) {
 		},
 	)
 	m := a.aliasModelByProvider()
-	// First-seen model for p1 must be recorded (deterministic: cheap -> p1-mini).
+
 	if got := m["p1"]; got != "p1-mini" {
 		t.Errorf("provider p1 mapped to %q, want p1-mini (first-seen alias target)", got)
 	}

@@ -5,20 +5,6 @@ import (
 	"testing"
 )
 
-// H5: auth was installed in two critical sections - setAuth(keys) followed by
-// setAuthOpen(open). Both fields live under the same authMu, so the race
-// detector sees nothing wrong; the defect is logical. checkAuth short-circuits
-// on authOpen, so closing an open gateway (open=true -> open=false plus a key
-// list) in one reload left a window where the new allow-list was already live
-// while authOpen was still true, and a request carrying NO token was accepted.
-//
-// The invariant the fix restores is: the (allow-list, open) pair visible to any
-// checkAuth call is always a pair some setAuth call actually installed. Under
-// the two-section version an observer can see a pair from the cross product of
-// two different calls, which no call ever installed.
-
-// authSnapshot reads both auth fields under one read lock, the way any
-// observer would.
 func authSnapshot(a *App) (closed bool, keys []string) {
 	a.authMu.RLock()
 	defer a.authMu.RUnlock()
@@ -45,21 +31,9 @@ func sameSet(got []string, want ...string) bool {
 	return true
 }
 
-// TestH5AuthSnapshotIsNeverTorn is the H5 regression.
-//
-// Writers alternate between two configurations whose cross product contains
-// combinations no single call ever installs:
-//
-//	open with NO keys        - accepts everything
-//	closed with keys k1,k2  - accepts exactly k1 and k2
-//
-// The dangerous cross pair is "closed + no keys observed while a writer is
-// mid-close", and more generally any observed (closed, keys) combination that
-// is not one of the two installed configurations. Observing a torn snapshot
-// means auth was installed in two steps.
 func TestH5AuthSnapshotIsNeverTorn(t *testing.T) {
 	a := &App{}
-	a.setAuth(nil, true) // installed config A: open, no keys
+	a.setAuth(nil, true)
 
 	const writers = 4
 	const iterations = 2000
@@ -67,7 +41,6 @@ func TestH5AuthSnapshotIsNeverTorn(t *testing.T) {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 
-	// Writers ping-pong between the two installed configurations.
 	for w := 0; w < writers; w++ {
 		wg.Add(1)
 		go func() {
@@ -78,16 +51,14 @@ func TestH5AuthSnapshotIsNeverTorn(t *testing.T) {
 					return
 				default:
 				}
-				// config B: closed, with a key list
+
 				a.setAuth([]string{"k1", "k2"}, false)
-				// config A: open, no keys
+
 				a.setAuth(nil, true)
 			}
 		}()
 	}
 
-	// Readers take a self-consistent snapshot and require it to be one of the
-	// two installed configurations.
 	var (
 		mu       sync.Mutex
 		violates int
@@ -104,8 +75,8 @@ func TestH5AuthSnapshotIsNeverTorn(t *testing.T) {
 				default:
 				}
 				closed, keys := authSnapshot(a)
-				ok := (!closed && len(keys) == 0) || // config A
-					(closed && sameSet(keys, "k1", "k2")) // config B
+				ok := (!closed && len(keys) == 0) ||
+					(closed && sameSet(keys, "k1", "k2"))
 				if !ok {
 					mu.Lock()
 					violates++
@@ -119,7 +90,6 @@ func TestH5AuthSnapshotIsNeverTorn(t *testing.T) {
 		}()
 	}
 
-	// Drain the readers, then close the gateway and stop the writers.
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -157,12 +127,6 @@ func joinKeys(keys []string) string {
 	return out
 }
 
-// TestH5ClosingAnOpenGatewayAcceptsNoToken is the behavioural consequence of the
-// same invariant, checked without concurrency.
-//
-// The exact H5 window was: allow-list installed, authOpen still true, tokenless
-// request accepted. Closing the gateway in one setAuth call must leave no such
-// state, and the closed gateway must reject a tokenless request outright.
 func TestH5ClosingAnOpenGatewayAcceptsNoToken(t *testing.T) {
 	a := &App{}
 
@@ -171,7 +135,6 @@ func TestH5ClosingAnOpenGatewayAcceptsNoToken(t *testing.T) {
 		t.Fatal("precondition: an open gateway should accept a tokenless request")
 	}
 
-	// One atomic close, exactly as a reload that turns open=false performs it.
 	a.setAuth([]string{"k1", "k2"}, false)
 
 	if a.checkAuth("") {
@@ -188,15 +151,12 @@ func TestH5ClosingAnOpenGatewayAcceptsNoToken(t *testing.T) {
 		}
 	}
 
-	// And the snapshot is self-consistent: closed implies the key list is live.
 	closed, keys := authSnapshot(a)
 	if !closed || !sameSet(keys, "k1", "k2") {
 		t.Fatalf("closed gateway exposed %s; the open flag and the allow-list disagree", describeAuthSnapshot(closed, keys))
 	}
 }
 
-// TestH5SetAuthInstallsBothFieldsTogether pins the per-call contract directly,
-// for every shape of configuration an operator can write.
 func TestH5SetAuthInstallsBothFieldsTogether(t *testing.T) {
 	cases := []struct {
 		name  string

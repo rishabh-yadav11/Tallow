@@ -16,9 +16,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/secret"
 )
 
-// echoUpstream echoes the requested model and a fixed prompt count in the
-// non-streaming response body, so a test can detect whether a response came
-// from the upstream or from an (possibly wrong-model) cache entry.
 type echoUpstream struct {
 	hits atomic.Int32
 	srv  *httptest.Server
@@ -31,11 +28,14 @@ func (e *echoUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &req)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"id":      "x",
-		"object":  "chat.completion",
-		"model":   req["model"],
-		"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "model=" + fmt.Sprint(req["model"])}}},
-		"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
+		"id":     "x",
+		"object": "response",
+		"model":  req["model"],
+		"output": []any{map[string]any{
+			"type": "message", "role": "assistant",
+			"content": []any{map[string]any{"type": "output_text", "text": "model=" + fmt.Sprint(req["model"])}},
+		}},
+		"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
 	})
 }
 
@@ -47,7 +47,6 @@ func setupEcho(t *testing.T) *echoUpstream {
 	return e
 }
 
-// startGatewayCfg builds and boots a gateway from a fully-specified config body.
 func startGatewayCfg(t *testing.T, cfg string) *httptest.Server {
 	t.Helper()
 	dir := t.TempDir()
@@ -55,7 +54,6 @@ func startGatewayCfg(t *testing.T, cfg string) *httptest.Server {
 	os.Setenv(secret.EnvMasterKey, masterKey)
 	t.Cleanup(func() { os.Unsetenv(secret.EnvMasterKey) })
 
-	// Substitute %ADMIN%, %DB%, %KS% placeholders for temp paths.
 	cfg = strings.ReplaceAll(cfg, "%ADMIN%", filepath.Join(dir, "admin.sock"))
 	cfg = strings.ReplaceAll(cfg, "%DB%", filepath.Join(dir, "tallow.db"))
 	cfg = strings.ReplaceAll(cfg, "%KS%", filepath.Join(dir, "keys.json"))
@@ -73,34 +71,37 @@ func startGatewayCfg(t *testing.T, cfg string) *httptest.Server {
 	return srv
 }
 
-// contentOf extracts the assistant message content from a chat completion JSON.
+// contentOf extracts the assistant text from a Responses output block.
 func contentOf(t *testing.T, body string) string {
 	t.Helper()
 	var v struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
 	}
 	if err := json.Unmarshal([]byte(body), &v); err != nil {
 		t.Fatalf("parse response: %v (body=%s)", err, body)
 	}
-	if len(v.Choices) == 0 {
-		return ""
+	for _, o := range v.Output {
+		if o.Type != "message" {
+			continue
+		}
+		for _, c := range o.Content {
+			if c.Type == "output_text" && c.Text != "" {
+				return c.Text
+			}
+		}
 	}
-	return v.Choices[0].Message.Content
+	return ""
 }
 
-// TestE2ECacheMultiModelAliasNoCollision verifies the fix: an alias whose
-// targets resolve to distinct upstream models must NOT be served from a
-// cross-model cache entry. Repeated identical requests all reach the upstream
-// (the exact-match cache fast path is disabled for multi-model aliases), and
-// each response reflects the routed model.
 func TestE2ECacheMultiModelAliasNoCollision(t *testing.T) {
 	up := setupEcho(t)
-	// One alias "mux" with two targets on distinct providers (same upstream)
-	// carrying different models. No key-level RPM caps, so both are healthy.
+
 	cfg := fmt.Sprintf(`version = 1
 [auth]
 open = true
@@ -150,7 +151,6 @@ name = "mux"
   model = "model-beta"
 `, up.srv.URL, up.srv.URL)
 
-	// Seed the keystore with the two key refs.
 	dir := t.TempDir()
 	box, _ := secret.NewBox([]byte("e2e-master-key"))
 	ks, _ := secret.LoadStore(filepath.Join(dir, "keys.json"), box)
@@ -159,9 +159,9 @@ name = "mux"
 
 	gw := startGatewayCfg(t, cfg)
 
-	body := `{"model":"mux","messages":[{"role":"user","content":"hi"}]}`
+	body := `{"model":"mux","input":"hi"}`
 	for i := 0; i < 3; i++ {
-		resp, got := post(t, gw.URL+"/v1/chat/completions", body)
+		resp, got := post(t, gw.URL+"/v1/responses", body)
 		if resp.StatusCode != 200 {
 			t.Fatalf("iter %d status %d: %s", i, resp.StatusCode, got)
 		}
@@ -170,22 +170,18 @@ name = "mux"
 			t.Fatalf("iter %d: unexpected content %q, want a routed model", i, c)
 		}
 	}
-	// Because "mux" is a multi-model alias, the cache fast path is disabled:
-	// every identical request must reach the upstream (no cross-model serve).
+
 	if up.hits.Load() != 3 {
 		t.Fatalf("expected 3 upstream hits for a multi-model alias (cache fast path disabled), got %d", up.hits.Load())
 	}
 }
 
-// gatewayReload is a gateway handle that lets a test rewrite the config file and
-// trigger a hot reload, to exercise reload-applied limit changes end to end.
 type gatewayReload struct {
 	srv     *httptest.Server
 	app     *app.App
 	cfgPath string
 }
 
-// reload rewrites cfgPath and calls App.Reload.
 func (g *gatewayReload) reload(t *testing.T, cfg string) {
 	t.Helper()
 	if err := os.WriteFile(g.cfgPath, []byte(cfg), 0o600); err != nil {
@@ -196,8 +192,6 @@ func (g *gatewayReload) reload(t *testing.T, cfg string) {
 	}
 }
 
-// startReloadGateway boots an App and returns a reloadable handle. baseURL is
-// substituted as %UPSTREAM% in the initial config.
 func startReloadGateway(t *testing.T, upstreamURL string) *gatewayReload {
 	t.Helper()
 	dir := t.TempDir()
@@ -254,9 +248,7 @@ name = "flash"
 
 	os.Setenv(secret.EnvMasterKey, masterKey)
 	t.Cleanup(func() { os.Unsetenv(secret.EnvMasterKey) })
-	// Start with rpm=0 (unlimited). A zero limit consumes no window count, so
-	// the warmup requests leave the key's live window at zero and the reload
-	// below cleanly installs the tightened limit from a fresh slate.
+
 	if err := os.WriteFile(cfgPath, []byte(mkCfg(0)), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -269,40 +261,28 @@ name = "flash"
 	return &gatewayReload{srv: srv, app: a, cfgPath: cfgPath}
 }
 
-// TestE2EHotReloadAppliesNewRPMLimit verifies the SetBudgets fix: after a hot
-// reload tightens a key's RPM, the newly-loaded limit is enforced on subsequent
-// requests (previously reloaded limit changes were silently ignored).
 func TestE2EHotReloadAppliesNewRPMLimit(t *testing.T) {
 	upSrv, _ := setup(t)
 	g := startReloadGateway(t, upSrv.URL)
 
-	body := `{"model":"flash","messages":[{"role":"user","content":"hi"}]}`
-	// Two requests succeed under rpm=0 (unlimited, no window consumption).
-	if resp, got := post(t, g.srv.URL+"/v1/chat/completions", body); resp.StatusCode != 200 {
+	body := `{"model":"flash","input":"hi"}`
+
+	if resp, got := post(t, g.srv.URL+"/v1/responses", body); resp.StatusCode != 200 {
 		t.Fatalf("req1 status %d: %s", resp.StatusCode, got)
 	}
-	if resp, got := post(t, g.srv.URL+"/v1/chat/completions", body); resp.StatusCode != 200 {
+	if resp, got := post(t, g.srv.URL+"/v1/responses", body); resp.StatusCode != 200 {
 		t.Fatalf("req2 status %d: %s", resp.StatusCode, got)
 	}
 
-	// Reload tightening the key to rpm=1: live windows survive SetBudgets, so
-	// the third request consumes the single RPM slot and the fourth must be
-	// rejected (previously reloaded limit changes were silently ignored, so
-	// the fourth request would have succeeded).
 	g.reload(t, cfgWithRPM(g.cfgPath, upSrv.URL, 1))
-	if resp, got := post(t, g.srv.URL+"/v1/chat/completions", body); resp.StatusCode != 200 {
+	if resp, got := post(t, g.srv.URL+"/v1/responses", body); resp.StatusCode != 200 {
 		t.Fatalf("req3 (post-reload) status %d: %s", resp.StatusCode, got)
 	}
-	if resp, _ := post(t, g.srv.URL+"/v1/chat/completions", body); resp.StatusCode == 200 {
+	if resp, _ := post(t, g.srv.URL+"/v1/responses", body); resp.StatusCode == 200 {
 		t.Fatal("req4 should be rejected: post-reload rpm=1 must be enforced, was 200")
 	}
 }
 
-// TestE2EStickyProviderRPMEnforced verifies the acquire fix: a session pinned
-// via sticky affinity still respects the aggregate provider-level RPM cap. With
-// a provider cap of 1, the first request succeeds and installs the pin; the
-// second request on the same session must be rejected because the provider cap
-// is exhausted (previously the sticky path bypassed the provider cap entirely).
 func TestE2EStickyProviderRPMEnforced(t *testing.T) {
 	upSrv, _ := setup(t)
 	dir := t.TempDir()
@@ -369,10 +349,9 @@ name = "flash"
 	srv := httptest.NewServer(a.ProxyHandler())
 	t.Cleanup(srv.Close)
 
-	// Same session on both requests so the second is sticky-pinned.
 	send := func(label string) *http.Response {
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions",
-			strings.NewReader(`{"model":"flash","messages":[{"role":"user","content":"hi"}]}`))
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses",
+			strings.NewReader(`{"model":"flash","input":"hi"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Session-Id", "sticky-session")
 		resp, err := http.DefaultClient.Do(req)
@@ -392,9 +371,6 @@ name = "flash"
 	}
 }
 
-// TestE2ECompactionBoundsToolOutput verifies the compact fix: a tool message
-// whose output exceeds MaxToolOutputChars is truncated (including the marker)
-// so the forwarded body stays at or under the configured bound.
 func TestE2ECompactionBoundsToolOutput(t *testing.T) {
 	upSrv, up := setup(t)
 	dir := t.TempDir()
@@ -456,25 +432,27 @@ name = "flash"
 	t.Cleanup(srv.Close)
 
 	big := strings.Repeat("x", 5000)
-	body := `{"model":"flash","messages":[{"role":"tool","tool_call_id":"t1","content":"` + big + `"}]}`
-	resp, got := post(t, srv.URL+"/v1/chat/completions", body)
+	body := `{"model":"flash","input":[{"type":"function_call_output","call_id":"t1","output":"` + big + `"}]}`
+	resp, got := post(t, srv.URL+"/v1/responses", body)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, got)
 	}
-	// Inspect what the upstream actually received; it must be <= 100 chars.
+
 	fwd, ok := up.lastBody()
 	if !ok {
 		t.Fatal("upstream did not receive the request")
 	}
-	msgs := fwd["messages"].([]any)
-	toolMsg := msgs[0].(map[string]any)
-	c := toolMsg["content"].(string)
+	items := fwd["input"].([]any)
+	toolItem := items[0].(map[string]any)
+	c := toolItem["output"].(string)
 	if len(c) > 100 {
-		t.Fatalf("upstream tool content length %d exceeds max_tool_output_chars 100", len(c))
+		t.Fatalf("upstream tool output length %d exceeds max_tool_output_chars 100", len(c))
+	}
+	if c == big {
+		t.Fatalf("upstream tool output was not truncated at all: %d bytes", len(c))
 	}
 }
 
-// cfgWithRPM rewrites g.cfgPath with the given key RPM and returns the new text.
 func cfgWithRPM(cfgPath, upstreamURL string, rpm int) string {
 	dir := filepath.Dir(cfgPath)
 	return fmt.Sprintf(`version = 1
