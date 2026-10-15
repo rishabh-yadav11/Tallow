@@ -6,9 +6,51 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rishabh-yadav11/tallow/internal/store"
 )
+
+// TestResponsesRecordsThroughRetentionStore asserts that a non-streaming
+// Responses request is persisted through the same retention store as chat
+// completions (spec §1: "response recorded through the same retention store"),
+// with the alias and the selected upstream model attributed on the row.
+func TestResponsesRecordsThroughRetentionStore(t *testing.T) {
+	up := newCountUpstream(t, 0)
+	reg := oneAliasRegistry(up.srv.URL)
+	st, err := store.Open(store.StoreConfig{Path: filepath.Join(t.TempDir(), "tallow.db")})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	h := newHarness(t, Deps{Router: newRouter(t, reg), Registry: reg, Store: st})
+	rec := doResponsesPost(t, h, "", `{"model":"flash","input":"hi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	st.Flush()
+	rows, err := st.RecentRequests(10)
+	if err != nil {
+		t.Fatalf("RecentRequests: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("Responses request produced no store row")
+	}
+	row := rows[0]
+	if row.Model != "flash" {
+		t.Fatalf("row model = %q, want the alias 'flash'", row.Model)
+	}
+	if row.UpstreamModel != "flash-v4" {
+		t.Fatalf("row upstream_model = %q, want 'flash-v4'", row.UpstreamModel)
+	}
+	if row.Provider != "p1" || row.Key == "" {
+		t.Fatalf("row not attributed to a route: %+v", row)
+	}
+}
 
 // doResponsesPost posts a Responses request to the /v1/responses route.
 func doResponsesPost(t *testing.T, h *Handler, token, body string) *httptest.ResponseRecorder {
