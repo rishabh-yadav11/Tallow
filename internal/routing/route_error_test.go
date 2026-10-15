@@ -6,19 +6,6 @@ import (
 	"testing"
 )
 
-// A rate limit is only reportable as a 429 when it is the WHOLE story. If any
-// candidate was rejected because something was actually wrong, the caller must
-// not be told to wait, because waiting does not help and it hides a real fault
-// behind a benign status.
-//
-// The classification therefore has to be all-or-nothing, and the cases below
-// are the ones where getting it wrong would mislead an operator: a limit
-// alongside a dead provider, a limit alongside an open breaker, and a provider
-// that was removed by a hot reload.
-
-// TestRouteErrorClassifiesLimitOnlyFailures pins the positive case from the
-// real reason vocabulary the selection loop and KeyBudget.Acquire emit, not
-// from strings invented for the test.
 func TestRouteErrorClassifiesLimitOnlyFailures(t *testing.T) {
 	limitOnly := [][]string{
 		{"provider:p1:provider_rpm"},
@@ -28,7 +15,7 @@ func TestRouteErrorClassifiesLimitOnlyFailures(t *testing.T) {
 		{"key:k1:key_max_concurrent"},
 		{"key:k1:key_cost_limit"},
 		{"sticky:p1/k1:exhausted"},
-		// A mixed trail where every entry is still a limit.
+
 		{"sticky:p1/k1:exhausted", "provider:p1:provider_rpm"},
 		{"provider:p1:provider_rpm", "key:k1:key_rpm", "key:k2:key_rpm"},
 	}
@@ -45,10 +32,6 @@ func TestRouteErrorClassifiesLimitOnlyFailures(t *testing.T) {
 	}
 }
 
-// TestRouteErrorRefusesToCallAFaultALimit is the safety half. Each case pairs a
-// limit with something genuinely wrong, or is entirely something wrong. None
-// may be reported as a limit, or the caller waits for a limit to clear while a
-// dead provider or an open breaker is the real problem.
 func TestRouteErrorRefusesToCallAFaultALimit(t *testing.T) {
 	faulty := [][]string{
 		{"provider:p1:breaker_open"},
@@ -59,14 +42,11 @@ func TestRouteErrorRefusesToCallAFaultALimit(t *testing.T) {
 		{"key:k1:no_budget"},
 		{"key:k1:breaker_open"},
 		{"key:k1:skip"},
-		// A limit alongside a fault: the fault wins, because the limit alone
-		// would not have produced this outcome.
+
 		{"provider:p1:provider_rpm", "provider:p2:breaker_open"},
 		{"sticky:p1/k1:exhausted", "provider:p1:provider_rpm", "provider:p2:no_key"},
 		{"key:k1:key_rpm", "key:k2:breaker_open"},
-		// An unrecognised reason must not be assumed healthy. Forward
-		// compatibility cuts the other way: a new reason means the code adding
-		// it knows something this classifier does not.
+
 		{"provider:p1:some_future_reason"},
 	}
 	for _, reasons := range faulty {
@@ -81,9 +61,6 @@ func TestRouteErrorRefusesToCallAFaultALimit(t *testing.T) {
 	}
 }
 
-// TestRouteErrorWithNoReasonsIsNotLimited is the degenerate case. An empty
-// trail means the loop never even produced a candidate, which is not evidence
-// that the providers are healthy, so it must not become a 429.
 func TestRouteErrorWithNoReasonsIsNotLimited(t *testing.T) {
 	re := newRouteError("flash", nil)
 	if re.Limited {
@@ -95,9 +72,6 @@ func TestRouteErrorWithNoReasonsIsNotLimited(t *testing.T) {
 	}
 }
 
-// TestRouteErrorPreservesTheAliasAndTrail pins that the classification did not
-// cost the diagnostic. The reason trail is what an operator reads to work out
-// which limit to raise, so it has to survive being classified.
 func TestRouteErrorPreservesTheAliasAndTrail(t *testing.T) {
 	reasons := []string{"sticky:p1/k1:exhausted", "provider:p1:provider_rpm"}
 	re := newRouteError("flash", reasons)

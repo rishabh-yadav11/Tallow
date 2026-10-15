@@ -1,14 +1,5 @@
 package routing
 
-// P3 audit tests for the router depth bound and routing-failure classification:
-//   - a fallback chain of depth exactly maxFallbackDepth (8) expands to depth 8 but
-//     a depth-9 hop is dropped (item 9);
-//   - a fully-exhausted provider RPM set carries the EARLIEST reset across multiple
-//     exhausted providers, and RetryAfter is zero when the failure is not limited
-//     (item 9);
-//   - splitID on an id without "/" yields the id with an empty key, and
-//     ProviderRPM on a provider without a cap is -1 (item 15).
-
 import (
 	"errors"
 	"fmt"
@@ -22,9 +13,7 @@ import (
 )
 
 func TestMaxFallbackDepthExpandsExactlyToDepthCap(t *testing.T) {
-	// A chain p0 -> p1 -> ... -> p9, each provider falling back to the next.
-	// maxFallbackDepth=8: a chain of depth exactly 8 must have expanded (p0..p8
-	// are candidates), and the depth-9 hop (p9) must have been dropped.
+
 	provs := []model.Provider{{Name: "p0", Fallback: []string{"p1"}}}
 	for i := 1; i < 9; i++ {
 		provs = append(provs, model.Provider{Name: fmt.Sprintf("p%d", i), Fallback: []string{fmt.Sprintf("p%d", i+1)}})
@@ -60,9 +49,7 @@ func TestMaxFallbackDepthExpandsExactlyToDepthCap(t *testing.T) {
 }
 
 func TestSelectRetryAfterIsEarliestResetAcrossExhaustedProviders(t *testing.T) {
-	// Two providers, both with provider RPM=1, exhausted at different times. The
-	// RouteError must carry the reset of the provider that frees up FIRST, so a
-	// client is told when a retry can actually succeed.
+
 	reg := registry.New(
 		[]model.Provider{
 			{Name: "p1", BaseURL: "https://p1/v1", Keys: []model.Key{{ID: "k1", Secret: "s1"}}},
@@ -80,14 +67,12 @@ func TestSelectRetryAfterIsEarliestResetAcrossExhaustedProviders(t *testing.T) {
 		"p2/k2": {RPM: 1000},
 	}, map[string]int{"p1": 1, "p2": 1})
 
-	// Exhaust p1's provider RPM at t0.
 	sel, err := r.Select("flash", "", nil)
 	if err != nil {
 		t.Fatalf("select p1: %v", err)
 	}
 	r.Release(sel, 0)
 
-	// Exhaust p2's provider RPM 15s later.
 	cur = cur.Add(15 * time.Second)
 	sel, err = r.Select("flash", "", nil)
 	if err != nil {
@@ -95,8 +80,6 @@ func TestSelectRetryAfterIsEarliestResetAcrossExhaustedProviders(t *testing.T) {
 	}
 	r.Release(sel, 0)
 
-	// Now both are exhausted; p1 frees up in 45s, p2 in 60s. The reported wait
-	// must be the EARLIEST of the two.
 	_, err = r.Select("flash", "", nil)
 	if !errors.Is(err, ErrNoRoute) {
 		t.Fatalf("Select with both providers exhausted: %v, want ErrNoRoute", err)
@@ -114,9 +97,7 @@ func TestSelectRetryAfterIsEarliestResetAcrossExhaustedProviders(t *testing.T) {
 }
 
 func TestRetryAfterIsZeroWhenNotLimited(t *testing.T) {
-	// A breaker-open failure is not a limit, so the classification must discard
-	// any retry hint: answering "come back in N seconds" to a dead provider would
-	// send the client off to wait at a provider that is not rate limited.
+
 	reg := registry.New(
 		[]model.Provider{{Name: "p1", BaseURL: "https://p1/v1", Keys: []model.Key{{ID: "k1", Secret: "s1"}}}},
 		[]model.Alias{{Name: "flash", Targets: []model.Target{{Provider: "p1", Model: "m"}}}},

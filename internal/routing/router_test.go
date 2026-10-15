@@ -51,7 +51,7 @@ func TestSelectTwoLayerAndSticky(t *testing.T) {
 	if sel.Provider != "p1" || sel.Key == "" || sel.Model != "flash-v4" {
 		t.Fatalf("unexpected selection: %+v", sel)
 	}
-	// Sticky: same session resolves to the same provider/key.
+
 	sel2, err := r.Select("flash", "session-1", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -68,11 +68,9 @@ func TestStickyRespectsHealth(t *testing.T) {
 	sel, _ := r.Select("flash", "sess", nil)
 	r.Release(sel, 0)
 
-	// Force the pinned provider/key unhealthy via the breaker.
 	r.health.Provider(sel.Provider).ForceOpen(now)
 	r.health.Key(sel.Provider, sel.Key).ForceOpen(now)
 
-	// Sticky must not re-pin an unhealthy key; it should fall through.
 	sel2, err := r.Select("flash", "sess", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +83,7 @@ func TestStickyRespectsHealth(t *testing.T) {
 
 func TestFallbackOnNoKey(t *testing.T) {
 	r, now := fixture()
-	// Exhaust p1's keys by opening both breakers.
+
 	r.health.Key("p1", "k1").ForceOpen(now)
 	r.health.Key("p1", "k2").ForceOpen(now)
 	sel, err := r.Select("flash", "s2", nil)
@@ -107,7 +105,7 @@ func TestUnknownAlias(t *testing.T) {
 
 func TestSelectHonorsKeySkip(t *testing.T) {
 	r, _ := fixture()
-	// First select pins nothing yet; force it to take a key and record it.
+
 	skip := map[string]bool{"p1/k1": true}
 	sel, err := r.Select("flash", "s1", skip)
 	if err != nil {
@@ -116,7 +114,7 @@ func TestSelectHonorsKeySkip(t *testing.T) {
 	if sel.Provider != "p1" || sel.Key == "k1" {
 		t.Fatalf("expected p1 to avoid k1, got %s/%s", sel.Provider, sel.Key)
 	}
-	// p1 still has k2 available; key k1 stayed untouched by this selection.
+
 	r.Release(sel, 0)
 }
 
@@ -139,7 +137,6 @@ func TestStickyPinToRemovedProviderNotReused(t *testing.T) {
 	r := NewRouter(reg, h, time.Minute, func() time.Time { return time.Unix(1000, 0) })
 	r.SetBudgets(map[string]budget.KeyLimits{"p1/k1": {RPM: 100}, "p2/k3": {RPM: 100}}, map[string]int{})
 
-	// Pin session to p1/k1.
 	sel, err := r.Select("flash", "sess", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +146,6 @@ func TestStickyPinToRemovedProviderNotReused(t *testing.T) {
 	}
 	r.Release(sel, 0)
 
-	// Hot-reload: p1 is removed from the registry.
 	r.reg.Swap([]model.Provider{
 		{Name: "p2", BaseURL: "https://p2.example/v1", Keys: []model.Key{{ID: "k3", Secret: "s3", RPM: 100}}},
 	}, aliases)
@@ -172,8 +168,7 @@ func TestStickyPinToRemovedProviderNotReused(t *testing.T) {
 
 func TestConcurrentSelectBudgetsNoRace(t *testing.T) {
 	r, _ := fixture()
-	// Pin some sessions and then hammer Select/Budgets from many goroutines
-	// while Budgets runs concurrently (exercises the bmu read/write paths).
+
 	done := make(chan bool, 32)
 	for g := 0; g < 32; g++ {
 		go func(gi int) {
@@ -195,23 +190,21 @@ func TestConcurrentSelectBudgetsNoRace(t *testing.T) {
 
 func TestSetBudgetsAppliesUpdatedLimitsWithoutReset(t *testing.T) {
 	r, now := fixture()
-	// First install a generous RPM limit.
+
 	r.SetBudgets(map[string]budget.KeyLimits{
 		"p1/k1": {RPM: 100},
 	}, map[string]int{})
 
 	kb := r.budgets["p1/k1"]
-	// Consume one slot; the live window must survive the reload below.
+
 	if ok, _ := kb.Acquire(now); !ok {
 		t.Fatal("first acquire should succeed")
 	}
-	// Hot-reload lowers the RPM to 10 (and adds p2 provider RPM cap).
+
 	r.SetBudgets(map[string]budget.KeyLimits{
 		"p1/k1": {RPM: 10},
 	}, map[string]int{"p1": 5})
 
-	// The existing tracker must now enforce the new (lower) limit without
-	// resetting the live counter: 9 more acquires succeed, the 10th fails.
 	for i := 0; i < 9; i++ {
 		if ok, _ := kb.Acquire(now); !ok {
 			t.Fatalf("acquire %d should succeed under new limit", i+1)
@@ -221,7 +214,6 @@ func TestSetBudgetsAppliesUpdatedLimitsWithoutReset(t *testing.T) {
 		t.Fatal("acquire beyond the updated RPM limit should fail")
 	}
 
-	// Provider budget installed on reload must be reflected.
 	if pb := r.pBudget["p1"]; pb == nil || pb.Remaining(now) != 5 {
 		t.Fatalf("provider budget not installed/updated: %+v", r.pBudget["p1"])
 	}

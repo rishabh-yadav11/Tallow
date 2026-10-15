@@ -7,23 +7,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/budget"
 )
 
-// TestBudgetsIsSortedByProviderThenKey pins the ordering of the admin budgets
-// view.
-//
-// Budgets iterates r.budgets, a Go map, so before the sort was added the row
-// order was whatever the runtime's randomised hash order produced. That is
-// visible to any consumer of the admin API: a dashboard renders these rows in
-// the order received, and a client comparing two polls positionally sees a
-// spurious change every time, with values appearing to move between rows. An
-// operator watching which key is throttled would be misled.
-//
-// The test is in routing rather than in the app-level suite because the key set
-// can be chosen exactly here. The app-level test has one provider with two keys,
-// which cannot distinguish a sort that compares provider first from one that
-// compares key alone: with a single provider both orderings are identical. That
-// gap was found by mutation, where a mutant that sorted on key only survived
-// every test. So this fixture uses several providers with overlapping key names,
-// where the two orderings genuinely differ.
 func TestBudgetsIsSortedByProviderThenKey(t *testing.T) {
 	keys := map[string]budget.KeyLimits{
 		"zeta/last":   {RPM: 1},
@@ -52,18 +35,6 @@ func TestBudgetsIsSortedByProviderThenKey(t *testing.T) {
 		views = append(views, r.Budgets(time.Now()))
 	}
 
-	// Every call must return the same rows in the same order. Running it
-	// repeatedly is what makes this a real test of ordering: a single call has a
-	// one-in-N chance of accidentally matching the expected order, while twelve
-	// calls do not.
-	// Plain byte ordering, so uppercase sorts before lowercase. That is the
-	// sort.Slice string comparison this uses, and it is deliberate: key ids are
-	// operator-chosen, and the only requirement is a stable total order that is
-	// the same on every call, not a human-friendly collation. Writing the
-	// expectation by hand in ASCII order rather than in a "looks alphabetical"
-	// order matters here, because the first draft of this list put "another"
-	// before "alpha" and "Beta" after "alpha", which is what a human expects and
-	// is not what the code does.
 	want := []string{
 		"Beta/upper",
 		"alpha/a", "alpha/b", "alpha/z",
@@ -87,9 +58,6 @@ func TestBudgetsIsSortedByProviderThenKey(t *testing.T) {
 		}
 	}
 
-	// The sort must be a total order, not a tie-break that happens to work for
-	// this input. Two rows equal under the comparator would be reordered
-	// arbitrarily, so assert no duplicates and that each id appears exactly once.
 	seen := map[string]int{}
 	for _, v := range views {
 		for _, got := range v {
@@ -108,11 +76,6 @@ func TestBudgetsIsSortedByProviderThenKey(t *testing.T) {
 	}
 }
 
-// TestBudgetsSortingHoldsUnderConcurrentSetBudgets checks that the ordering
-// survives a reload, because SetBudgets can add keys while the admin API is
-// polling. An unsorted result there would reintroduce the same problem in the
-// window right after a config change, which is exactly when an operator is
-// watching to confirm the change took effect.
 func TestBudgetsSortingHoldsUnderConcurrentSetBudgets(t *testing.T) {
 	r := NewRouter(nil, nil, time.Minute, time.Now)
 	all := map[string]budget.KeyLimits{
@@ -126,8 +89,7 @@ func TestBudgetsSortingHoldsUnderConcurrentSetBudgets(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 200; i++ {
-			// Alternate between the full set and a subset, which is what a
-			// reload that drops or adds a key looks like.
+
 			if i%2 == 0 {
 				r.SetBudgets(all, map[string]int{})
 			} else {
