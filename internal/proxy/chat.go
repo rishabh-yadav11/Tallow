@@ -266,6 +266,20 @@ func (h *Handler) serveUncached(
 			h.record(*meta, nil, body, started)
 			return
 		}
+		// §3 request-scoped error rules + transient cooldown. A stop /
+		// stop-and-cooldown rule returns the error immediately (no more retries);
+		// otherwise a transient status schedules the credential's cooldown.
+		if h.deps.Router.DecideError(sel.Provider, sel.Key, ferr.status, ferr.resp) {
+			meta.Status = "error"
+			meta.Err = ferr.Error()
+			h.record(*meta, nil, body, started)
+			st := ferr.status
+			if st == 0 {
+				st = http.StatusBadGateway
+			}
+			writeErr(w, st, "upstream_error", ferr.Error())
+			return
+		}
 		if !ferr.retryable {
 			meta.Status = "error"
 			meta.Err = ferr.Error()
@@ -277,6 +291,11 @@ func (h *Handler) serveUncached(
 			writeErr(w, st, "upstream_error", ferr.Error())
 			return
 		}
+		// Cooldown wait between retry rounds (bounded, cancellable). The failed
+		// credential is already out of rotation for the cooldown, so the next
+		// Select will skip it; this wait paces the next round against the
+		// configured max-retry-interval.
+		h.sleepRetryBackoff(r.Context(), sel.Provider, sel.Key)
 	}
 
 	meta.Status = "error"
@@ -482,10 +501,15 @@ func (h *Handler) routeAndBuffer(
 			skip[sel.Provider] = true
 		}
 		attemptErrs = append(attemptErrs, attemptReason(sel, ferr))
+		// §3 error rules + transient cooldown, mirroring serveUncached.
+		if h.deps.Router.DecideError(sel.Provider, sel.Key, ferr.status, ferr.resp) {
+			return fetch{sel: sel, err: ferr, attempts: attempt + 1}, nil
+		}
 		if !ferr.retryable {
 			f := fetch{sel: sel, err: ferr, attempts: attempt + 1}
 			return f, nil
 		}
+		h.sleepRetryBackoff(r.Context(), sel.Provider, sel.Key)
 	}
 	return fetch{err: &forwardError{msg: exhaustedMessage(attemptErrs)}}, nil
 }
@@ -652,6 +676,22 @@ func (h *Handler) maxAttempts(alias string) int {
 		}
 	}
 	return 2
+}
+
+// sleepRetryBackoff waits the configured cooldown between retry rounds, bounded
+// by the routing max-retry-interval and aborting early if the request context is
+// cancelled. It is a no-op when no wait is configured.
+func (h *Handler) sleepRetryBackoff(ctx context.Context, provider, key string) {
+	p := h.deps.Router.RetryPolicyFor(provider, key)
+	if p.Wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(p.Wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
 }
 
 // singleModel returns the upstream model an alias resolves to, or ("", false)

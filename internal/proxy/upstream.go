@@ -34,6 +34,10 @@ type forwardError struct {
 	status        int
 	msg           string
 	private       string
+	// resp is the upstream error body, kept only so the routing error-rule
+	// matcher (body substring/regexp) can inspect it. It is never returned to
+	// the client; the client-facing msg is what the caller writes.
+	resp []byte
 	// retryAfter is how long a rate-limited caller should wait, carried from the
 	// routing failure that produced this error. It is set only for a
 	// limit-driven 429, and is written as a Retry-After header by the response
@@ -241,7 +245,7 @@ func readUpstreamBody(resp *http.Response) ([]byte, *forwardError) {
 		return nil, &forwardError{retryable: true, msg: "read upstream: " + err.Error()}
 	}
 	if resp.StatusCode >= 400 {
-		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b)}
+		fe := &forwardError{status: resp.StatusCode, resp: b, msg: upstreamErrorMsg(resp.StatusCode, b)}
 		fe.retryable = isRetryableStatus(resp.StatusCode)
 		return nil, fe
 	}
@@ -271,7 +275,7 @@ func (h *Handler) plainForward(w http.ResponseWriter, resp *http.Response) (resu
 		return result{}, &forwardError{retryable: true, msg: "read upstream: " + err.Error()}
 	}
 	if resp.StatusCode >= 400 {
-		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b)}
+		fe := &forwardError{status: resp.StatusCode, resp: b, msg: upstreamErrorMsg(resp.StatusCode, b)}
 		fe.retryable = isRetryableStatus(resp.StatusCode)
 		return result{}, fe
 	}
@@ -305,7 +309,7 @@ const streamPreHeaderLimit = 256 << 10
 func (h *Handler) streamForward(w http.ResponseWriter, resp *http.Response) (result, *forwardError) {
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		fe := &forwardError{status: resp.StatusCode, msg: upstreamErrorMsg(resp.StatusCode, b)}
+		fe := &forwardError{status: resp.StatusCode, resp: b, msg: upstreamErrorMsg(resp.StatusCode, b)}
 		fe.retryable = isRetryableStatus(resp.StatusCode)
 		return result{}, fe
 	}

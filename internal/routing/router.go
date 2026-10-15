@@ -38,24 +38,115 @@ type Router struct {
 	cmu     sync.Mutex
 	candVer uint64                 // registry version candMap was built from
 	candMap map[string][]candidate // alias -> expanded candidates
+
+	// §3 routing/resilience knobs sourced from config via NewRouter options.
+	// Kept on the Router so the selection and retry logic can be exercised
+	// directly in unit tests, and so hot-reload can adjust them through the
+	// same already-swap paths if desired. They default to safe values when no
+	// option is supplied, which keeps every existing NewRouter call (tests and
+	// app alike) working unchanged.
+	strategy         string
+	globalRetry      int           // -1 = inherit (no global override configured).
+	tmu              sync.RWMutex  // guards the two config below against hot-reload writes.
+	maxRetryInterval time.Duration // bound on the cooldown wait between rounds.
+	cd               *Cooldown
+	affinity         sessionAffinity
+}
+
+// Option tailors a Router built by NewRouter. Options are applied in order and
+// never change the signature of NewRouter itself, so existing call sites (tests
+// and app alike) that pass only the positional arguments keep compiling.
+type Option func(*Router)
+
+// WithStrategy overrides the default round-robin key-selection strategy.
+func WithStrategy(s string) Option {
+	return func(r *Router) {
+		switch s {
+		case "weighted-round-robin", "fill-first", "round-robin":
+			r.strategy = s
+		}
+	}
+}
+
+// WithRequestRetry sets the global default number of retry rounds. -1 keeps
+// the inherit default (each credential's own override wins); 0 means the
+// initial attempt only.
+func WithRequestRetry(n int) Option {
+	return func(r *Router) { r.globalRetry = n }
+}
+
+// WithCooldown enables request-scoped cooldowns with the given offset. An
+// offset <= 0 is treated as the default 30s so a validation-safe config always
+// has a non-zero wait. DisableCooling per key still overrides.
+func WithCooldown(enabled bool, offset time.Duration) Option {
+	return func(r *Router) {
+		cd := &Cooldown{now: r.now, until: map[string]time.Time{}}
+		if offset > 0 {
+			cd.offset = offset
+		} else {
+			cd.offset = 30 * time.Second
+		}
+		cd.enabled = enabled
+		r.cd = cd
+	}
+}
+
+// WithMaxRetryInterval bounds the cooldown wait between retry rounds.
+func WithMaxRetryInterval(d time.Duration) Option {
+	return func(r *Router) { r.maxRetryInterval = d }
+}
+
+// WithSessionAffinity configures the session-affinity knobs (TTL, subagents,
+// rebind-on) on top of the existing bare-sticky behaviour.
+func WithSessionAffinity(enabled bool, ttl time.Duration, subagents bool, rebindOn string) Option {
+	return func(r *Router) {
+		r.affinity.enabled = enabled
+		if ttl > 0 {
+			r.affinity.ttl = ttl
+		}
+		r.affinity.subagents = subagents
+		switch rebindOn {
+		case "quota":
+			r.affinity.rebindOn = "quota"
+		default:
+			r.affinity.rebindOn = "any"
+		}
+	}
 }
 
 // NewRouter wires the router. stickyTTL <= 0 disables sticky affinity.
-func NewRouter(reg *registry.Registry, h *health.Registry, stickyTTL time.Duration, now func() time.Time) *Router {
+// Additional behaviour (selection strategy, retry/cooldown policy, session
+// affinity) is configured through the variadic opts.
+func NewRouter(reg *registry.Registry, h *health.Registry, stickyTTL time.Duration, now func() time.Time, opts ...Option) *Router {
 	if now == nil {
 		now = time.Now
 	}
-	return &Router{
-		reg:     reg,
-		health:  h,
-		budgets: map[string]*budget.KeyBudget{},
-		pBudget: map[string]*budget.ProviderBudget{},
-		sticky:  NewSticky(stickyTTL, now),
-		now:     now,
-		rr:      map[string]int{},
+	r := &Router{
+		reg:         reg,
+		health:      h,
+		budgets:     map[string]*budget.KeyBudget{},
+		pBudget:     map[string]*budget.ProviderBudget{},
+		sticky:      NewSticky(stickyTTL, now),
+		now:         now,
+		rr:          map[string]int{},
+		strategy:    "round-robin",
+		globalRetry: -1,
 		// Seeded as already-stale so the first Select populates the cache.
 		candMap: map[string][]candidate{},
 	}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
+}
+
+// cooldownFor returns the cooldown tracker, creating a disabled (no-op)
+// default when none was configured, so callers never have to nil-check.
+func (r *Router) cooldownFor() *Cooldown {
+	if r.cd != nil {
+		return r.cd
+	}
+	return &Cooldown{now: r.now, until: map[string]time.Time{}}
 }
 
 // SetBudgets (re)installs budget trackers. Existing trackers are updated with
@@ -359,37 +450,12 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 	// Sticky affinity first: keep session on its provider/key for cache reuse.
 	if sessionKey != "" {
 		if p, k, tgt, ok := r.sticky.Get(sessionKey, now); ok && !skip[p+"/"+k] && !skip[p] {
-			// Health gate: an unhealthy key/provider must not be re-pinned.
-			if r.health.Provider(p).Allow(now) && r.health.Key(p, k).Allow(now) {
-				sel, err := r.acquire(p, k, tgt.Model, tgt, now)
-				switch {
-				case err == nil:
-					sel.Alias = alias
-					sel.SessionKey = sessionKey
-					sel.Model = tgt.Model
-					sel.Target = tgt
-					sel.Reason = finalReason(reasons, "sticky:"+p+"/"+k)
-					r.sticky.Put(sessionKey, p, k, tgt)
-					return sel, nil
-				case errors.Is(err, errStaleSelection), errors.Is(err, errNoBudget):
-					// The pin is stale: the provider/key (or its budget) was
-					// removed on hot-reload. Forget it and route normally.
-					// r.releaseSelection is nil-safe, so a budget-less
-					// selection cannot panic here (C1).
-					r.releaseSelection(sel)
-					r.sticky.Forget(sessionKey)
-					reasons = append(reasons, "sticky:"+p+"/"+k+":removed")
-				default:
-					// Budget or provider RPM exhausted on the pinned target:
-					// fall through to normal routing rather than stranding the
-					// session, but forget the pin so the next attempt re-picks.
-					r.releaseSelection(sel)
-					r.sticky.Forget(sessionKey)
-					reasons = append(reasons, "sticky:"+p+"/"+k+":exhausted")
-				}
-			} else {
-				reasons = append(reasons, "sticky:"+p+"/"+k+":stale")
+			// A pin whose model is now excluded (hot-reload) cannot be used.
+			if r.aliasModelExcluded(p, tgt.Model, a.ExcludedModels) {
 				r.sticky.Forget(sessionKey)
+				reasons = append(reasons, "sticky:"+p+"/"+k+":model_excluded")
+			} else if sel, ok := r.trySticky(sessionKey, p, k, tgt, alias, now, &reasons); ok {
+				return sel, nil
 			}
 		}
 	}
@@ -398,6 +464,12 @@ func (r *Router) Select(alias, sessionKey string, skip map[string]bool) (*Select
 		provID := "provider:" + c.provider
 		if skip[c.provider] {
 			reasons = append(reasons, provID+":skip")
+			continue
+		}
+		// §3: apply provider/alias ExcludedModels wildcard filtering to the
+		// routable key set, so a model hidden on purpose is never routed.
+		if r.aliasModelExcluded(c.provider, c.model, a.ExcludedModels) {
+			reasons = append(reasons, provID+":model_excluded")
 			continue
 		}
 		b := r.health.Provider(c.provider)
@@ -573,6 +645,63 @@ func (r *Router) releaseSelection(sel *Selection) {
 	sel.pb, sel.pbSet, sel.kb = nil, false, nil
 }
 
+// trySticky attempts to reuse a sticky pin for a session. It returns the
+// selection when the pin is still usable, and ok=false (having cleaned up the
+// pin as needed) when the normal candidate scan should run instead.
+//
+// It honours the health gate and the §3 cooldown exactly like a fresh
+// selection, and applies the session-affinity rebind policy: under
+// rebind-on=quota a pin that merely hit a transient (non-quota) error is kept,
+// while a quota-exhausted pin is always released so the session can re-pick.
+func (r *Router) trySticky(sessionKey, p, k string, tgt model.Target, alias string, now time.Time, reasons *[]string) (*Selection, bool) {
+	// Health gate: an unhealthy key/provider must not be re-pinned.
+	if !r.health.Provider(p).Allow(now) || !r.health.Key(p, k).Allow(now) {
+		*reasons = append(*reasons, "sticky:"+p+"/"+k+":stale")
+		r.sticky.Forget(sessionKey)
+		return nil, false
+	}
+	// §3 cooldown gate: a pinned credential serving a 408/5xx is out of rotation
+	// too; fall through so another credential can serve the session.
+	if !r.cooldownFor().Allow(p+"/"+k, now) {
+		*reasons = append(*reasons, "sticky:"+p+"/"+k+":cooldown")
+		r.sticky.Forget(sessionKey)
+		return nil, false
+	}
+	sel, err := r.acquire(p, k, tgt.Model, tgt, now)
+	switch {
+	case err == nil:
+		sel.Alias = alias
+		sel.SessionKey = sessionKey
+		sel.Model = tgt.Model
+		sel.Target = tgt
+		sel.Reason = finalReason(*reasons, "sticky:"+p+"/"+k)
+		r.sticky.Put(sessionKey, p, k, tgt)
+		return sel, true
+	case errors.Is(err, errStaleSelection), errors.Is(err, errNoBudget):
+		// The pin is stale: the provider/key (or its budget) was removed on
+		// hot-reload. Forget it and route normally. r.releaseSelection is
+		// nil-safe, so a budget-less selection cannot panic here (C1).
+		r.releaseSelection(sel)
+		r.sticky.Forget(sessionKey)
+		*reasons = append(*reasons, "sticky:"+p+"/"+k+":removed")
+		return nil, false
+	default:
+		// Budget or provider RPM exhausted on the pinned target. Fall through to
+		// normal routing rather than stranding the session; the affinity rebind
+		// policy decides whether the pin is released (quota) or retained.
+		cause := "exhausted"
+		if !r.rebindAllowed(cause) {
+			// rebind-on=quota and this pin failed for a non-quota reason: keep
+			// the pin so the next request retries it rather than re-picking.
+			return nil, false
+		}
+		r.releaseSelection(sel)
+		r.sticky.Forget(sessionKey)
+		*reasons = append(*reasons, "sticky:"+p+"/"+k+":exhausted")
+		return nil, false
+	}
+}
+
 // acquire reserves a specific provider/key (used by sticky path). It enforces
 // both the key budget and the provider-level RPM cap, mirroring the non-sticky
 // acquireKey path so a pinned session cannot exceed the aggregate provider cap.
@@ -664,10 +793,19 @@ func (r *Router) acquireKey(provider string, now time.Time, reasons *[]string, s
 	r.rr[provider] = start + 1
 	r.rrmu.Unlock()
 
-	for i := 0; i < n; i++ {
-		k := p.Keys[(start+i)%n]
+	order := r.keyOrder(p, start)
+	for _, idx := range order {
+		k := p.Keys[idx]
 		if skip[provider+"/"+k.ID] {
 			*reasons = append(*reasons, "key:"+k.ID+":skip")
+			continue
+		}
+		// §3 cooldown: a credential that hit a transient error (408/5xx) is out
+		// of rotation for the cooldown offset. This is honored regardless of the
+		// breaker so a single bad 429 does not wait for the consecutive-failure
+		// threshold.
+		if !r.cooldownFor().Allow(provider+"/"+k.ID, now) {
+			*reasons = append(*reasons, "key:"+k.ID+":cooldown")
 			continue
 		}
 		bk := r.health.Key(provider, k.ID)
@@ -924,6 +1062,24 @@ func (s *Sticky) Forget(sessionKey string) {
 	s.mu.Lock()
 	delete(s.m, sessionKey)
 	s.mu.Unlock()
+}
+
+// Inherit copies a parent session's pin to a child session (session-affinity-
+// subagents) so a subagent reuses the same upstream credential for prompt-cache
+// reuse. It is a no-op when the parent has no live pin. The child shares the
+// parent's target so the same upstream model string is requested.
+func (s *Sticky) Inherit(parent, child string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.m[parent]
+	if !ok {
+		return
+	}
+	if s.ttl > 0 && s.now().Sub(e.at) > s.ttl {
+		return // parent pin already idle-expired; do not propagate a stale pin.
+	}
+	s.m[child] = stickyEntry{provider: e.provider, key: e.key, target: e.target, at: s.now()}
+	s.evictLocked()
 }
 
 // BudgetStatus is a live per-key budget view for the admin API/TUI. Costs are

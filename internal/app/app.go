@@ -113,7 +113,7 @@ func (a *App) load(path string) error {
 
 	reg := registry.New(providers, aliases)
 	hreg := health.NewRegistry()
-	router := routing.NewRouter(reg, hreg, params.StickyTTL, time.Now)
+	router := routing.NewRouter(reg, hreg, params.StickyTTL, time.Now, routingOptions(cfg, params)...)
 	router.SetBudgets(keyLimits(providers), provRPM(providers))
 
 	st, err := store.Open(store.StoreConfig{
@@ -342,6 +342,30 @@ func provRPM(providers []model.Provider) map[string]int {
 		}
 	}
 	return m
+}
+
+// routingOptions derives the §3 router options from config. Every knob is
+// optional with a default, so an unset config yields the existing behaviour
+// (round-robin, no explicit global retry, cooldown enabled with the default
+// offset, session affinity off).
+func routingOptions(cfg *config.Config, params config.Params) []routing.Option {
+	opts := []routing.Option{routing.WithStrategy(cfg.Routing.Strategy)}
+	if cfg.Routing.RequestRetry != -1 {
+		opts = append(opts, routing.WithRequestRetry(cfg.Routing.RequestRetry))
+	}
+	cdOff, _ := config.Dur(cfg.Routing.Cooldown.Offset)
+	opts = append(opts, routing.WithCooldown(cfg.Routing.Cooldown.Enabled, cdOff))
+	if mri, err := config.Dur(cfg.Routing.MaxRetryInterval); err == nil && mri > 0 {
+		opts = append(opts, routing.WithMaxRetryInterval(mri))
+	}
+	affTTL, _ := config.Dur(cfg.Routing.SessionAffinityTTL)
+	opts = append(opts, routing.WithSessionAffinity(
+		cfg.Routing.SessionAffinity,
+		affTTL,
+		cfg.Routing.SessionAffinitySubagents,
+		cfg.Routing.SessionAffinityRebindOn,
+	))
+	return opts
 }
 
 func newHTTPClient() *http.Client {
