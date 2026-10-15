@@ -20,16 +20,12 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/store"
 )
 
-// testSecret is a plaintext value the fake Backend "holds" internally. No
-// admin endpoint may ever surface it in a response body.
 const testSecret = "sk-test-secret-do-not-leak-42"
 
 const testVersion = "v9.9.9-test"
 
 const testConfigPath = "/etc/tallow/config.toml"
 
-// fakeBackend implements Backend with canned data and records what the admin
-// server asks for, so limit handling and reload invocation are observable.
 type fakeBackend struct {
 	mu        sync.Mutex
 	snap      observ.Snapshot
@@ -45,6 +41,16 @@ type fakeBackend struct {
 	evict     int64
 	size      int64
 	reloadErr error
+
+	cfgDoc     []byte
+	putErr     error
+	patchErr   error
+	deleteErr  error
+	keyRefs    []string
+	setKeyErr  error
+	delKeyErr  error
+	replayBody []byte
+	replayErr  error
 
 	reloadCalls   int
 	lastRequestsN int
@@ -128,6 +134,54 @@ func (f *fakeBackend) ConfigPath() string {
 	return testConfigPath
 }
 
+func (f *fakeBackend) GetConfigDoc(root string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cfgDoc, nil
+}
+
+func (f *fakeBackend) PutConfigDoc(root string, body []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.putErr
+}
+
+func (f *fakeBackend) PatchConfigDoc(root string, body []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.patchErr
+}
+
+func (f *fakeBackend) DeleteConfigDoc(root string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deleteErr
+}
+
+func (f *fakeBackend) ListKeyRefs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.keyRefs
+}
+
+func (f *fakeBackend) SetKeyRef(ref, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.setKeyErr
+}
+
+func (f *fakeBackend) DeleteKeyRef(ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.delKeyErr
+}
+
+func (f *fakeBackend) ReplayRequest(id string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.replayBody, f.replayErr
+}
+
 func (f *fakeBackend) reloadCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -152,9 +206,6 @@ func (f *fakeBackend) auditLimit() int {
 	return f.lastAuditN
 }
 
-// populatedFake returns a fakeBackend whose fixed reference time is
-// time.Unix(1700000000, 0).UTC(). The plaintext testSecret is deliberately
-// kept out of every view.
 func populatedFake() *fakeBackend {
 	return &fakeBackend{
 		snap: observ.Snapshot{
@@ -238,11 +289,10 @@ func populatedFake() *fakeBackend {
 			Detail: "ok",
 		}},
 		hit: 10, miss: 4, evict: 1, size: 7,
+		cfgDoc: []byte(`{"version":1,"auth":{"open":true,"api_keys":[]},"server":{"listen":"127.0.0.1:8090"},"provider":[],"alias":[]}`),
 	}
 }
 
-// unixClient returns an http.Client that dials the admin server through its
-// Unix socket, exercising the real Serve path.
 func unixClient(t *testing.T, sockPath string) *http.Client {
 	t.Helper()
 	c := &http.Client{
@@ -258,7 +308,6 @@ func unixClient(t *testing.T, sockPath string) *http.Client {
 	return c
 }
 
-// waitReady polls /health until the server accepts connections.
 func waitReady(t *testing.T, c *http.Client) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -275,8 +324,6 @@ func waitReady(t *testing.T, c *http.Client) {
 	}
 }
 
-// startAdmin serves a Server over a real Unix socket in a temp dir and
-// cancels it at cleanup, verifying Serve unwinds with http.ErrServerClosed.
 func startAdmin(t *testing.T, b Backend) (*Server, *http.Client) {
 	t.Helper()
 	s := New(b, filepath.Join(t.TempDir(), "admin.sock"))
@@ -345,8 +392,6 @@ func decodeErrBody(t *testing.T, body []byte) string {
 	return m["error"]
 }
 
-// TestAdminEndpoints hits every GET route over a real Unix socket and asserts
-// the decoded JSON shape, not raw strings.
 func TestAdminEndpoints(t *testing.T) {
 	f := populatedFake()
 	_, c := startAdmin(t, f)
@@ -539,16 +584,14 @@ func TestAdminEndpoints(t *testing.T) {
 			name: "config", method: http.MethodGet, path: "/config",
 			want: func(t *testing.T, resp *http.Response, body []byte) {
 				wantStatus(t, resp, http.StatusOK)
-				var m struct {
-					Path    string `json:"path"`
-					Version string `json:"version"`
-				}
+
+				var m map[string]any
 				decodeBody(t, body, &m)
-				if m.Path != testConfigPath {
-					t.Errorf("path = %q; want %q", m.Path, testConfigPath)
+				if v, ok := m["version"]; !ok || v.(float64) != 1 {
+					t.Errorf("config doc version = %v; want 1", m["version"])
 				}
-				if m.Version != testVersion {
-					t.Errorf("version = %q; want %q", m.Version, testVersion)
+				if _, ok := m["server"]; !ok {
+					t.Errorf("config doc missing the server section: %s", body)
 				}
 			},
 		},
@@ -561,8 +604,6 @@ func TestAdminEndpoints(t *testing.T) {
 	}
 }
 
-// TestMetricsDisabled verifies the enabled flag carried on observ.Snapshot is
-// passed through faithfully when metrics are off.
 func TestMetricsDisabled(t *testing.T) {
 	f := populatedFake()
 	f.snap.Enabled = false
@@ -581,9 +622,6 @@ func TestMetricsDisabled(t *testing.T) {
 	}
 }
 
-// TestLimitParam pins the limit fallback rules: missing, non-numeric, zero,
-// and negative limits all fall back to the per-route default; only positive
-// integers pass through.
 func TestLimitParam(t *testing.T) {
 	f := populatedFake()
 	_, c := startAdmin(t, f)
@@ -617,8 +655,6 @@ func TestLimitParam(t *testing.T) {
 	}
 }
 
-// TestReload verifies the method guard, the exactly-once invocation per
-// request, and the success body.
 func TestReload(t *testing.T) {
 	f := populatedFake()
 	_, c := startAdmin(t, f)
@@ -651,8 +687,6 @@ func TestReload(t *testing.T) {
 	}
 }
 
-// TestReloadError verifies the backend-error path returns 500 with a JSON
-// error body carrying the backend message.
 func TestReloadError(t *testing.T) {
 	f := populatedFake()
 	f.reloadErr = errors.New("boom")
@@ -668,8 +702,6 @@ func TestReloadError(t *testing.T) {
 	}
 }
 
-// TestUnknownRoute pins the mux default: 404 with the net/http plain-text
-// body, not a JSON error envelope.
 func TestUnknownRoute(t *testing.T) {
 	f := populatedFake()
 	_, c := startAdmin(t, f)
@@ -681,10 +713,6 @@ func TestUnknownRoute(t *testing.T) {
 	}
 }
 
-// TestSecretNotExposed sweeps every GET endpoint and asserts the fake's
-// plaintext secret appears nowhere in any response body. It additionally pins
-// the exact JSON key sets of provider and key objects, so a future field that
-// could carry a secret would surface as an unexpected key.
 func TestSecretNotExposed(t *testing.T) {
 	f := populatedFake()
 	_, c := startAdmin(t, f)
@@ -731,9 +759,6 @@ func TestSecretNotExposed(t *testing.T) {
 	}
 }
 
-// TestServeClose covers the full lifecycle: a socket path in a not-yet-existing
-// nested directory is created, the server answers, ctx cancel unwinds Serve
-// with http.ErrServerClosed, and Close is safe afterwards.
 func TestServeClose(t *testing.T) {
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "run", "admin.sock")
@@ -783,30 +808,23 @@ func TestServeClose(t *testing.T) {
 	}
 }
 
-// panicBackend is a fakeBackend whose Metrics method panics, to prove a backend
-// bug on one endpoint is contained and cannot take the server down.
 type panicBackend struct {
 	*fakeBackend
 }
 
 func (p *panicBackend) Metrics() observ.Snapshot { panic("metrics exploded") }
 
-// TestBackendPanicReturns500AndHealthSurvives pins the panic-recovery contract:
-// a panicking backend method yields a JSON 500 response that keeps the same
-// content type, and does not kill the server - /health still answers 200.
 func TestBackendPanicReturns500AndHealthSurvives(t *testing.T) {
 	s, c := startAdmin(t, &panicBackend{fakeBackend: populatedFake()})
 	_ = s
 
-	// The panicking endpoint delivers a JSON 500, not a crashed connection.
 	respMetrics, bodyMetrics := doJSON(t, c, http.MethodGet, "/metrics")
 	wantStatus(t, respMetrics, http.StatusInternalServerError)
-	wantJSONContentType(t, respMetrics) // assert it still writes the JSON envelope
+	wantJSONContentType(t, respMetrics)
 	if err := decodeErrBody(t, bodyMetrics); err != "internal error" {
 		t.Fatalf("panic error body = %q; want %q", err, "internal error")
 	}
 
-	// The server is still alive and /health still serves.
 	respHealth, body := doJSON(t, c, http.MethodGet, "/health")
 	wantStatus(t, respHealth, http.StatusOK)
 	var m map[string]string

@@ -10,10 +10,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/model"
 )
 
-// legacySchema is the requests table as it existed BEFORE request coalescing
-// (H8) was added. It is written verbatim here rather than derived from the
-// current schema constant, so the test keeps failing to compile if the live
-// schema ever changes shape in a way this migration would not handle.
 const legacyRequestsSchema = `
 CREATE TABLE requests (
 	id                TEXT PRIMARY KEY,
@@ -34,15 +30,9 @@ CREATE TABLE requests (
 );
 `
 
-// TestMigrateCoalescedColumnOnLegacyDatabase is the H8 migration regression: an
-// operator upgrading an existing gateway must not have to delete their history
-// store. Before this migration, Open would succeed but every later INSERT would
-// fail with "no such column: coalesced", so the gateway would silently stop
-// recording requests.
 func TestMigrateCoalescedColumnOnLegacyDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 
-	// Build a pre-coalescing database with one historical row.
 	raw, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatalf("open legacy db: %v", err)
@@ -62,15 +52,12 @@ func TestMigrateCoalescedColumnOnLegacyDatabase(t *testing.T) {
 		t.Fatalf("close legacy db: %v", err)
 	}
 
-	// Reopen through the real Open path, which must run the migration.
 	s, err := Open(StoreConfig{Path: path, RollupEvery: time.Hour, VacuumEvery: time.Hour})
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}
 	defer s.Close()
 
-	// The pre-existing row must still be readable, and must read as NOT
-	// coalesced: before coalescing every request had its own upstream call.
 	rows, err := s.RecentRequests(10)
 	if err != nil {
 		t.Fatalf("recent requests: %v", err)
@@ -88,8 +75,6 @@ func TestMigrateCoalescedColumnOnLegacyDatabase(t *testing.T) {
 		t.Fatalf("CostMicros = %d, want 42 (the migration must not disturb spend)", rows[0].CostMicros)
 	}
 
-	// The new column must actually be usable, which is the failure this
-	// migration exists to prevent.
 	newID := "new-request"
 	if err := s.RecordRequest(model.RequestMeta{
 		ID: newID, StartedAt: time.Now(), Provider: "p1", Key: "k1",
@@ -129,9 +114,6 @@ func TestMigrateCoalescedColumnOnLegacyDatabase(t *testing.T) {
 	}
 }
 
-// TestMigrateCoalescedColumnIsIdempotent opens the same database twice. The
-// second Open must be a no-op rather than failing on a duplicate column, which
-// is what makes a restart safe.
 func TestMigrateCoalescedColumnIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "twice.db")
 	for i := 0; i < 3; i++ {
@@ -145,10 +127,6 @@ func TestMigrateCoalescedColumnIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestCoalescedSpendIsNotDoubleCountedInRollups states the reason the follower
-// rows carry zero spend: a rollup over a coalesced burst must report the money
-// actually spent, not one copy per caller. This exercises the aggregate that
-// operators read, rather than only the individual rows.
 func TestCoalescedSpendIsNotDoubleCountedInRollups(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roll.db")
 	s, err := Open(StoreConfig{Path: path, RollupEvery: time.Hour, VacuumEvery: time.Hour})
@@ -158,7 +136,7 @@ func TestCoalescedSpendIsNotDoubleCountedInRollups(t *testing.T) {
 	defer s.Close()
 
 	now := time.Now()
-	// One leader that made the real call, plus three followers that shared it.
+
 	if err := s.RecordRequest(model.RequestMeta{
 		ID: "leader", StartedAt: now, Provider: "p1", Key: "k1", Model: "m",
 		Status: "ok", PromptTokens: 5, CompletionTokens: 3, CostMicros: 11,

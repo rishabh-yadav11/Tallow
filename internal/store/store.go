@@ -1,6 +1,3 @@
-// Package store persists request metadata, raw bodies, errors, rollups, and an
-// append-only audit log in SQLite (WAL mode). It implements tiered retention:
-// age-based delete per table plus rollup-then-delete for indefinite rollups.
 package store
 
 import (
@@ -17,59 +14,47 @@ import (
 	"time"
 
 	"github.com/rishabh-yadav11/tallow/internal/model"
-	_ "modernc.org/sqlite" // pure-Go driver: CGO_ENABLED=0 static binary.
+	_ "modernc.org/sqlite"
 )
 
-// Store wraps the SQLite connection and retention state.
 type Store struct {
 	db  *sql.DB
-	mu  sync.Mutex // serializes writes and maintenance.
+	mu  sync.Mutex
 	cfg StoreConfig
 
-	queue  chan writeOp // buffered request/audit write queue drained by the worker.
-	enqMu  sync.Mutex   // guards closed + channel send against Close.
+	queue  chan writeOp
+	enqMu  sync.Mutex
 	closed bool
-	wg     sync.WaitGroup // tracks the background writer goroutine.
+	wg     sync.WaitGroup
 
-	// writeFailures counts DB writes that failed inside the worker; writeDrops
-	// counts ops dropped because the queue was full or the store was closed.
-	// Both are best-effort observability for silent telemetry loss.
 	writeFailures atomic.Uint64
 	writeDrops    atomic.Uint64
 }
 
-// WriteFailures returns the number of deferred writes that failed at the
-// database layer, and the number of ops dropped because the queue was full or
-// the store was closed. Useful for diagnosing silent telemetry loss.
 func (s *Store) WriteStats() (failures, drops uint64) {
 	return s.writeFailures.Load(), s.writeDrops.Load()
 }
 
-// writeOp is one deferred database write produced by the request path. The
-// public record methods enqueue an op and return immediately; a single worker
-// goroutine performs the actual Exec under s.mu.
 type writeOp struct {
 	kind string
 
-	req      model.RequestMeta // RecordRequest
-	id       string            // RecordRaw / RecordError
-	ts       time.Time         // RecordRaw
-	reqBody  []byte            // RecordRaw
-	respBody []byte            // RecordRaw
+	req      model.RequestMeta
+	id       string
+	ts       time.Time
+	reqBody  []byte
+	respBody []byte
 
-	// RecordError
 	provider  string
 	key       string
 	model     string
 	requestID string
 	message   string
 
-	// Audit
 	action string
 	entity string
 	detail string
 
-	flushDone chan struct{} // RecordRequest/Raw/Error/Audit leave nil; flushForTest sets it.
+	flushDone chan struct{}
 }
 
 const (
@@ -80,7 +65,6 @@ const (
 	opFlush   = "flush"
 )
 
-// StoreConfig carries retention and capture knobs.
 type StoreConfig struct {
 	Path          string
 	RawBodies     bool
@@ -91,8 +75,6 @@ type StoreConfig struct {
 	VacuumEvery   time.Duration
 }
 
-// createRequestsTable is the requests table definition, kept separate from the
-// rest of the schema so migrateRequestSeq can rebuild exactly this table.
 const createRequestsTable = `CREATE TABLE IF NOT EXISTS requests (
 	seq               INTEGER PRIMARY KEY AUTOINCREMENT,
 	id                TEXT NOT NULL UNIQUE,
@@ -166,23 +148,13 @@ CREATE TABLE IF NOT EXISTS meta (
 
 const watermarkKey = "rollup_watermark"
 
-// costUnitsKey records that an existing database's cost column has been
-// converted from the old integer-cents unit to micro-USD. Cost was previously
-// accumulated in cents, which truncated every sub-cent request to zero, so
-// stored totals understate real spend; existing values are scaled up once, on
-// the first open of a pre-existing database, and the stamp makes it idempotent.
 const costUnitsKey = "cost_units"
 
-// Open opens (creating if needed) the database and applies the schema in WAL
-// mode.
 func Open(cfg StoreConfig) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return nil, err
 	}
-	// The database holds raw request/response bodies, so it must not be
-	// world-readable. The SQLite driver creates the file with the process
-	// umask (0644 in practice), so pre-create it with restrictive permissions
-	// instead; an existing file keeps whatever mode it already has.
+
 	if fi, err := os.Stat(cfg.Path); os.IsNotExist(err) {
 		if fh, err := os.OpenFile(cfg.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err != nil {
 			return nil, err
@@ -192,7 +164,7 @@ func Open(cfg StoreConfig) (*Store, error) {
 	} else if err != nil {
 		return nil, err
 	} else if fi != nil {
-		// Tighten permissions on a pre-existing file, but never widen them.
+
 		if mode := fi.Mode().Perm(); mode&0o077 != 0 {
 			if err := os.Chmod(cfg.Path, mode&^0o077); err != nil {
 				return nil, err
@@ -204,8 +176,8 @@ func Open(cfg StoreConfig) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1) // single writer; WAL readers still allowed via separate conns if needed.
-	// WAL mode.
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: enable WAL: %w", err)
@@ -240,8 +212,6 @@ func Open(cfg StoreConfig) (*Store, error) {
 	return s, nil
 }
 
-// Close flushes any pending queued writes, stops the writer goroutine, then
-// closes the database. It is safe to call once; subsequent calls no-op.
 func (s *Store) Close() error {
 	s.enqMu.Lock()
 	if s.closed {
@@ -252,16 +222,10 @@ func (s *Store) Close() error {
 	close(s.queue)
 	s.enqMu.Unlock()
 
-	s.wg.Wait() // worker drains and exits before we touch the db.
+	s.wg.Wait()
 	return s.db.Close()
 }
 
-// migrateCostUnits converts a pre-existing database's cost column from integer
-// cents to micro-USD. Because the old unit truncated sub-cent requests, stored
-// values are cent-denominated, so they are scaled by micro-USD-per-cent to keep
-// totals comparable after the upgrade. A fresh database already has cost_micros
-// and simply gets the unit stamp. The stamp makes this run at most once, so
-// reopening an already-converted database is a no-op.
 func migrateCostUnits(db *sql.DB) error {
 	var unit string
 	err := db.QueryRow(`SELECT v FROM meta WHERE k=?`, costUnitsKey).Scan(&unit)
@@ -275,13 +239,6 @@ func migrateCostUnits(db *sql.DB) error {
 		return fmt.Errorf("store: read cost units: %w", err)
 	}
 
-	// The conversion, renames, and the unit stamp are written as a single
-	// transaction. Previously they ran as independent statements: a crash
-	// between the UPDATE and the ALTER left cost_cents still named cost_cents
-	// but already scaled ×10000 with no stamp, so the next open re-ran the
-	// migration and scaled every legacy value a second time, corrupting cost
-	// rollups. SQLite DDL is transactional, so wrapping everything guarantees a
-	// crash can never leave that partial half-converted state.
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("store: begin cost units: %w", err)
@@ -290,14 +247,14 @@ func migrateCostUnits(db *sql.DB) error {
 
 	for _, table := range []string{"requests", "rollups"} {
 		var n int
-		// Only a pre-existing table carries the old cost_cents column.
+
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name='cost_cents'`, table).Scan(&n); err != nil {
 			return fmt.Errorf("store: inspect %s: %w", table, err)
 		}
 		if n == 0 {
 			continue
 		}
-		// 10,000 micro-USD per cent, preserving the stored magnitude.
+
 		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET cost_cents = cost_cents * 10000`, table)); err != nil {
 			return fmt.Errorf("store: convert %s cost: %w", table, err)
 		}
@@ -315,15 +272,6 @@ func migrateCostUnits(db *sql.DB) error {
 	return nil
 }
 
-// migrateCoalescedColumn adds the coalesced column to a database created before
-// request coalescing (H8) existed.
-//
-// CREATE TABLE IF NOT EXISTS does not add a column to an existing table, so an
-// upgraded database would otherwise reject every INSERT that names the column.
-// Migrating keeps an operator's existing history store readable instead of
-// forcing them to delete it. Existing rows backfill to 0, which is the correct
-// historical value: before coalescing, every recorded request had issued its own
-// upstream call and owned its own spend.
 func migrateCoalescedColumn(db *sql.DB) error {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name='coalesced'`).Scan(&n); err != nil {
@@ -332,33 +280,13 @@ func migrateCoalescedColumn(db *sql.DB) error {
 	if n > 0 {
 		return nil
 	}
-	// SQLite rejects ADD COLUMN NOT NULL without a non-null default, so the
-	// default is a requirement here rather than a convenience.
+
 	if _, err := db.Exec(`ALTER TABLE requests ADD COLUMN coalesced INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return fmt.Errorf("store: add requests.coalesced: %w", err)
 	}
 	return nil
 }
 
-// migrateRequestSeq gives requests a monotonic ingestion sequence.
-//
-// The rollup watermark used to be a max() over started_at, which is a client-
-// supplied event time rather than an ingestion order. A request whose started_at
-// predates a row already folded into the watermark was skipped by the "started_at
-// > watermark" query and never appeared in any rollup, permanently: the
-// watermark had already passed it. The async write queue makes this routine, not
-// exotic - a request recorded a moment late, or any request from a host whose
-// clock is behind, lands in exactly this window. Those requests were counted in
-// RecentRequests and billed by observ, but silently missing from the daily and
-// weekly rollups that operators use for trend reporting.
-//
-// SQLite's implicit rowid already assigns a monotonic sequence, but it is not
-// guaranteed monotonic under deletes unless the table is AUTOINCREMENT, and it
-// cannot be referenced by a stable name. The rebuild below creates an explicit
-// AUTOINCREMENT column and backfills it in the existing row order, which is the
-// order the rows were inserted and therefore the order the old watermark was
-// already tracking. Backfilled rows keep id as the unique key, so a rebuild
-// cannot introduce a duplicate and cannot lose a row.
 func migrateRequestSeq(db *sql.DB) error {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name='seq'`).Scan(&n); err != nil {
@@ -376,13 +304,11 @@ func migrateRequestSeq(db *sql.DB) error {
 	if _, err := tx.Exec(`ALTER TABLE requests RENAME TO requests_old`); err != nil {
 		return fmt.Errorf("store: rename requests: %w", err)
 	}
-	// The schema constant creates the table with seq already present, so this
-	// CREATE picks up the new column and leaves requests_old untouched.
+
 	if _, err := tx.Exec(createRequestsTable); err != nil {
 		return fmt.Errorf("store: recreate requests: %w", err)
 	}
-	// rowid is the original insertion order, so ordering by it preserves the
-	// sequence the pre-existing watermark was already tracking.
+
 	if _, err := tx.Exec(`INSERT INTO requests
 		(seq, id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, coalesced, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err)
 		SELECT rowid, id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, coalesced, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err
@@ -392,7 +318,7 @@ func migrateRequestSeq(db *sql.DB) error {
 	if _, err := tx.Exec(`DROP TABLE requests_old`); err != nil {
 		return fmt.Errorf("store: drop requests_old: %w", err)
 	}
-	// The rename dropped and recreated the indexes on the old table's name.
+
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_requests_started ON requests(started_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_pk ON requests(provider, key)`,
@@ -401,18 +327,7 @@ func migrateRequestSeq(db *sql.DB) error {
 			return fmt.Errorf("store: recreate requests index: %w", err)
 		}
 	}
-	// Re-base the watermark onto the new sequence. The value left behind by the
-	// pre-seq scheme is a Unix-millisecond started_at, on the order of 1.7e12,
-	// which dwarfs every sequence number this table will ever assign. Left as
-	// is, the first rollup run after the upgrade would read "seq > 1700000000000",
-	// match nothing, and - since the watermark is only advanced by a scan that
-	// found rows - never repair itself. The store would keep recording requests
-	// that no rollup ever counted again.
-	//
-	// Starting from MAX(seq) is the correct handover point: the legacy scheme
-	// had already folded every row up to its own watermark into a rollup, and
-	// the backfilled sequences run in the same insertion order it was tracking,
-	// so those rows stay counted exactly once rather than being replayed.
+
 	var maxSeq sql.NullInt64
 	if err := tx.QueryRow(`SELECT MAX(seq) FROM requests`).Scan(&maxSeq); err != nil {
 		return fmt.Errorf("store: read requests.seq high-water mark: %w", err)
@@ -425,7 +340,6 @@ func migrateRequestSeq(db *sql.DB) error {
 	return tx.Commit()
 }
 
-// worker is the single background goroutine that performs all deferred writes.
 func (s *Store) worker() {
 	defer s.wg.Done()
 	for op := range s.queue {
@@ -450,8 +364,7 @@ func (s *Store) worker() {
 				time.Now().UnixMilli(), op.action, op.entity, op.detail)
 		}
 		if err != nil {
-			// Best-effort writes must still be observable: a failing INSERT
-			// (disk full, DB locked) should never be completely silent.
+
 			s.writeFailures.Add(1)
 			log.Printf("tallow-store: async %s write failed: %v", op.kind, err)
 		}
@@ -480,28 +393,14 @@ func (s *Store) enqueue(op writeOp) error {
 	}
 }
 
-// Flush blocks until every write enqueued so far has been written to disk.
-//
-// It enqueues a sentinel behind the pending queue and waits for the worker to
-// reach it, so on return every earlier RecordRequest, RecordRaw, RecordError,
-// and Audit call has been executed against the database. That makes a
-// read-after-write sequence meaningful for a caller that needs to observe its
-// own writes - the admin /logs endpoint, a test, or a graceful-shutdown path
-// that wants the queue drained without tearing the store down.
-//
-// It is not on the hot request path: enqueueing the sentinel and waiting for
-// the worker is a synchronisation point, and per-request callers want the
-// non-blocking enqueue that RecordRequest already does.
 func (s *Store) Flush() {
 	s.flushForTest()
 }
 
-// flushForTest blocks until every op enqueued so far has been written, by
-// enqueueing a sentinel after the pending queue. Test-only helper.
 func (s *Store) flushForTest() {
 	done := make(chan struct{})
 	if err := s.enqueue(writeOp{kind: opFlush, flushDone: done}); err != nil {
-		return // store closed or queue dropped; nothing to flush reliably.
+		return
 	}
 	<-done
 }
@@ -511,13 +410,10 @@ var (
 	errQueueFull   = fmt.Errorf("store: write queue full")
 )
 
-// RecordRequest enqueues a per-request metadata row; the write is performed
-// asynchronously by the background worker.
 func (s *Store) RecordRequest(m model.RequestMeta) error {
 	return s.enqueue(writeOp{kind: opRequest, req: m})
 }
 
-// RecordRaw queues request/response bodies (if raw capture is enabled).
 func (s *Store) RecordRaw(id string, startedAt time.Time, reqBody, respBody []byte) error {
 	if !s.cfg.RawBodies {
 		return nil
@@ -525,21 +421,14 @@ func (s *Store) RecordRaw(id string, startedAt time.Time, reqBody, respBody []by
 	return s.enqueue(writeOp{kind: opRaw, id: id, ts: startedAt, reqBody: reqBody, respBody: respBody})
 }
 
-// RecordError queues an error row.
 func (s *Store) RecordError(id, provider, key, model, requestID, message string) error {
 	return s.enqueue(writeOp{kind: opError, id: id, provider: provider, key: key, model: model, requestID: requestID, message: message})
 }
 
-// Audit queues an immutable config/key-change entry.
 func (s *Store) Audit(action, entity, detail string) error {
 	return s.enqueue(writeOp{kind: opAudit, action: action, entity: entity, detail: detail})
 }
 
-// ---------- Retention ----------
-
-// Maintain rolls up recent per-request rows into daily/weekly rollups, then
-// applies age-based deletes, and occasionally VACUUMs. It is idempotent and
-// safe to call concurrently from a single goroutine.
 func (s *Store) Maintain(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -554,8 +443,6 @@ func (s *Store) Maintain(ctx context.Context) error {
 	return s.maybeVacuumLocked(now)
 }
 
-// RunRetention is a blocking loop invoking Maintain on rollupEvery, plus
-// vacuum on vacuumEvery.
 func (s *Store) RunRetention(ctx context.Context) error {
 	tick := s.cfg.RollupEvery
 	if tick <= 0 {
@@ -569,8 +456,7 @@ func (s *Store) RunRetention(ctx context.Context) error {
 			return ctx.Err()
 		case <-t.C:
 			if err := s.Maintain(ctx); err != nil {
-				// A transient maintenance error must not permanently kill future
-				// rollup/delete/vacuum runs; log and continue.
+
 				fmt.Fprintf(os.Stderr, "tallow: retention maintenance failed: %v\n", err)
 			}
 		}
@@ -593,13 +479,6 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 		return err
 	}
 
-	// The watermark is an ingestion sequence, not a timestamp. started_at is
-	// the event time the request recorded, which is not monotonic: a request
-	// written after the watermark advanced but carrying an earlier started_at
-	// (a late-recorded request, or a host whose clock runs behind) would be
-	// excluded by "started_at > wm" and never folded into any rollup, ever.
-	// seq is assigned at INSERT and only ever increases, so every row is
-	// folded exactly once and none is skipped.
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT seq, started_at, provider, key, prompt_tokens, completion_tokens, cost_micros, status
 		 FROM requests WHERE seq > ? ORDER BY seq`, wm)
@@ -639,9 +518,9 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 				a = &[5]int64{}
 				agg[bk] = a
 			}
-			a[0]++ // requests
+			a[0]++
 			if r.err {
-				a[1]++ // errors
+				a[1]++
 			}
 			a[2] += int64(r.prompt)
 			a[3] += int64(r.completion)
@@ -652,9 +531,6 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 		}
 	}
 
-	// Perform the rollup INSERTs and the watermark advance in one transaction so
-	// a crash between them cannot re-merge the same range (double counting) on
-	// the next run.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -676,14 +552,6 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 		}
 	}
 
-	// The watermark is the ingestion sequence, so its unit is a row sequence
-	// and not a timestamp. It is only ever advanced by a scan that actually found
-	// rows, so an out-of-range value can never be climbed back: "seq > wm"
-	// matching nothing leaves the watermark untouched and the rollup permanently
-	// empty. The only place a legacy value can be corrected is the migration that
-	// introduces the sequence, which re-bases it onto MAX(seq); see
-	// migrateRequestSeq. This guard therefore only ever moves the watermark
-	// forward, onto a sequence that was really folded in just now.
 	if maxSeq > wm {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO meta (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
@@ -695,8 +563,7 @@ func (s *Store) rollupLocked(ctx context.Context, now time.Time) error {
 }
 
 func (s *Store) deleteAgedLocked(now time.Time) error {
-	// A retention window of 0 or less means "keep forever": skip the DELETE so
-	// a natural-but-wrong "disable this capture" reading of 0 cannot wipe data.
+
 	cut := func(days int) int64 {
 		return now.AddDate(0, 0, -days).UnixMilli()
 	}
@@ -745,7 +612,7 @@ func dayStartMs(ms int64) int64 {
 
 func weekStartMs(ms int64) int64 {
 	t := time.UnixMilli(ms).UTC()
-	// Monday-based ISO week start.
+
 	wd := int(t.Weekday())
 	if wd == 0 {
 		wd = 7
@@ -762,9 +629,6 @@ func b2i(b bool) int {
 	return 0
 }
 
-// ---------- Read helpers (admin API / TUI) ----------
-
-// RecentRequests returns the latest N request-metadata rows (newest first).
 func (s *Store) RecentRequests(limit int) ([]model.RequestMeta, error) {
 	if limit <= 0 {
 		limit = 100
@@ -791,7 +655,44 @@ func (s *Store) RecentRequests(limit int) ([]model.RequestMeta, error) {
 	return out, rows.Err()
 }
 
-// Rollup is one aggregated bucket row for display.
+var ErrRawNotCaptured = errors.New("store: raw bodies not captured for this request")
+
+func (s *Store) RequestByID(id string) (model.RequestMeta, []byte, []byte, error) {
+	var m model.RequestMeta
+	var started, stream, cached, coalesced int64
+	err := s.db.QueryRow(`SELECT id, started_at, dur_ms, provider, key, model, upstream_model, stream, cached, coalesced, status, route_reason, prompt_tokens, completion_tokens, cost_micros, err
+		FROM requests WHERE id=?`, id).Scan(
+		&m.ID, &started, &m.DurMillis, &m.Provider, &m.Key, &m.Model, &m.UpstreamModel,
+		&stream, &cached, &coalesced, &m.Status, &m.RouteReason, &m.PromptTokens, &m.CompletionTokens, &m.CostMicros, &m.Err)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.RequestMeta{}, nil, nil, fmt.Errorf("store: unknown request %q", id)
+		}
+		return model.RequestMeta{}, nil, nil, err
+	}
+	m.StartedAt = time.UnixMilli(started)
+	m.Stream = stream != 0
+	m.Cached = cached != 0
+	m.Coalesced = coalesced != 0
+
+	var reqBody, respBody *string
+	err = s.db.QueryRow(`SELECT req_body, resp_body FROM raw_bodies WHERE id=?`, id).Scan(&reqBody, &respBody)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return m, nil, nil, ErrRawNotCaptured
+		}
+		return m, nil, nil, err
+	}
+	mbr, mbr2 := []byte{}, []byte{}
+	if reqBody != nil {
+		mbr = []byte(*reqBody)
+	}
+	if respBody != nil {
+		mbr2 = []byte(*respBody)
+	}
+	return m, mbr, mbr2, nil
+}
+
 type Rollup struct {
 	Bucket      string    `json:"bucket"`
 	BucketStart time.Time `json:"bucket_start"`
@@ -804,7 +705,6 @@ type Rollup struct {
 	CostMicros  int64     `json:"cost_micros"`
 }
 
-// RecentRollups returns the latest rollup rows.
 func (s *Store) RecentRollups(limit int) ([]Rollup, error) {
 	if limit <= 0 {
 		limit = 200
@@ -828,7 +728,6 @@ func (s *Store) RecentRollups(limit int) ([]Rollup, error) {
 	return out, rows.Err()
 }
 
-// RecentAudit returns the latest audit-log rows.
 func (s *Store) RecentAudit(limit int) ([]AuditEntry, error) {
 	if limit <= 0 {
 		limit = 100
@@ -851,7 +750,6 @@ func (s *Store) RecentAudit(limit int) ([]AuditEntry, error) {
 	return out, rows.Err()
 }
 
-// AuditEntry is an audit-log row.
 type AuditEntry struct {
 	TS     time.Time `json:"ts"`
 	Action string    `json:"action"`

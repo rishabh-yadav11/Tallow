@@ -11,19 +11,6 @@ import (
 	"github.com/rishabh-yadav11/tallow/internal/model"
 )
 
-// The rollup watermark used to be a max() over started_at. started_at is the
-// event time a request recorded, and it is not monotonic: a request written
-// after the watermark advanced but carrying an earlier started_at - a request
-// recorded a moment late, or one from a host whose clock runs behind - was
-// excluded by "started_at > wm" and never folded into a rollup. The watermark
-// had already passed it, so no later run would pick it up either.
-//
-// The consequence was not a crash or a wrong total. It was a rollup that was
-// quietly short, while RecentRequests and the observ counters both included the
-// request. The daily and weekly rollups are what an operator reads for trend
-// reporting, so the number silently disagreed with itself.
-
-// dayRequests sums the request counts across day-bucket rollups.
 func dayRequests(t *testing.T, s *Store) int64 {
 	t.Helper()
 	rolls, err := s.RecentRollups(200)
@@ -39,8 +26,6 @@ func dayRequests(t *testing.T, s *Store) int64 {
 	return total
 }
 
-// TestRollupCountsARecordedLateWithAnEarlierTimestamp is the defect, stated as
-// the operator-visible consequence.
 func TestRollupCountsARecordedLateWithAnEarlierTimestamp(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -52,7 +37,6 @@ func TestRollupCountsARecordedLateWithAnEarlierTimestamp(t *testing.T) {
 		t.Fatalf("first Maintain: %v", err)
 	}
 
-	// Arrives afterwards, but started a second earlier.
 	s.RecordRequest(model.RequestMeta{ID: "late", StartedAt: now.Add(-time.Second), Provider: "p1", Key: "k1", PromptTokens: 999})
 	s.Flush()
 	if err := s.Maintain(ctx); err != nil {
@@ -64,11 +48,6 @@ func TestRollupCountsARecordedLateWithAnEarlierTimestamp(t *testing.T) {
 	}
 }
 
-// TestRollupAggregatesErrorsAndTokensAcrossRequests asserts the non-Requests
-// rollup columns that operators actually read: the errors count (requests whose
-// status is "error") and the prompt/completion token sums, folded together from
-// multiple requests in one day bucket. The existing tests only asserted
-// Requests, so a rollup that dropped errors or tokens would have stayed green.
 func TestRollupAggregatesErrorsAndTokensAcrossRequests(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -111,11 +90,6 @@ func TestRollupAggregatesErrorsAndTokensAcrossRequests(t *testing.T) {
 	}
 }
 
-// TestRollupIsIdempotentAcrossRepeatedRuns guards the other property the
-// sequence-based watermark has to preserve. A naive fix - dropping the
-// watermark entirely and re-scanning all rows - would fold every row on every
-// run and multiply the totals, which is worse than the original bug. Each
-// request must be counted exactly once no matter how often Maintain runs.
 func TestRollupIsIdempotentAcrossRepeatedRuns(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -137,15 +111,11 @@ func TestRollupIsIdempotentAcrossRepeatedRuns(t *testing.T) {
 	}
 }
 
-// TestRollupWatermarkUnaffectedByBackdatedTimestamps drives the watermark
-// backwards repeatedly. Even if every timestamp were in the past, the sequence
-// only increases, so nothing is skipped and nothing is counted twice.
 func TestRollupWatermarkUnaffectedByBackdatedTimestamps(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now()
 
-	// A year of history, all backdated, recorded oldest-first.
 	base := now.Add(-365 * 24 * time.Hour)
 	for i := 0; i < 10; i++ {
 		id := "old-" + string(rune('a'+i))
@@ -159,7 +129,6 @@ func TestRollupWatermarkUnaffectedByBackdatedTimestamps(t *testing.T) {
 		t.Errorf("day rollup counted %d, want 10 for backdated rows", got)
 	}
 
-	// Now a row backdated further still, recorded last.
 	s.RecordRequest(model.RequestMeta{ID: "older", StartedAt: base.Add(-30 * 24 * time.Hour), Provider: "p1", Key: "k1"})
 	s.Flush()
 	if err := s.Maintain(ctx); err != nil {
@@ -170,8 +139,6 @@ func TestRollupWatermarkUnaffectedByBackdatedTimestamps(t *testing.T) {
 	}
 }
 
-// oldSchemaNoSeq recreates a pre-seq requests table, so the upgrade path is
-// exercised against a realistic existing database rather than a fresh one.
 const oldSchemaNoSeq = `
 CREATE TABLE IF NOT EXISTS requests (
 	id                TEXT PRIMARY KEY,
@@ -208,10 +175,6 @@ CREATE INDEX IF NOT EXISTS idx_requests_started ON requests(started_at);
 CREATE INDEX IF NOT EXISTS idx_requests_pk ON requests(provider, key);
 `
 
-// TestMigrateRequestSeqPreservesEveryRow is the upgrade path. An operator's
-// existing history store has to survive the upgrade intact: a table rebuild is
-// the riskiest thing this migration does, and losing rows to it would be a far
-// worse outcome than the rollup skew being fixed.
 func TestMigrateRequestSeqPreservesEveryRow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 	db, err := sql.Open("sqlite", "file:"+path)
@@ -221,8 +184,7 @@ func TestMigrateRequestSeqPreservesEveryRow(t *testing.T) {
 	if _, err := db.Exec(oldSchemaNoSeq); err != nil {
 		t.Fatalf("create old schema: %v", err)
 	}
-	// Insert in a deliberately non-monotonic started_at order, so a migration
-	// that ordered the backfill by timestamp would visibly permute the rows.
+
 	seeds := []struct {
 		id string
 		ts int64
@@ -245,7 +207,6 @@ func TestMigrateRequestSeqPreservesEveryRow(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Every row survived, with its id and timestamp intact.
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
@@ -263,10 +224,6 @@ func TestMigrateRequestSeqPreservesEveryRow(t *testing.T) {
 		}
 	}
 
-	// The backfilled sequence follows insertion order, which is the order the
-	// old timestamp watermark was already tracking. Ordering by it must
-	// reproduce the insertion order exactly, or rows would be folded into the
-	// wrong daily buckets.
 	rows, err := s.db.Query(`SELECT id FROM requests ORDER BY seq`)
 	if err != nil {
 		t.Fatalf("order by seq: %v", err)
@@ -291,9 +248,6 @@ func TestMigrateRequestSeqPreservesEveryRow(t *testing.T) {
 		}
 	}
 
-	// The indexes the query plan depends on must exist after the rebuild; a
-	// dropped index would not fail a correctness test but would make every
-	// rollup a full table scan.
 	for _, idx := range []string{"idx_requests_started", "idx_requests_pk"} {
 		var c int
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, idx).Scan(&c); err != nil {
@@ -304,12 +258,6 @@ func TestMigrateRequestSeqPreservesEveryRow(t *testing.T) {
 		}
 	}
 
-	// The scratch table the rebuild works through must not survive it. Left in
-	// place it is a full second copy of the operator's history that nothing ever
-	// reads or prunes: it is not covered by any retention window, so it would
-	// grow to hold data the operator believes they have deleted, and an
-	// operator inspecting the database with any SQL client would see a phantom
-	// requests_old table.
 	var leftover int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='requests_old'`).Scan(&leftover); err != nil {
 		t.Fatalf("leftover table lookup: %v", err)
@@ -319,9 +267,6 @@ func TestMigrateRequestSeqPreservesEveryRow(t *testing.T) {
 	}
 }
 
-// TestMigrateRequestSeqIsIdempotent guards the second migration run. Open is
-// called on every start, so a migration that rebuilt the table each time would
-// churn the database and reset sequences on every restart.
 func TestMigrateRequestSeqIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "twice.db")
 	s, err := Open(StoreConfig{Path: path, MetadataDays: 7})
@@ -355,10 +300,6 @@ func TestMigrateRequestSeqIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestRetentionDeletesAgedRows covers the irreversible half of maintenance.
-// deleteAgedLocked and RunRetention were untested, and a retention window that
-// deleted too much would destroy history with no error and no way to notice
-// from the return value.
 func TestRetentionDeletesAgedRows(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(StoreConfig{
@@ -400,7 +341,6 @@ func TestRetentionDeletesAgedRows(t *testing.T) {
 		t.Error("a request past the retention window survived")
 	}
 
-	// raw_bodies has a 1-day window, tighter than metadata's 7.
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM raw_bodies WHERE id='fresh'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
@@ -414,11 +354,6 @@ func TestRetentionDeletesAgedRows(t *testing.T) {
 		t.Error("a raw body past its 1-day window survived")
 	}
 
-	// The row that separates the two windows. raw_bodies must be pruned on its
-	// own 1-day schedule, not on the longer 7-day metadata one: a raw body is a
-	// verbatim copy of the operator's request and response, so the tighter
-	// window is the privacy control. Reading the wrong field here would keep
-	// every raw body for a full extra six days.
 	mid := model.RequestMeta{ID: "mid", StartedAt: now.Add(-3 * 24 * time.Hour), Provider: "p1", Key: "k1"}
 	s.RecordRequest(mid)
 	s.RecordRaw("mid", mid.StartedAt, []byte("r"), []byte("s"))
@@ -433,9 +368,7 @@ func TestRetentionDeletesAgedRows(t *testing.T) {
 		t.Error("a raw body past its 1-day window survived because retention used the " +
 			"7-day metadata window instead of raw_bodies_days")
 	}
-	// The request row itself is still inside the 7-day metadata window, so it
-	// must remain. This is the paired half: the two windows are genuinely
-	// independent, not one derived from the other.
+
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM requests WHERE id='mid'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
@@ -444,10 +377,6 @@ func TestRetentionDeletesAgedRows(t *testing.T) {
 	}
 }
 
-// TestRetentionOfZeroKeepsEverything pins the fail-safe reading of a zero or
-// negative window. Zero means "keep forever", so a config that leaves the
-// window unset must not be read as "delete everything" - that would destroy an
-// operator's entire history on the first maintenance tick.
 func TestRetentionOfZeroKeepsEverything(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(StoreConfig{
@@ -482,9 +411,6 @@ func TestRetentionOfZeroKeepsEverything(t *testing.T) {
 	}
 }
 
-// TestRunRetentionStopsOnContextCancel covers the loop that was entirely
-// untested. It must return on cancellation rather than leak a ticker and a
-// goroutine for the life of the process.
 func TestRunRetentionStopsOnContextCancel(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(StoreConfig{
@@ -501,7 +427,6 @@ func TestRunRetentionStopsOnContextCancel(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.RunRetention(ctx) }()
 
-	// Let a few ticks run, then cancel.
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 
@@ -515,16 +440,6 @@ func TestRunRetentionStopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// TestRunRetentionSurvivesAMaintenanceError checks the loop keeps running after
-// a failed pass. The loop is the only thing that ever prunes the store, so a
-// single transient error must not silently end retention forever.
-//
-// It has to prove the loop is still *working*, not merely that it returned a
-// non-nil error: a version that bailed out on the first failure would also
-// return non-nil, so asserting on the return value alone cannot tell the two
-// apart. Instead the database is broken for a while and then repaired, and the
-// test waits for a request recorded after the repair to appear in a rollup.
-// Only a loop that survived the failed passes can do that.
 func TestRunRetentionSurvivesAMaintenanceError(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(StoreConfig{
@@ -541,8 +456,6 @@ func TestRunRetentionSurvivesAMaintenanceError(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.RunRetention(ctx) }()
 
-	// Break maintenance underneath the loop by swapping in a closed handle,
-	// under the store's own mutex so this is not a data race.
 	broken, err := sql.Open("sqlite", "file::memory:")
 	if err != nil {
 		t.Fatalf("open broken handle: %v", err)
@@ -555,10 +468,8 @@ func TestRunRetentionSurvivesAMaintenanceError(t *testing.T) {
 	s.db = broken
 	s.mu.Unlock()
 
-	// Let several ticks run against the broken handle.
 	time.Sleep(50 * time.Millisecond)
 
-	// Repair it and record a request the surviving loop must still roll up.
 	s.mu.Lock()
 	s.db = real
 	s.mu.Unlock()

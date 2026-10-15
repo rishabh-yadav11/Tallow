@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -50,7 +51,7 @@ func TestAsyncRecordRequestRoundTrip(t *testing.T) {
 	if err := s.RecordRequest(meta); err != nil {
 		t.Fatalf("RecordRequest returned error: %v", err)
 	}
-	// Records are async; flush to make the write deterministic.
+
 	s.flushForTest()
 
 	got, err := s.RecentRequests(10)
@@ -98,9 +99,6 @@ func TestAsyncRecordError(t *testing.T) {
 	}
 	s.flushForTest()
 
-	// Errors are visible via RecentRequests? No: RecentRequests reads requests.
-	// Verify the error count by exercising recent endpoints that touch errors.
-	// We check indirectly that no write error surfaced by querying the table.
 	rows, err := s.db.Query(`SELECT COUNT(*) FROM errors`)
 	if err != nil {
 		t.Fatalf("count errors: %v", err)
@@ -153,12 +151,11 @@ func TestCloseFlushesPendingWrites(t *testing.T) {
 	if err := s.RecordRequest(meta); err != nil {
 		t.Fatalf("RecordRequest: %v", err)
 	}
-	// Do NOT flush; Close must drain the pending write before closing db.
+
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Reopen and confirm the queued write landed.
 	s2, err := Open(StoreConfig{Path: path})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -178,7 +175,7 @@ func TestRecordAfterCloseNoPanic(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// Enqueueing after close must not panic and should report an error.
+
 	if err := s.RecordRequest(model.RequestMeta{ID: "late"}); err == nil {
 		t.Fatal("expected error enqueueing after close")
 	}
@@ -187,8 +184,6 @@ func TestRecordAfterCloseNoPanic(t *testing.T) {
 	}
 }
 
-// TestMaintainVacuum exercises the deferred VACUUM path (issue #2): retention
-// maintenance must run off the request path and shrink the db without error.
 func TestMaintainVacuum(t *testing.T) {
 	dir := t.TempDir()
 	cfg := StoreConfig{
@@ -198,14 +193,13 @@ func TestMaintainVacuum(t *testing.T) {
 		MetadataDays:  30,
 		ErrorsDays:    90,
 		RollupEvery:   time.Hour,
-		VacuumEvery:   0, // <=0 means never vacuum; a tiny value is set below to force one
+		VacuumEvery:   0,
 	}
 	s, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Seed enough rows that the db file is non-trivial, then delete most of them
-	// so a VACUUM actually reclaims space.
+
 	for i := 0; i < 200; i++ {
 		if err := s.RecordRequest(model.RequestMeta{ID: fmt.Sprintf("seed-%d", i), DurMillis: 5}); err != nil {
 			t.Fatal(err)
@@ -215,7 +209,7 @@ func TestMaintainVacuum(t *testing.T) {
 	if err := s.Maintain(context.Background()); err != nil {
 		t.Fatalf("Maintain: %v", err)
 	}
-	// Force a second VACUUM now that enough time (simulated) has passed.
+
 	cfg.VacuumEvery = time.Nanosecond
 	s.cfg = cfg
 	if err := s.Maintain(context.Background()); err != nil {
@@ -226,9 +220,6 @@ func TestMaintainVacuum(t *testing.T) {
 	}
 }
 
-// TestDurableAfterReopen verifies async writes are persisted to the SQLite WAL
-// and survive Close + reopen (issue #2): a crash-free shutdown must not lose
-// request metadata that was enqueued before Close.
 func TestDurableAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "tallow.db")
@@ -243,12 +234,11 @@ func TestDurableAfterReopen(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Close flushes the queue (worker drains before db.Close).
+
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Reopen and confirm all rows persisted.
 	s2, err := Open(cfg)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -263,9 +253,6 @@ func TestDurableAfterReopen(t *testing.T) {
 	}
 }
 
-// TestRetentionZeroKeepsForever verifies that a retention window of 0 is
-// interpreted as "keep forever": Maintain must not delete any rows (a natural
-// but wrong reading of 0 as "delete everything" previously wiped all data).
 func TestRetentionZeroKeepsForever(t *testing.T) {
 	dir := t.TempDir()
 	cfg := StoreConfig{Path: filepath.Join(dir, "tallow.db"), RawBodies: true, RawBodiesDays: 0, MetadataDays: 0, ErrorsDays: 0}
@@ -275,7 +262,6 @@ func TestRetentionZeroKeepsForever(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Old rows that retention would definitely delete if 0 were "keep nothing".
 	old := time.Now().AddDate(0, -6, 0)
 	if err := s.RecordRequest(model.RequestMeta{ID: "old-req", StartedAt: old}); err != nil {
 		t.Fatal(err)
@@ -299,8 +285,7 @@ func TestRetentionZeroKeepsForever(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("retention 0 must keep rows forever: got %d rows, want 1", len(rows))
 	}
-	// The errors table must also survive 0 (it was previously unasserted, so
-	// 0-retention only protected metadata rows, not error rows).
+
 	var errCount int64
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM errors`).Scan(&errCount); err != nil {
 		t.Fatalf("query error rows: %v", err)
@@ -310,8 +295,6 @@ func TestRetentionZeroKeepsForever(t *testing.T) {
 	}
 }
 
-// TestRetentionPositiveDeletesAgedRows verifies positive windows still delete
-// old rows, so the zero-keep-forever change did not break real retention.
 func TestRetentionPositiveDeletesAgedRows(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "tallow.db")
@@ -346,8 +329,6 @@ func TestRetentionPositiveDeletesAgedRows(t *testing.T) {
 	}
 }
 
-// TestWriteStatsCountsDrops verifies the drop counter records ops lost to a
-// closed store, making silent telemetry loss observable (audit H1).
 func TestWriteStatsCountsDrops(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.Close(); err != nil {
@@ -362,9 +343,6 @@ func TestWriteStatsCountsDrops(t *testing.T) {
 	}
 }
 
-// TestRecentRequestsDefaultsZeroLimit pins that a non-positive limit falls back
-// to the documented default (100 for requests) rather than returning everything
-// or nothing.
 func TestRecentRequestsDefaultsZeroLimit(t *testing.T) {
 	s := newTestStore(t)
 	for i := range 120 {
@@ -390,8 +368,6 @@ func TestRecentRequestsDefaultsZeroLimit(t *testing.T) {
 	}
 }
 
-// TestAuditAndRollupDefaultZeroLimit pins the same non-positive->default fallback
-// for the two other read helpers whose defaults are 100 and 200 respectively.
 func TestAuditAndRollupDefaultZeroLimit(t *testing.T) {
 	s := newTestStore(t)
 	for i := range 5 {
@@ -411,8 +387,6 @@ func TestAuditAndRollupDefaultZeroLimit(t *testing.T) {
 		t.Errorf("RecentAudit(0) newest-first ordering broke: first detail = %q", audits[0].Detail)
 	}
 
-	// Rollup default is 200. Record requests too (audits do not become rollups)
-	// so Maintain produces a day bucket to read back through the default path.
 	for i := range 5 {
 		if err := s.RecordRequest(model.RequestMeta{ID: fmt.Sprintf("req-%d", i), PromptTokens: 1}); err != nil {
 			t.Fatal(err)
@@ -431,16 +405,12 @@ func TestAuditAndRollupDefaultZeroLimit(t *testing.T) {
 	}
 	for _, r := range rolls {
 		if r.Bucket == "day" && r.Requests == 5 {
-			return // found the 5-request day rollup: default path works.
+			return
 		}
 	}
 	t.Errorf("no day rollup with 5 requests found: %+v", rolls)
 }
 
-// TestQueueFullDropsPins the write-queue capacity (1024) and the drop path when
-// it overflows: enqueuing into a full queue must not block, must increment the
-// drop counter, and must return errQueueFull. It builds a Store with a full
-// channel and no worker on purpose so the overflow is deterministic.
 func TestQueueFullDrops(t *testing.T) {
 	st := &Store{queue: make(chan writeOp, 1024)}
 	for range 1024 {
@@ -456,9 +426,6 @@ func TestQueueFullDrops(t *testing.T) {
 	}
 }
 
-// TestWorkerExecFailureCountsFailures pins that a deferred write failing at the
-// database layer is surfaced through WriteStats rather than silently lost. A
-// dropped requests table makes the worker's INSERT fail.
 func TestWorkerExecFailureCountsFailures(t *testing.T) {
 	s := newTestStore(t)
 	if _, err := s.db.Exec(`DROP TABLE requests`); err != nil {
@@ -474,5 +441,47 @@ func TestWorkerExecFailureCountsFailures(t *testing.T) {
 	}
 	if drops != 0 {
 		t.Fatalf("WriteStats after failed worker insert: drops=%d, want 0", drops)
+	}
+}
+
+func TestRequestByID(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Truncate(time.Millisecond)
+	if err := s.RecordRequest(model.RequestMeta{
+		ID: "id1", StartedAt: now, DurMillis: 7, Provider: "p1", Key: "k1",
+		Model: "m1", UpstreamModel: "m1", Stream: false, Status: "ok",
+		PromptTokens: 5, CompletionTokens: 3, CostMicros: 300,
+	}); err != nil {
+		t.Fatalf("RecordRequest: %v", err)
+	}
+	if err := s.RecordRaw("id1", now, []byte(`{"model":"m1"}`), []byte(`{"content":"hi"}`)); err != nil {
+		t.Fatalf("RecordRaw: %v", err)
+	}
+
+	if err := s.RecordRequest(model.RequestMeta{ID: "meta-only", StartedAt: now, DurMillis: 1}); err != nil {
+		t.Fatalf("RecordRequest meta-only: %v", err)
+	}
+	s.flushForTest()
+
+	meta, reqB, respB, err := s.RequestByID("id1")
+	if err != nil {
+		t.Fatalf("RequestByID(id1): %v", err)
+	}
+	if meta.ID != "id1" || meta.Provider != "p1" || meta.Model != "m1" ||
+		!meta.StartedAt.Equal(now) || meta.CostMicros != 300 {
+		t.Errorf("RequestByID metadata = %+v", meta)
+	}
+	if string(reqB) != `{"model":"m1"}` || string(respB) != `{"content":"hi"}` {
+		t.Errorf("raw bodies = %q / %q; want the recorded bytes", reqB, respB)
+	}
+
+	if _, _, _, err := s.RequestByID("meta-only"); !errors.Is(err, ErrRawNotCaptured) {
+		t.Fatalf("RequestByID(meta-only) err = %v, want ErrRawNotCaptured", err)
+	}
+
+	if _, _, _, err := s.RequestByID("nope"); err == nil {
+		t.Fatal("RequestByID(unknown) = nil error; want error")
+	} else if errors.Is(err, ErrRawNotCaptured) {
+		t.Errorf("RequestByID(unknown) reported ErrRawNotCaptured; want unknown-id error")
 	}
 }
